@@ -8,6 +8,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import TelegramAPIError
 
 # ЕДИНЫЙ ИМПОРТ ИЗ БАЗЫ:
 from database import add_message, get_pending_messages, mark_as_sent, init_db
@@ -91,6 +92,7 @@ async def catch_message(message: types.Message, state: FSMContext):
 
 
 # 4. ОБРАБОТЧИК: Нажатия на кнопки (Callback)
+# 4. ОБРАБОТЧИК: Нажатия на кнопки (Callback)
 @dp.callback_query(F.data.startswith("time_"))
 async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -102,16 +104,14 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
     # ЛОГИКА ДЛЯ КНОПКИ ТОЧНОГО ВРЕМЕНИ
     if callback.data == "time_custom":
         msg_id = callback.message.reply_to_message.message_id
-        # Сохраняем ID сообщения во временную память машины состояний
         await state.update_data(message_id=msg_id)
-        # Включаем состояние ожидания
         await state.set_state(ScheduleState.waiting_for_datetime)
         
         await callback.message.edit_text(
             "Напиши точную дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ\n"
             "Например: `15.03.2026 14:30`", parse_mode="Markdown"
         )
-        return # Выходим из функции, дальше бот будет ждать текстовое сообщение
+        return
 
     elif callback.data == "time_morning":
         scheduled_time = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
@@ -130,12 +130,27 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
         scheduled_time = now + timedelta(minutes=1)
         label = "через 1 минуту (тест)"
 
+    # --- ИСПРАВЛЕННЫЙ БЛОК С ПРАВИЛЬНЫМИ ОТСТУПАМИ ---
     if scheduled_time:
+        # ЗАЩИТА №1: Проверяем, существует ли пересланное сообщение
+        if callback.message.reply_to_message is None:
+            await callback.message.edit_text("❌ Ошибка: не могу найти оригинальное сообщение. Попробуй переслать его заново.")
+            return
+
         chat_id = callback.message.chat.id
         msg_id = callback.message.reply_to_message.message_id
-        add_message(user_id=chat_id, message_id=msg_id, send_at=scheduled_time.strftime('%Y-%m-%d %H:%M:%S'))
-        await callback.message.edit_text(f"✅ Принято! Отправлю это сообщение тебе {label}.")
-
+        
+        try:
+            # 1. Сначала меняем текст (сработает только для первого клика)
+            await callback.message.edit_text(f"✅ Принято! Отправлю это сообщение тебе {label}.")
+            
+            # 2. Сохраняем в базу ТОЛЬКО если текст успешно изменился
+            add_message(user_id=chat_id, message_id=msg_id, send_at=scheduled_time.strftime('%Y-%m-%d %H:%M:%S'))
+            
+        # ЗАЩИТА №2: Ловим только ошибки Телеграма (например, двойной клик)
+        except TelegramAPIError:
+            pass
+                
 # 5. ФОНОВАЯ ЗАДАЧА: Проверка базы данных
 async def check_messages():
     while True:
