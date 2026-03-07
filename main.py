@@ -92,7 +92,6 @@ async def catch_message(message: types.Message, state: FSMContext):
 
 
 # 4. ОБРАБОТЧИК: Нажатия на кнопки (Callback)
-# 4. ОБРАБОТЧИК: Нажатия на кнопки (Callback)
 @dp.callback_query(F.data.startswith("time_"))
 async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -107,9 +106,23 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
         await state.update_data(message_id=msg_id)
         await state.set_state(ScheduleState.waiting_for_datetime)
         
+        # --- ВЫСЧИТЫВАЕМ УМНУЮ ПОДСКАЗКУ ВРЕМЕНИ ---
+        if now.hour < 8:
+            suggested_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        elif now.hour < 13:
+            suggested_time = now.replace(hour=14, minute=0, second=0, microsecond=0)
+        elif now.hour < 20:
+            suggested_time = now.replace(hour=20, minute=0, second=0, microsecond=0)
+        else:
+            suggested_time = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+            
+        suggested_str = suggested_time.strftime('%d.%m.%Y %H:%M')
+        
         await callback.message.edit_text(
-            "Напиши точную дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ\n"
-            "Например: `15.03.2026 14:30`", parse_mode="Markdown"
+            "Напиши точную дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ\n\n"
+            "💡 *Лайфхак:* нажми на время ниже, чтобы скопировать его, а затем просто измени нужные цифры в строке ввода:\n\n"
+            f"`{suggested_str}`", 
+            parse_mode="Markdown"
         )
         return
 
@@ -130,7 +143,6 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
         scheduled_time = now + timedelta(minutes=1)
         label = "через 1 минуту (тест)"
 
-    # --- ИСПРАВЛЕННЫЙ БЛОК С ПРАВИЛЬНЫМИ ОТСТУПАМИ ---
     if scheduled_time:
         # ЗАЩИТА №1: Проверяем, существует ли пересланное сообщение
         if callback.message.reply_to_message is None:
@@ -147,10 +159,10 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
             # 2. Сохраняем в базу ТОЛЬКО если текст успешно изменился
             add_message(user_id=chat_id, message_id=msg_id, send_at=scheduled_time.strftime('%Y-%m-%d %H:%M:%S'))
             
-        # ЗАЩИТА №2: Ловим только ошибки Телеграма (например, двойной клик)
+        # ЗАЩИТА №2: Ловим только ошибки Телеграма
         except TelegramAPIError:
             pass
-                
+
 # 5. ФОНОВАЯ ЗАДАЧА: Проверка базы данных
 async def check_messages():
     while True:
