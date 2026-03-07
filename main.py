@@ -1,77 +1,111 @@
 import asyncio
 import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo # Встроенная библиотека для часовых поясов
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError
 
-# ЕДИНЫЙ ИМПОРТ ИЗ БАЗЫ:
-from database import add_message, get_pending_messages, mark_as_sent, init_db
+from database import add_message, get_pending_messages, mark_as_sent, init_db, get_user_messages, delete_message
 
-# Загрузка переменных окружения
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise ValueError("❌ Токен бота не найден! Проверьте файл .env")
 
-# Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
+
+# TODO: Для больших проектов память (MemoryStorage) заменяют на Redis, 
+# чтобы при перезагрузке сервера Railway пользователи не теряли свои текущие "состояния" ввода.
 dp = Dispatcher()
 
-# Класс состояний (FSM) для ожидания текстового ввода даты
+# Фиксируем часовой пояс
+TZ = ZoneInfo("Europe/Moscow")
+
 class ScheduleState(StatesGroup):
     waiting_for_datetime = State()
 
-# 1. ОБРАБОТЧИК: Команда /start
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear() # На всякий случай очищаем память состояний
-    await message.answer("Привет! Я готов. Перешли мне любое сообщение, и я предложу время для отложенной отправки.")
+    await state.clear()
+    await message.answer(
+        "Привет! Я готов.\n\n"
+        "1️⃣ Перешли мне любое сообщение, и я предложу время для отложенной отправки.\n"
+        "2️⃣ Напиши /list, чтобы посмотреть или отменить запланированные задачи."
+    )
 
-# 2. ОБРАБОТЧИК: Ловец точной даты (СПЕЦИФИЧНЫЙ ФИЛЬТР - СТРОГО ВЫШЕ ОБЩЕГО)
+# НОВАЯ ФУНКЦИЯ: Управление списком задач
+@dp.message(Command("list"))
+async def cmd_list(message: types.Message, state: FSMContext):
+    await state.clear()
+    
+    # TODO: В будущем, при переходе на асинхронную БД (aiosqlite), эта функция не будет 
+    # блокировать event-loop при высоких нагрузках. Для MVP синхронного sqlite3 более чем достаточно.
+    user_msgs = get_user_messages(message.chat.id)
+    
+    if not user_msgs:
+        await message.answer("📭 У тебя нет активных напоминаний.")
+        return
+        
+    await message.answer("⏳ Твои запланированные напоминания:")
+    
+    # Выдаем каждое напоминание отдельным сообщением с кнопкой отмены
+    for msg in user_msgs:
+        db_id, send_at = msg
+        dt_obj = datetime.strptime(send_at, '%Y-%m-%d %H:%M:%S')
+        pretty_time = dt_obj.strftime('%d.%m.%Y в %H:%M')
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_{db_id}")]
+        ])
+        await message.answer(f"📌 Напоминание на: {pretty_time}", reply_markup=kb)
+
+# НОВАЯ ФУНКЦИЯ: Обработка кнопки "Отменить"
+@dp.callback_query(F.data.startswith("cancel_"))
+async def handle_cancel(callback: CallbackQuery):
+    db_id = int(callback.data.split("_")[1])
+    delete_message(db_id)
+    
+    try:
+        await callback.message.edit_text("🚫 Напоминание отменено.")
+    except TelegramAPIError:
+        pass
+    await callback.answer("Удалено!")
+
 @dp.message(ScheduleState.waiting_for_datetime)
 async def process_custom_datetime(message: types.Message, state: FSMContext):
     try:
-        # Пытаемся расшифровать текст пользователя в дату
-        scheduled_time = datetime.strptime(message.text, "%d.%m.%Y %H:%M")
+        # Привязываем введенную дату к нашему часовому поясу
+        scheduled_time = datetime.strptime(message.text, "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
         
-        # Проверяем, не ввел ли он дату из прошлого
-        if scheduled_time < datetime.now():
+        if scheduled_time < datetime.now(TZ):
             await message.answer("Эта дата уже в прошлом! Попробуй еще раз (ДД.ММ.ГГГГ ЧЧ:ММ):")
             return
             
-        # Достаем ID сообщения из временной памяти
         data = await state.get_data()
         msg_id = data.get('message_id')
         chat_id = message.chat.id
         
-        # Защита: если ID сообщения потерялся
         if not msg_id:
             await message.answer("Ошибка: не найден ID сообщения. Попробуй переслать его заново.")
             await state.clear()
             return
             
-        # Сохраняем в базу
         add_message(user_id=chat_id, message_id=msg_id, send_at=scheduled_time.strftime('%Y-%m-%d %H:%M:%S'))
-        
         await message.answer(f"✅ Принято! Запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}.")
-        
-        # Очищаем состояние (выходим из режима ожидания)
         await state.clear()
         
     except ValueError:
-        await message.answer("❌ Неверный формат. Напиши точно как в примере: ДД.ММ.ГГГГ ЧЧ:ММ (например, 15.03.2026 14:30)")
+        await message.answer("❌ Неверный формат. Напиши точно как в примере: ДД.ММ.ГГГГ ЧЧ:ММ")
 
-# 3. ОБРАБОТЧИК: Общий перехватчик сообщений (БЕЗ ФИЛЬТРОВ - СТРОГО ВНИЗУ)
 @dp.message()
 async def catch_message(message: types.Message, state: FSMContext):
-    # Если пользователь прислал новое сообщение, отменяем ожидание даты для старого
     await state.clear() 
     
     kb = [
@@ -91,22 +125,25 @@ async def catch_message(message: types.Message, state: FSMContext):
     await message.reply("Когда мне напомнить об этом сообщении?", reply_markup=keyboard)
 
 
-# 4. ОБРАБОТЧИК: Нажатия на кнопки (Callback)
 @dp.callback_query(F.data.startswith("time_"))
 async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     
-    now = datetime.now()
+    # Все расчеты теперь строго в нашем часовом поясе
+    now = datetime.now(TZ)
     scheduled_time = None
     label = ""
 
-    # ЛОГИКА ДЛЯ КНОПКИ ТОЧНОГО ВРЕМЕНИ
     if callback.data == "time_custom":
+        # ЗАЩИТА №1: Проверяем, существует ли пересланное сообщение
+        if callback.message.reply_to_message is None:
+            await callback.message.edit_text("❌ Ошибка: не могу найти оригинальное сообщение. Попробуй переслать его заново.")
+            return
+
         msg_id = callback.message.reply_to_message.message_id
         await state.update_data(message_id=msg_id)
         await state.set_state(ScheduleState.waiting_for_datetime)
         
-        # --- ВЫСЧИТЫВАЕМ УМНУЮ ПОДСКАЗКУ ВРЕМЕНИ ---
         if now.hour < 8:
             suggested_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
         elif now.hour < 13:
@@ -120,7 +157,7 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
         
         await callback.message.edit_text(
             "Напиши точную дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ\n\n"
-            "💡 *Лайфхак:* нажми на время ниже, чтобы скопировать его, а затем просто измени нужные цифры в строке ввода:\n\n"
+            "💡 *Лайфхак:* нажми на время ниже, чтобы скопировать его:\n\n"
             f"`{suggested_str}`", 
             parse_mode="Markdown"
         )
@@ -144,7 +181,6 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
         label = "через 1 минуту (тест)"
 
     if scheduled_time:
-        # ЗАЩИТА №1: Проверяем, существует ли пересланное сообщение
         if callback.message.reply_to_message is None:
             await callback.message.edit_text("❌ Ошибка: не могу найти оригинальное сообщение. Попробуй переслать его заново.")
             return
@@ -153,48 +189,40 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
         msg_id = callback.message.reply_to_message.message_id
         
         try:
-            # 1. Сначала меняем текст (сработает только для первого клика)
             await callback.message.edit_text(f"✅ Принято! Отправлю это сообщение тебе {label}.")
-            
-            # 2. Сохраняем в базу ТОЛЬКО если текст успешно изменился
             add_message(user_id=chat_id, message_id=msg_id, send_at=scheduled_time.strftime('%Y-%m-%d %H:%M:%S'))
-            
-        # ЗАЩИТА №2: Ловим только ошибки Телеграма
         except TelegramAPIError:
             pass
 
-# 5. ФОНОВАЯ ЗАДАЧА: Проверка базы данных
 async def check_messages():
+    # TODO: В будущем бесконечный цикл `while True` с `sleep()` лучше заменить на 
+    # профессиональный планировщик задач, например APScheduler или Celery.
     while True:
-        pending = get_pending_messages()
+        # Передаем точное время в нашем поясе
+        now_str = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
+        pending = get_pending_messages(now_str)
+        
         for msg in pending:
             db_id, chat_id, message_id = msg
             try:
                 chat_id = int(chat_id)
-                print(f"⏳ Пробую отправить: чат={chat_id}, сообщение={message_id}")
-                
                 await bot.forward_message(chat_id=chat_id, from_chat_id=chat_id, message_id=message_id)
                 mark_as_sent(db_id)
-                print(f"✅ Сообщение {message_id} успешно отправлено!")
+                
+                # TODO: Если бот будет массово рассылать сотни сообщений в одну секунду, 
+                # Telegram выдаст бан за спам. Сюда стоит добавить `await asyncio.sleep(0.05)`, 
+                # чтобы искусственно тормозить отправку.
                 
             except Exception as e:
                 print(f"❌ Ошибка при отправке сообщения {message_id}: {e}")
                 mark_as_sent(db_id)
         
-        # Проверяем базу каждые 30 секунд
         await asyncio.sleep(30)
 
-# 6. ГЛАВНАЯ ФУНКЦИЯ ЗАПУСКА
 async def main():
-    # 1. Создаем таблицы в базе данных (если их еще нет на новом диске)
     init_db()
-
-    # 2. Удаляем старые вебхуки Telegram, чтобы избежать конфликта getUpdates
     await bot.delete_webhook(drop_pending_updates=True)
-
-    # 3. Запускаем фоновый "будильник"
     asyncio.create_task(check_messages())
-
     print("Бот успешно запущен и ждет сообщений...")
     await dp.start_polling(bot)
 
