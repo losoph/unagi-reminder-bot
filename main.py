@@ -9,8 +9,8 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-# Импорты из нашего файла базы данных
-from database import add_message, get_pending_messages, mark_as_sent
+# ЕДИНЫЙ ИМПОРТ ИЗ БАЗЫ:
+from database import add_message, get_pending_messages, mark_as_sent, init_db
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -159,9 +159,15 @@ async def check_messages():
 
 # 6. ГЛАВНАЯ ФУНКЦИЯ ЗАПУСКА
 async def main():
-    # Запускаем фоновый "будильник"
+    # 1. Создаем таблицы в базе данных (если их еще нет на новом диске)
+    init_db()
+
+    # 2. Удаляем старые вебхуки Telegram, чтобы избежать конфликта getUpdates
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    # 3. Запускаем фоновый "будильник"
     asyncio.create_task(check_messages())
-    
+
     print("Бот успешно запущен и ждет сообщений...")
     await dp.start_polling(bot)
 
