@@ -68,13 +68,51 @@ async def cmd_list(message: types.Message, state: FSMContext):
         await message.answer("📡 **Твои подписки на дайджесты:**", parse_mode="Markdown")
         period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
         for sub in user_subs:
-            sub_id, title, period, next_send_at = sub
+            # ИЗМЕНЕНИЕ: теперь мы принимаем и распаковываем username из БД
+            sub_id, username, title, period, next_send_at = sub
             dt_obj = datetime.strptime(next_send_at, '%Y-%m-%d %H:%M:%S')
             pretty_time = dt_obj.strftime('%d.%m.%Y в %H:%M')
             
             kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отменить сбор", callback_data=f"unsub_{sub_id}")]])
             await message.answer(f"📰 Канал: *{title}*\n🔄 Частота: {period_ru.get(period, period)}\nСлед. отчет: {pretty_time}", reply_markup=kb, parse_mode="Markdown")
 
+# --- НОВАЯ КОМАНДА ДЛЯ СРОЧНОГО СБОРА ---
+@dp.message(Command("test_digest"))
+async def cmd_test_digest(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.chat.id
+    user_subs = get_user_subscriptions(user_id)
+    
+    if not user_subs:
+        await message.answer("📭 У тебя нет активных подписок для парсинга.")
+        return
+        
+    await message.answer("⏳ Собираю свежие публикации за последние 24 часа. Это займет пару секунд...")
+    
+    # Отмеряем ровно 24 часа назад от текущего момента
+    now_tz = datetime.now(TZ)
+    last_24h_str = (now_tz - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+    
+    for sub in user_subs:
+        sub_id, username, title, period, next_send_at = sub
+        try:
+            posts = await get_latest_posts(username, last_24h_str)
+            
+            if posts:
+                lines = [f"📰 <b>Тестовый дайджест: {title}</b>\n"]
+                for p in posts:
+                    text_safe = p['text'].replace('<', '&lt;').replace('>', '&gt;').replace('&', '&amp;')
+                    lines.append(f"🔹 <i>{text_safe}</i>\n<a href='{p['link']}'>Читать в канале</a>\n")
+                
+                text = "\n".join(lines)
+                for i in range(0, len(text), 4000):
+                    await message.answer(text[i:i+4000], parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+            else:
+                await message.answer(f"📰 <b>Тестовый дайджест: {title}</b>\n\nЗа последние 24 часа новых постов не было.", parse_mode="HTML")
+                
+        except Exception as e:
+            await message.answer(f"❌ Ошибка парсинга канала {title}: {e}")
+            
 @dp.callback_query(F.data.startswith("cancel_"))
 async def handle_cancel(callback: CallbackQuery):
     db_id = int(callback.data.split("_")[1])
