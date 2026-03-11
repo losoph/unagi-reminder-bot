@@ -1,5 +1,7 @@
 import asyncio
 import os
+import html
+
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -95,24 +97,26 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
     
     for sub in user_subs:
         sub_id, username, title, period, next_send_at = sub
-        try:
+    try:
             posts = await get_latest_posts(username, last_24h_str)
+            title_safe = html.escape(title) # Безопасное название канала
             
             if posts:
-                lines = [f"📰 <b>Тестовый дайджест: {title}</b>\n"]
+                lines = [f"📰 <b>Тестовый дайджест: {title_safe}</b>\n"]
                 for p in posts:
-                    text_safe = p['text'].replace('<', '&lt;').replace('>', '&gt;').replace('&', '&amp;')
+                    # Идеальное экранирование от встроенной библиотеки
+                    text_safe = html.escape(p['text'])
                     lines.append(f"🔹 <i>{text_safe}</i>\n<a href='{p['link']}'>Читать в канале</a>\n")
                 
                 text = "\n".join(lines)
                 for i in range(0, len(text), 4000):
                     await message.answer(text[i:i+4000], parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
             else:
-                await message.answer(f"📰 <b>Тестовый дайджест: {title}</b>\n\nЗа последние 24 часа новых постов не было.", parse_mode="HTML")
+                await message.answer(f"📰 <b>Тестовый дайджест: {title_safe}</b>\n\nЗа последние 24 часа новых постов не было.", parse_mode="HTML")
                 
-        except Exception as e:
+    except Exception as e:
             await message.answer(f"❌ Ошибка парсинга канала {title}: {e}")
-            
+
 @dp.callback_query(F.data.startswith("cancel_"))
 async def handle_cancel(callback: CallbackQuery):
     db_id = int(callback.data.split("_")[1])
@@ -322,22 +326,23 @@ async def check_digests():
         
         for sub in due_subs:
             sub_id, user_id, username, title, period, last_scraped = sub
-            try:
+    try:
                 posts = await get_latest_posts(username, last_scraped)
+                title_safe = html.escape(title) # Безопасное название канала
                 
                 if posts:
-                    # Используем HTML, чтобы случайные символы в постах не сломали разметку Markdown
-                    lines = [f"📰 <b>Дайджест: {title}</b>\n"]
+                    lines = [f"📰 <b>Дайджест: {title_safe}</b>\n"]
                     for p in posts:
-                        text_safe = p['text'].replace('<', '&lt;').replace('>', '&gt;').replace('&', '&amp;')
+                        # Идеальное экранирование от встроенной библиотеки
+                        text_safe = html.escape(p['text'])
                         lines.append(f"🔹 <i>{text_safe}</i>\n<a href='{p['link']}'>Читать в канале</a>\n")
                     
                     text = "\n".join(lines)
-                    # Если текст слишком длинный (лимит ТГ 4096), бьем на части
                     for i in range(0, len(text), 4000):
+                        # В фоновой задаче мы используем bot.send_message вместо message.answer
                         await bot.send_message(user_id, text[i:i+4000], parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
                 else:
-                    await bot.send_message(user_id, f"📰 <b>Дайджест: {title}</b>\n\nНовых постов за этот период не было.", parse_mode="HTML")
+                    await bot.send_message(user_id, f"📰 <b>Дайджест: {title_safe}</b>\n\nНовых постов за этот период не было.", parse_mode="HTML")
                     
                 # Высчитываем дату следующего отчета
                 now = datetime.now(TZ)
@@ -351,10 +356,10 @@ async def check_digests():
                 next_send_str = next_time.replace(hour=7, minute=0, second=0, microsecond=0).strftime('%Y-%m-%d %H:%M:%S')
                 update_subscription_time(sub_id, now_str, next_send_str)
                 
-            except Exception as e:
+    except Exception as e:
                 print(f"Ошибка дайджеста для {username}: {e}")
-                
-        await asyncio.sleep(60) # Проверяем дайджесты раз в минуту
+
+    await asyncio.sleep(60) # Проверяем дайджесты раз в минуту
 
 async def main():
     init_db()
