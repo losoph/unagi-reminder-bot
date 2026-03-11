@@ -1,17 +1,23 @@
 import asyncio
 import os
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo # Встроенная библиотека для часовых поясов
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, LinkPreviewOptions
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError
 
-from database import add_message, get_pending_messages, mark_as_sent, init_db, get_user_messages, delete_message
+from database import (
+    add_message, get_pending_messages, mark_as_sent, init_db, 
+    get_user_messages, delete_message,
+    add_subscription, get_due_subscriptions, update_subscription_time, 
+    get_user_subscriptions, delete_subscription
+)
+from scraper import get_latest_posts
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -20,12 +26,7 @@ if not BOT_TOKEN:
     raise ValueError("❌ Токен бота не найден! Проверьте файл .env")
 
 bot = Bot(token=BOT_TOKEN)
-
-# TODO: Для больших проектов память (MemoryStorage) заменяют на Redis, 
-# чтобы при перезагрузке сервера Railway пользователи не теряли свои текущие "состояния" ввода.
 dp = Dispatcher()
-
-# Фиксируем часовой пояс
 TZ = ZoneInfo("Europe/Moscow")
 
 class ScheduleState(StatesGroup):
@@ -36,54 +37,66 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "Привет! Я готов.\n\n"
-        "1️⃣ Перешли мне любое сообщение, и я предложу время для отложенной отправки.\n"
-        "2️⃣ Напиши /list, чтобы посмотреть или отменить запланированные задачи."
+        "1️⃣ Перешли мне любое сообщение, чтобы отложить его.\n"
+        "2️⃣ Перешли пост из открытого канала, чтобы подписаться на его дайджест.\n"
+        "3️⃣ Напиши /list для управления задачами."
     )
 
-# НОВАЯ ФУНКЦИЯ: Управление списком задач
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message, state: FSMContext):
     await state.clear()
+    user_id = message.chat.id
     
-    # TODO: В будущем, при переходе на асинхронную БД (aiosqlite), эта функция не будет 
-    # блокировать event-loop при высоких нагрузках. Для MVP синхронного sqlite3 более чем достаточно.
-    user_msgs = get_user_messages(message.chat.id)
+    user_msgs = get_user_messages(user_id)
+    user_subs = get_user_subscriptions(user_id)
     
-    if not user_msgs:
-        await message.answer("📭 У тебя нет активных напоминаний.")
+    if not user_msgs and not user_subs:
+        await message.answer("📭 У тебя нет активных напоминаний или подписок.")
         return
         
-    await message.answer("⏳ Твои запланированные напоминания:")
-    
-    # Выдаем каждое напоминание отдельным сообщением с кнопкой отмены
-    for msg in user_msgs:
-        db_id, send_at = msg
-        dt_obj = datetime.strptime(send_at, '%Y-%m-%d %H:%M:%S')
-        pretty_time = dt_obj.strftime('%d.%m.%Y в %H:%M')
-        
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_{db_id}")]
-        ])
-        await message.answer(f"📌 Напоминание на: {pretty_time}", reply_markup=kb)
+    if user_msgs:
+        await message.answer("⏳ **Твои разовые напоминания:**", parse_mode="Markdown")
+        for msg in user_msgs:
+            db_id, send_at = msg
+            dt_obj = datetime.strptime(send_at, '%Y-%m-%d %H:%M:%S')
+            pretty_time = dt_obj.strftime('%d.%m.%Y в %H:%M')
+            
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_{db_id}")]])
+            await message.answer(f"📌 Напоминание на: {pretty_time}", reply_markup=kb)
 
-# НОВАЯ ФУНКЦИЯ: Обработка кнопки "Отменить"
+    if user_subs:
+        await message.answer("📡 **Твои подписки на дайджесты:**", parse_mode="Markdown")
+        period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
+        for sub in user_subs:
+            sub_id, title, period, next_send_at = sub
+            dt_obj = datetime.strptime(next_send_at, '%Y-%m-%d %H:%M:%S')
+            pretty_time = dt_obj.strftime('%d.%m.%Y в %H:%M')
+            
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отменить сбор", callback_data=f"unsub_{sub_id}")]])
+            await message.answer(f"📰 Канал: *{title}*\n🔄 Частота: {period_ru.get(period, period)}\nСлед. отчет: {pretty_time}", reply_markup=kb, parse_mode="Markdown")
+
 @dp.callback_query(F.data.startswith("cancel_"))
 async def handle_cancel(callback: CallbackQuery):
     db_id = int(callback.data.split("_")[1])
     delete_message(db_id)
-    
     try:
         await callback.message.edit_text("🚫 Напоминание отменено.")
     except TelegramAPIError:
         pass
-    await callback.answer("Удалено!")
+
+@dp.callback_query(F.data.startswith("unsub_"))
+async def handle_unsub(callback: CallbackQuery):
+    sub_id = int(callback.data.split("_")[1])
+    delete_subscription(sub_id)
+    try:
+        await callback.message.edit_text("🚫 Подписка на дайджест отменена.")
+    except TelegramAPIError:
+        pass
 
 @dp.message(ScheduleState.waiting_for_datetime)
 async def process_custom_datetime(message: types.Message, state: FSMContext):
     try:
-        # Привязываем введенную дату к нашему часовому поясу
         scheduled_time = datetime.strptime(message.text, "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
-        
         if scheduled_time < datetime.now(TZ):
             await message.answer("Эта дата уже в прошлом! Попробуй еще раз (ДД.ММ.ГГГГ ЧЧ:ММ):")
             return
@@ -100,13 +113,23 @@ async def process_custom_datetime(message: types.Message, state: FSMContext):
         add_message(user_id=chat_id, message_id=msg_id, send_at=scheduled_time.strftime('%Y-%m-%d %H:%M:%S'))
         await message.answer(f"✅ Принято! Запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}.")
         await state.clear()
-        
     except ValueError:
-        await message.answer("❌ Неверный формат. Напиши точно как в примере: ДД.ММ.ГГГГ ЧЧ:ММ")
+        await message.answer("❌ Неверный формат. Пример: 15.03.2026 14:30")
 
 @dp.message()
 async def catch_message(message: types.Message, state: FSMContext):
     await state.clear() 
+    
+    is_public_channel = False
+    channel_username = None
+    channel_title = None
+
+    # Проверяем, переслано ли сообщение из публичного канала
+    if message.forward_origin and message.forward_origin.type == "channel":
+        if getattr(message.forward_origin.chat, 'username', None):
+            is_public_channel = True
+            channel_username = message.forward_origin.chat.username
+            channel_title = message.forward_origin.chat.title
     
     kb = [
         [
@@ -114,30 +137,73 @@ async def catch_message(message: types.Message, state: FSMContext):
             InlineKeyboardButton(text="☀️ День", callback_data="time_day"),
             InlineKeyboardButton(text="🌙 Вечер", callback_data="time_evening")
         ],
-        [
-            InlineKeyboardButton(text="⏱ Через минуту (тест)", callback_data="time_now")
-        ],
-        [
-            InlineKeyboardButton(text="📅 Точная дата и время", callback_data="time_custom")
-        ]
+        [InlineKeyboardButton(text="⏱ Через минуту (тест)", callback_data="time_now")],
+        [InlineKeyboardButton(text="📅 Точная дата и время", callback_data="time_custom")]
     ]
-    keyboard = InlineKeyboardMarkup(inline_keyboard=kb)
-    await message.reply("Когда мне напомнить об этом сообщении?", reply_markup=keyboard)
+    
+    # Если это канал, добавляем кнопку дайджеста и сохраняем данные в память
+    if is_public_channel:
+        kb.append([InlineKeyboardButton(text="📡 Собирать дайджест", callback_data="digest_setup")])
+        await state.update_data(channel_username=channel_username, channel_title=channel_title)
+        
+    await message.reply("Что мне сделать с этим сообщением?", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
+# --- НОВЫЙ БЛОК: Настройка дайджестов ---
+@dp.callback_query(F.data == "digest_setup")
+async def setup_digest(callback: CallbackQuery, state: FSMContext):
+    kb = [
+        [InlineKeyboardButton(text="📅 Раз в день", callback_data="period_daily")],
+        [InlineKeyboardButton(text="🗓 Раз в неделю", callback_data="period_weekly")],
+        [InlineKeyboardButton(text="📊 Раз в месяц", callback_data="period_monthly")]
+    ]
+    await callback.message.edit_text("Как часто присылать новые посты из этого канала?", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
+@dp.callback_query(F.data.startswith("period_"))
+async def save_subscription(callback: CallbackQuery, state: FSMContext):
+    period = callback.data.split("_")[1]
+    data = await state.get_data()
+    username = data.get("channel_username")
+    title = data.get("channel_title")
+    
+    if not username:
+        await callback.message.edit_text("❌ Ошибка: данные канала утеряны.")
+        return
+        
+    now = datetime.now(TZ)
+    # Назначаем следующую отправку на 07:00
+    next_send = now.replace(hour=7, minute=0, second=0, microsecond=0)
+    if next_send <= now:
+        next_send += timedelta(days=1)
+        
+    last_scraped = now.strftime('%Y-%m-%d %H:%M:%S')
+    
+    add_subscription(
+        user_id=callback.message.chat.id,
+        channel_username=username,
+        channel_title=title,
+        period=period,
+        last_scraped_at=last_scraped,
+        next_send_at=next_send.strftime('%Y-%m-%d %H:%M:%S')
+    )
+    
+    period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
+    try:
+        await callback.message.edit_text(f"✅ Подписка оформлена!\nДайджест канала *{title}* будет приходить {period_ru[period]} в 07:00.", parse_mode="Markdown")
+    except TelegramAPIError:
+        pass
+    await state.clear()
+
+# --- СТАРЫЙ БЛОК: Обработка времени ---
 @dp.callback_query(F.data.startswith("time_"))
 async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    
-    # Все расчеты теперь строго в нашем часовом поясе
     now = datetime.now(TZ)
     scheduled_time = None
     label = ""
 
     if callback.data == "time_custom":
-        # ЗАЩИТА №1: Проверяем, существует ли пересланное сообщение
         if callback.message.reply_to_message is None:
-            await callback.message.edit_text("❌ Ошибка: не могу найти оригинальное сообщение. Попробуй переслать его заново.")
+            await callback.message.edit_text("❌ Ошибка: не могу найти оригинальное сообщение.")
             return
 
         msg_id = callback.message.reply_to_message.message_id
@@ -154,7 +220,6 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
             suggested_time = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
             
         suggested_str = suggested_time.strftime('%d.%m.%Y %H:%M')
-        
         await callback.message.edit_text(
             "Напиши точную дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ\n\n"
             "💡 *Лайфхак:* нажми на время ниже, чтобы скопировать его:\n\n"
@@ -182,7 +247,7 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
 
     if scheduled_time:
         if callback.message.reply_to_message is None:
-            await callback.message.edit_text("❌ Ошибка: не могу найти оригинальное сообщение. Попробуй переслать его заново.")
+            await callback.message.edit_text("❌ Ошибка: не могу найти оригинальное сообщение.")
             return
 
         chat_id = callback.message.chat.id
@@ -194,11 +259,9 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
         except TelegramAPIError:
             pass
 
+# --- ФОНОВЫЕ ПРОЦЕССЫ ---
 async def check_messages():
-    # TODO: В будущем бесконечный цикл `while True` с `sleep()` лучше заменить на 
-    # профессиональный планировщик задач, например APScheduler или Celery.
     while True:
-        # Передаем точное время в нашем поясе
         now_str = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
         pending = get_pending_messages(now_str)
         
@@ -208,21 +271,58 @@ async def check_messages():
                 chat_id = int(chat_id)
                 await bot.forward_message(chat_id=chat_id, from_chat_id=chat_id, message_id=message_id)
                 mark_as_sent(db_id)
-                
-                # TODO: Если бот будет массово рассылать сотни сообщений в одну секунду, 
-                # Telegram выдаст бан за спам. Сюда стоит добавить `await asyncio.sleep(0.05)`, 
-                # чтобы искусственно тормозить отправку.
-                
             except Exception as e:
-                print(f"❌ Ошибка при отправке сообщения {message_id}: {e}")
+                print(f"❌ Ошибка отправки {message_id}: {e}")
                 mark_as_sent(db_id)
         
         await asyncio.sleep(30)
+
+async def check_digests():
+    while True:
+        now_str = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
+        due_subs = get_due_subscriptions(now_str)
+        
+        for sub in due_subs:
+            sub_id, user_id, username, title, period, last_scraped = sub
+            try:
+                posts = await get_latest_posts(username, last_scraped)
+                
+                if posts:
+                    # Используем HTML, чтобы случайные символы в постах не сломали разметку Markdown
+                    lines = [f"📰 <b>Дайджест: {title}</b>\n"]
+                    for p in posts:
+                        text_safe = p['text'].replace('<', '&lt;').replace('>', '&gt;').replace('&', '&amp;')
+                        lines.append(f"🔹 <i>{text_safe}</i>\n<a href='{p['link']}'>Читать в канале</a>\n")
+                    
+                    text = "\n".join(lines)
+                    # Если текст слишком длинный (лимит ТГ 4096), бьем на части
+                    for i in range(0, len(text), 4000):
+                        await bot.send_message(user_id, text[i:i+4000], parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+                else:
+                    await bot.send_message(user_id, f"📰 <b>Дайджест: {title}</b>\n\nНовых постов за этот период не было.", parse_mode="HTML")
+                    
+                # Высчитываем дату следующего отчета
+                now = datetime.now(TZ)
+                if period == "daily":
+                    next_time = now + timedelta(days=1)
+                elif period == "weekly":
+                    next_time = now + timedelta(days=7)
+                else:
+                    next_time = now + timedelta(days=30)
+                    
+                next_send_str = next_time.replace(hour=7, minute=0, second=0, microsecond=0).strftime('%Y-%m-%d %H:%M:%S')
+                update_subscription_time(sub_id, now_str, next_send_str)
+                
+            except Exception as e:
+                print(f"Ошибка дайджеста для {username}: {e}")
+                
+        await asyncio.sleep(60) # Проверяем дайджесты раз в минуту
 
 async def main():
     init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(check_messages())
+    asyncio.create_task(check_digests()) # Запуск парсера в фоне
     print("Бот успешно запущен и ждет сообщений...")
     await dp.start_polling(bot)
 
