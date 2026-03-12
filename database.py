@@ -19,7 +19,7 @@ def init_db():
         )
     ''')
     
-    # НОВАЯ ТАБЛИЦА: Подписки на каналы
+    # Таблица подписок на каналы
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS subscriptions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,8 +35,6 @@ def init_db():
     conn.commit()
     conn.close()
     print(f"База данных успешно инициализирована по пути: {DB_PATH}")
-
-# --- ФУНКЦИИ РАЗОВЫХ НАПОМИНАНИЙ (БЕЗ ИЗМЕНЕНИЙ) ---
 
 def add_message(user_id, message_id, send_at):
     conn = sqlite3.connect(DB_PATH)
@@ -78,8 +76,6 @@ def delete_message(msg_id):
     conn.commit()
     conn.close()
 
-# --- НОВЫЕ ФУНКЦИИ ДЛЯ ДАЙДЖЕСТОВ ---
-
 def add_subscription(user_id, channel_username, channel_title, period, last_scraped_at, next_send_at):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -116,18 +112,17 @@ def update_subscription_time(sub_id, last_scraped_at, next_send_at):
 def get_user_subscriptions(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # ИЗМЕНЕНИЕ: добавили channel_username, чтобы передавать его в парсер
+    # Здесь учтен наш исправленный запрос с channel_username
     cursor.execute('SELECT id, channel_username, channel_title, period, next_send_at FROM subscriptions WHERE user_id = ? ORDER BY next_send_at', 
                    (user_id,))
     rows = cursor.fetchall()
     conn.close()
     return rows
 
-def get_user_subscriptions(user_id):
+def delete_subscription(sub_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('SELECT id, channel_username, channel_title, period, next_send_at FROM subscriptions WHERE user_id = ? ORDER BY next_send_at', 
-                   (user_id,))
-    rows = cursor.fetchall()
+    cursor.execute('DELETE FROM subscriptions WHERE id = ?', (sub_id,))
+    conn.commit()
     conn.close()
-    return rows
+    
