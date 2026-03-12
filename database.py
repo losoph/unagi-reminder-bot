@@ -116,15 +116,18 @@ def update_subscription_time(sub_id, last_scraped_at, next_send_at):
 def get_user_subscriptions(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('SELECT id, channel_title, period, next_send_at FROM subscriptions WHERE user_id = ? ORDER BY next_send_at', 
+    # ИЗМЕНЕНИЕ: добавили channel_username, чтобы передавать его в парсер
+    cursor.execute('SELECT id, channel_username, channel_title, period, next_send_at FROM subscriptions WHERE user_id = ? ORDER BY next_send_at', 
                    (user_id,))
     rows = cursor.fetchall()
     conn.close()
     return rows
 
-def delete_subscription(sub_id):
+def get_user_subscriptions(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('DELETE FROM subscriptions WHERE id = ?', (sub_id,))
-    conn.commit()
+    cursor.execute('SELECT id, channel_username, channel_title, period, next_send_at FROM subscriptions WHERE user_id = ? ORDER BY next_send_at', 
+                   (user_id,))
+    rows = cursor.fetchall()
     conn.close()
+    return rows
