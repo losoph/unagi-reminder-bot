@@ -1,7 +1,7 @@
 import asyncio
 import os
 import html
-
+import logging # <-- Включаем систему логов
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -20,6 +20,9 @@ from database import (
     get_user_subscriptions, delete_subscription
 )
 from scraper import get_latest_posts
+
+# ЗАСТАВЛЯЕМ БОТА ВЫВОДИТЬ ВСЕ ОШИБКИ В КОНСОЛЬ RAILWAY
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -70,52 +73,12 @@ async def cmd_list(message: types.Message, state: FSMContext):
         await message.answer("📡 **Твои подписки на дайджесты:**", parse_mode="Markdown")
         period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
         for sub in user_subs:
-            # ИЗМЕНЕНИЕ: теперь мы принимаем и распаковываем username из БД
             sub_id, username, title, period, next_send_at = sub
             dt_obj = datetime.strptime(next_send_at, '%Y-%m-%d %H:%M:%S')
             pretty_time = dt_obj.strftime('%d.%m.%Y в %H:%M')
             
             kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отменить сбор", callback_data=f"unsub_{sub_id}")]])
             await message.answer(f"📰 Канал: *{title}*\n🔄 Частота: {period_ru.get(period, period)}\nСлед. отчет: {pretty_time}", reply_markup=kb, parse_mode="Markdown")
-
-# --- НОВАЯ КОМАНДА ДЛЯ СРОЧНОГО СБОРА ---
-@dp.message(Command("test_digest"))
-async def cmd_test_digest(message: types.Message, state: FSMContext):
-    await state.clear()
-    user_id = message.chat.id
-    user_subs = get_user_subscriptions(user_id)
-    
-    if not user_subs:
-        await message.answer("📭 У тебя нет активных подписок для парсинга.")
-        return
-        
-    await message.answer("⏳ Собираю свежие публикации за последние 24 часа. Это займет пару секунд...")
-    
-    # Отмеряем ровно 24 часа назад от текущего момента
-    now_tz = datetime.now(TZ)
-    last_24h_str = (now_tz - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
-    
-    for sub in user_subs:
-        sub_id, username, title, period, next_send_at = sub
-    try:
-            posts = await get_latest_posts(username, last_24h_str)
-            title_safe = html.escape(title) # Безопасное название канала
-            
-            if posts:
-                lines = [f"📰 <b>Тестовый дайджест: {title_safe}</b>\n"]
-                for p in posts:
-                    # Идеальное экранирование от встроенной библиотеки
-                    text_safe = html.escape(p['text'])
-                    lines.append(f"🔹 <i>{text_safe}</i>\n<a href='{p['link']}'>Читать в канале</a>\n")
-                
-                text = "\n".join(lines)
-                for i in range(0, len(text), 4000):
-                    await message.answer(text[i:i+4000], parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
-            else:
-                await message.answer(f"📰 <b>Тестовый дайджест: {title_safe}</b>\n\nЗа последние 24 часа новых постов не было.", parse_mode="HTML")
-                
-    except Exception as e:
-            await message.answer(f"❌ Ошибка парсинга канала {title}: {e}")
 
 @dp.callback_query(F.data.startswith("cancel_"))
 async def handle_cancel(callback: CallbackQuery):
@@ -158,6 +121,54 @@ async def process_custom_datetime(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Неверный формат. Пример: 15.03.2026 14:30")
 
+# --- КОМАНДА ДЛЯ СРОЧНОГО СБОРА (С МАЯЧКАМИ DEBUG) ---
+@dp.message(Command("test_digest"))
+async def cmd_test_digest(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.chat.id
+    print(f"[DEBUG] Запрошен /test_digest от пользователя {user_id}")
+    
+    user_subs = get_user_subscriptions(user_id)
+    
+    if not user_subs:
+        await message.answer("📭 У тебя нет активных подписок для парсинга.")
+        return
+        
+    await message.answer("⏳ Собираю свежие публикации за последние 24 часа. Это займет пару секунд...")
+    
+    now_tz = datetime.now(TZ)
+    last_24h_str = (now_tz - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+    
+    for sub in user_subs:
+        sub_id, username, title, period, next_send_at = sub
+        print(f"[DEBUG] Начинаю парсинг канала: {username} (Title: {title})")
+        
+        try:
+            posts = await get_latest_posts(username, last_24h_str)
+            print(f"[DEBUG] Для канала {username} найдено постов: {len(posts)}")
+            
+            # На случай, если у канала почему-то нет Title
+            title_safe = html.escape(title) if title else "Без названия"
+            
+            if posts:
+                lines = [f"📰 <b>Тестовый дайджест: {title_safe}</b>\n"]
+                for p in posts:
+                    text_safe = html.escape(p['text'])
+                    lines.append(f"🔹 <i>{text_safe}</i>\n<a href='{p['link']}'>Читать в канале</a>\n")
+                
+                text = "\n".join(lines)
+                print(f"[DEBUG] Отправляю сообщение с постами в Телеграм...")
+                for i in range(0, len(text), 4000):
+                    await message.answer(text[i:i+4000], parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+            else:
+                await message.answer(f"📰 <b>Тестовый дайджест: {title_safe}</b>\n\nЗа последние 24 часа новых постов не было.", parse_mode="HTML")
+                
+        except Exception as e:
+            print(f"[ERROR] Ошибка при обработке канала {username}: {e}")
+            await message.answer(f"❌ Ошибка парсинга канала {title}: {e}")
+            
+    print(f"[DEBUG] Команда /test_digest полностью завершена.")
+
 @dp.message()
 async def catch_message(message: types.Message, state: FSMContext):
     await state.clear() 
@@ -166,7 +177,6 @@ async def catch_message(message: types.Message, state: FSMContext):
     channel_username = None
     channel_title = None
 
-    # Проверяем, переслано ли сообщение из публичного канала
     if message.forward_origin and message.forward_origin.type == "channel":
         if getattr(message.forward_origin.chat, 'username', None):
             is_public_channel = True
@@ -183,14 +193,12 @@ async def catch_message(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="📅 Точная дата и время", callback_data="time_custom")]
     ]
     
-    # Если это канал, добавляем кнопку дайджеста и сохраняем данные в память
     if is_public_channel:
         kb.append([InlineKeyboardButton(text="📡 Собирать дайджест", callback_data="digest_setup")])
         await state.update_data(channel_username=channel_username, channel_title=channel_title)
         
     await message.reply("Что мне сделать с этим сообщением?", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-# --- НОВЫЙ БЛОК: Настройка дайджестов ---
 @dp.callback_query(F.data == "digest_setup")
 async def setup_digest(callback: CallbackQuery, state: FSMContext):
     kb = [
@@ -212,7 +220,6 @@ async def save_subscription(callback: CallbackQuery, state: FSMContext):
         return
         
     now = datetime.now(TZ)
-    # Назначаем следующую отправку на 07:00
     next_send = now.replace(hour=7, minute=0, second=0, microsecond=0)
     if next_send <= now:
         next_send += timedelta(days=1)
@@ -235,7 +242,6 @@ async def save_subscription(callback: CallbackQuery, state: FSMContext):
         pass
     await state.clear()
 
-# --- СТАРЫЙ БЛОК: Обработка времени ---
 @dp.callback_query(F.data.startswith("time_"))
 async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -301,7 +307,6 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
         except TelegramAPIError:
             pass
 
-# --- ФОНОВЫЕ ПРОЦЕССЫ ---
 async def check_messages():
     while True:
         now_str = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
@@ -326,25 +331,22 @@ async def check_digests():
         
         for sub in due_subs:
             sub_id, user_id, username, title, period, last_scraped = sub
-    try:
+            try:
                 posts = await get_latest_posts(username, last_scraped)
-                title_safe = html.escape(title) # Безопасное название канала
+                title_safe = html.escape(title) if title else "Канал"
                 
                 if posts:
                     lines = [f"📰 <b>Дайджест: {title_safe}</b>\n"]
                     for p in posts:
-                        # Идеальное экранирование от встроенной библиотеки
                         text_safe = html.escape(p['text'])
                         lines.append(f"🔹 <i>{text_safe}</i>\n<a href='{p['link']}'>Читать в канале</a>\n")
                     
                     text = "\n".join(lines)
                     for i in range(0, len(text), 4000):
-                        # В фоновой задаче мы используем bot.send_message вместо message.answer
                         await bot.send_message(user_id, text[i:i+4000], parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
                 else:
                     await bot.send_message(user_id, f"📰 <b>Дайджест: {title_safe}</b>\n\nНовых постов за этот период не было.", parse_mode="HTML")
                     
-                # Высчитываем дату следующего отчета
                 now = datetime.now(TZ)
                 if period == "daily":
                     next_time = now + timedelta(days=1)
@@ -356,16 +358,16 @@ async def check_digests():
                 next_send_str = next_time.replace(hour=7, minute=0, second=0, microsecond=0).strftime('%Y-%m-%d %H:%M:%S')
                 update_subscription_time(sub_id, now_str, next_send_str)
                 
-    except Exception as e:
+            except Exception as e:
                 print(f"Ошибка дайджеста для {username}: {e}")
-
-    await asyncio.sleep(60) # Проверяем дайджесты раз в минуту
+                
+        await asyncio.sleep(60)
 
 async def main():
     init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(check_messages())
-    asyncio.create_task(check_digests()) # Запуск парсера в фоне
+    asyncio.create_task(check_digests()) 
     print("Бот успешно запущен и ждет сообщений...")
     await dp.start_polling(bot)
 
