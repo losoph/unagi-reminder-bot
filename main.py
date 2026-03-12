@@ -154,6 +154,7 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
                     digest_lines.append(f"🔹 <i>{text_safe}</i> <a href='{p['link']}'>[Читать]</a>\n")
                 digest_lines.append("") # Пустая строка между каналами
         except Exception as e:
+            has_news = True  # Специально ставим True, чтобы бот не скрыл текст ошибки
             digest_lines.append(f"❌ Ошибка парсинга канала <b>{title_safe}</b>: {e}\n")
             
     if not has_news:
@@ -397,7 +398,7 @@ async def check_digests():
                         print(f"Ошибка отправки лонгрида пользователю {user_id}: {e}")
         
         await asyncio.sleep(60)
-        
+
 async def main():
     init_db()
     await bot.delete_webhook(drop_pending_updates=True)
