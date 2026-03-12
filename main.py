@@ -126,48 +126,54 @@ async def process_custom_datetime(message: types.Message, state: FSMContext):
 async def cmd_test_digest(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.chat.id
-    print(f"[DEBUG] Запрошен /test_digest от пользователя {user_id}")
-    
     user_subs = get_user_subscriptions(user_id)
     
     if not user_subs:
         await message.answer("📭 У тебя нет активных подписок для парсинга.")
         return
         
-    await message.answer("⏳ Собираю свежие публикации за последние 24 часа. Это займет пару секунд...")
+    await message.answer("⏳ Собираю единый дайджест за последние 24 часа...")
     
     now_tz = datetime.now(TZ)
     last_24h_str = (now_tz - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
     
+    digest_lines = [f"📰 <b>Твоя тестовая утренняя газета</b> ☕️\n\n"]
+    has_news = False
+    
     for sub in user_subs:
         sub_id, username, title, period, next_send_at = sub
-        print(f"[DEBUG] Начинаю парсинг канала: {username} (Title: {title})")
+        title_safe = html.escape(title) if title else "Без названия"
         
         try:
             posts = await get_latest_posts(username, last_24h_str)
-            print(f"[DEBUG] Для канала {username} найдено постов: {len(posts)}")
-            
-            # На случай, если у канала почему-то нет Title
-            title_safe = html.escape(title) if title else "Без названия"
-            
             if posts:
-                lines = [f"📰 <b>Тестовый дайджест: {title_safe}</b>\n"]
+                has_news = True
+                digest_lines.append(f"📌 <b>{title_safe}</b>")
                 for p in posts:
                     text_safe = html.escape(p['text'])
-                    lines.append(f"🔹 <i>{text_safe}</i>\n<a href='{p['link']}'>Читать в канале</a>\n")
-                
-                text = "\n".join(lines)
-                print(f"[DEBUG] Отправляю сообщение с постами в Телеграм...")
-                for i in range(0, len(text), 4000):
-                    await message.answer(text[i:i+4000], parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
-            else:
-                await message.answer(f"📰 <b>Тестовый дайджест: {title_safe}</b>\n\nЗа последние 24 часа новых постов не было.", parse_mode="HTML")
-                
+                    digest_lines.append(f"🔹 <i>{text_safe}</i> <a href='{p['link']}'>[Читать]</a>\n")
+                digest_lines.append("") # Пустая строка между каналами
         except Exception as e:
-            print(f"[ERROR] Ошибка при обработке канала {username}: {e}")
-            await message.answer(f"❌ Ошибка парсинга канала {title}: {e}")
+            digest_lines.append(f"❌ Ошибка парсинга канала <b>{title_safe}</b>: {e}\n")
             
-    print(f"[DEBUG] Команда /test_digest полностью завершена.")
+    if not has_news:
+        await message.answer("📭 За последние 24 часа новых постов ни в одном из каналов не было.")
+        return
+        
+    # Умная разбивка текста: не режем HTML-теги пополам
+    chunks = []
+    current_chunk = ""
+    for line in digest_lines:
+        if len(current_chunk) + len(line) > 4000:
+            chunks.append(current_chunk)
+            current_chunk = line + "\n"
+        else:
+            current_chunk += line + "\n"
+    if current_chunk:
+        chunks.append(current_chunk)
+        
+    for chunk in chunks:
+        await message.answer(chunk, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 @dp.message()
 async def catch_message(message: types.Message, state: FSMContext):
@@ -329,40 +335,69 @@ async def check_digests():
         now_str = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
         due_subs = get_due_subscriptions(now_str)
         
+        # Группируем задачи по пользователям
+        users_subs = {}
         for sub in due_subs:
-            sub_id, user_id, username, title, period, last_scraped = sub
-            try:
-                posts = await get_latest_posts(username, last_scraped)
+            # sub = (id, user_id, channel_username, channel_title, period, last_scraped_at)
+            user_id = sub[1]
+            if user_id not in users_subs:
+                users_subs[user_id] = []
+            users_subs[user_id].append(sub)
+            
+        for user_id, subs in users_subs.items():
+            digest_lines = [f"📰 <b>Твоя утренняя газета</b> ☕️\n\n"]
+            has_news = False
+            
+            for sub in subs:
+                sub_id, uid, username, title, period, last_scraped = sub
                 title_safe = html.escape(title) if title else "Канал"
                 
-                if posts:
-                    lines = [f"📰 <b>Дайджест: {title_safe}</b>\n"]
-                    for p in posts:
-                        text_safe = html.escape(p['text'])
-                        lines.append(f"🔹 <i>{text_safe}</i>\n<a href='{p['link']}'>Читать в канале</a>\n")
+                try:
+                    posts = await get_latest_posts(username, last_scraped)
+                    if posts:
+                        has_news = True
+                        digest_lines.append(f"📌 <b>{title_safe}</b>")
+                        for p in posts:
+                            text_safe = html.escape(p['text'])
+                            digest_lines.append(f"🔹 <i>{text_safe}</i> <a href='{p['link']}'>[Читать]</a>\n")
+                        digest_lines.append("") # Пустая строка
+                        
+                    # Обновляем таймер в базе в любом случае
+                    now = datetime.now(TZ)
+                    if period == "daily":
+                        next_time = now + timedelta(days=1)
+                    elif period == "weekly":
+                        next_time = now + timedelta(days=7)
+                    else:
+                        next_time = now + timedelta(days=30)
+                        
+                    next_send_str = next_time.replace(hour=7, minute=0, second=0, microsecond=0).strftime('%Y-%m-%d %H:%M:%S')
+                    update_subscription_time(sub_id, now_str, next_send_str)
                     
-                    text = "\n".join(lines)
-                    for i in range(0, len(text), 4000):
-                        await bot.send_message(user_id, text[i:i+4000], parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
-                else:
-                    await bot.send_message(user_id, f"📰 <b>Дайджест: {title_safe}</b>\n\nНовых постов за этот период не было.", parse_mode="HTML")
+                except Exception as e:
+                    print(f"Ошибка дайджеста для {username}: {e}")
+            
+            # Отправляем газету ТОЛЬКО если есть новости
+            if has_news:
+                chunks = []
+                current_chunk = ""
+                for line in digest_lines:
+                    if len(current_chunk) + len(line) > 4000:
+                        chunks.append(current_chunk)
+                        current_chunk = line + "\n"
+                    else:
+                        current_chunk += line + "\n"
+                if current_chunk:
+                    chunks.append(current_chunk)
                     
-                now = datetime.now(TZ)
-                if period == "daily":
-                    next_time = now + timedelta(days=1)
-                elif period == "weekly":
-                    next_time = now + timedelta(days=7)
-                else:
-                    next_time = now + timedelta(days=30)
-                    
-                next_send_str = next_time.replace(hour=7, minute=0, second=0, microsecond=0).strftime('%Y-%m-%d %H:%M:%S')
-                update_subscription_time(sub_id, now_str, next_send_str)
-                
-            except Exception as e:
-                print(f"Ошибка дайджеста для {username}: {e}")
-                
+                for chunk in chunks:
+                    try:
+                        await bot.send_message(user_id, chunk, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+                    except Exception as e:
+                        print(f"Ошибка отправки лонгрида пользователю {user_id}: {e}")
+        
         await asyncio.sleep(60)
-
+        
 async def main():
     init_db()
     await bot.delete_webhook(drop_pending_updates=True)
