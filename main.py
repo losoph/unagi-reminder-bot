@@ -36,9 +36,7 @@ TZ = ZoneInfo("Europe/Moscow")
 class ScheduleState(StatesGroup):
     waiting_for_datetime = State()
 
-# 👇👇👇 НОВЫЙ КОД: Вспомогательные функции (Оптимизация и вытаскивание цитат) 👇👇👇
 def chunk_html_text(lines, max_length=4000):
-    """Оптимизация: универсальная функция для разбивки длинных текстов"""
     chunks, current = [], ""
     for line in lines:
         if len(current) + len(line) > max_length:
@@ -51,7 +49,6 @@ def chunk_html_text(lines, max_length=4000):
     return chunks
 
 def get_message_preview(msg: types.Message):
-    """Вытаскивает первые 40 символов сообщения и имя автора/канала"""
     text = msg.text or msg.caption or "🖼 Медиафайл"
     preview = text.replace('\n', ' ')[:40] + "..." if len(text) > 40 else text.replace('\n', ' ')
     
@@ -67,7 +64,6 @@ def get_message_preview(msg: types.Message):
             source = getattr(msg.forward_origin.chat, 'title', 'Группа')
             
     return preview, source
-# 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -79,7 +75,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "3️⃣ Напиши /list для управления задачами."
     )
 
-# 👇👇👇 НОВЫЙ КОД: Полностью переписанный умный /list и обработчики кнопок 👇👇👇
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message, state: FSMContext):
     await state.clear()
@@ -125,7 +120,6 @@ async def handle_cancel(callback: CallbackQuery):
     db_id = int(callback.data.split("_")[1])
     delete_message(db_id)
     
-    # Перерисовываем список напоминаний
     user_msgs = get_user_messages(callback.message.chat.id)
     if not user_msgs:
         await callback.message.edit_text("📭 Все разовые напоминания отменены.")
@@ -151,7 +145,6 @@ async def handle_unsub(callback: CallbackQuery):
     sub_id = int(callback.data.split("_")[1])
     delete_subscription(sub_id)
     
-    # Перерисовываем список подписок
     user_subs = get_user_subscriptions(callback.message.chat.id)
     if not user_subs:
         await callback.message.edit_text("📭 Все подписки на дайджесты отменены.")
@@ -172,9 +165,8 @@ async def handle_unsub(callback: CallbackQuery):
     except TelegramAPIError:
         pass
     await callback.answer("Удалено!")
-# 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
 
-# 👇👇👇 НОВЫЙ КОД: Сохранение цитат при выборе точного времени 👇👇👇
+# 👇👇👇 НОВЫЙ КОД: Уборка мусора при ручном вводе времени 👇👇👇
 @dp.message(ScheduleState.waiting_for_datetime)
 async def process_custom_datetime(message: types.Message, state: FSMContext):
     try:
@@ -187,6 +179,7 @@ async def process_custom_datetime(message: types.Message, state: FSMContext):
         msg_id = data.get('message_id')
         preview = data.get('preview', '')
         source = data.get('source', '')
+        prompt_msg_id = data.get('prompt_msg_id') # ID вопроса бота
         
         if not msg_id:
             await message.answer("Ошибка: не найден ID сообщения. Попробуй переслать его заново.")
@@ -194,8 +187,25 @@ async def process_custom_datetime(message: types.Message, state: FSMContext):
             return
             
         add_message(message.chat.id, msg_id, scheduled_time.strftime('%Y-%m-%d %H:%M:%S'), preview, source)
-        await message.answer(f"✅ Принято! Запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}.")
+        
+        # Зачистка: удаляем сообщение пользователя с датой и вопрос бота
+        try:
+            await message.delete() 
+            if prompt_msg_id:
+                await bot.delete_message(message.chat.id, prompt_msg_id)
+        except TelegramAPIError:
+            pass
+            
+        # Отправляем подтверждение и запускаем таймер на его удаление
+        confirm_msg = await message.answer(f"✅ Принято! Запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}.")
         await state.clear()
+        
+        await asyncio.sleep(3)
+        try:
+            await confirm_msg.delete()
+        except TelegramAPIError:
+            pass
+            
     except ValueError:
         await message.answer("❌ Неверный формат. Пример: 15.03.2026 14:30")
 # 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
@@ -239,7 +249,6 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
         await message.answer("📭 За последние 24 часа новых постов ни в одном из каналов не было.")
         return
         
-    # Использование оптимизированной функции разбивки текста
     for chunk in chunk_html_text(digest_lines):
         await message.answer(chunk, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
 
@@ -282,6 +291,7 @@ async def setup_digest(callback: CallbackQuery, state: FSMContext):
     ]
     await callback.message.edit_text("Как часто присылать новые посты из этого канала?", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
+# 👇👇👇 НОВЫЙ КОД: Зачистка чата при подписке на дайджест 👇👇👇
 @dp.callback_query(F.data.startswith("period_"))
 async def save_subscription(callback: CallbackQuery, state: FSMContext):
     period = callback.data.split("_")[1]
@@ -299,27 +309,27 @@ async def save_subscription(callback: CallbackQuery, state: FSMContext):
         next_send += timedelta(days=1)
         
     last_scraped = now.strftime('%Y-%m-%d %H:%M:%S')
-    
-    add_subscription(
-        user_id=callback.message.chat.id,
-        channel_username=username,
-        channel_title=title,
-        period=period,
-        last_scraped_at=last_scraped,
-        next_send_at=next_send.strftime('%Y-%m-%d %H:%M:%S')
-    )
+    add_subscription(callback.message.chat.id, username, title, period, last_scraped, next_send.strftime('%Y-%m-%d %H:%M:%S'))
     
     period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
+    
+    # 1. Показываем всплывающее окно поверх чата
+    await callback.answer(f"✅ Дайджест {title} оформлен!\nБудет приходить {period_ru[period]} в 07:00.", show_alert=True)
+    
+    # 2. Удаляем мусор (исходный пост и меню бота)
     try:
-        await callback.message.edit_text(f"✅ Подписка оформлена!\nДайджест канала *{title}* будет приходить {period_ru[period]} в 07:00.", parse_mode="Markdown")
+        if callback.message.reply_to_message:
+            await bot.delete_message(callback.message.chat.id, callback.message.reply_to_message.message_id)
+        await callback.message.delete()
     except TelegramAPIError:
         pass
+        
     await state.clear()
+# 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
 
-# 👇👇👇 НОВЫЙ КОД: Сохранение цитат при выборе быстрых кнопок 👇👇👇
+# 👇👇👇 НОВЫЙ КОД: Магическая уборка при быстрых кнопках напоминаний 👇👇👇
 @dp.callback_query(F.data.startswith("time_"))
 async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
     now = datetime.now(TZ)
     scheduled_time = None
     label = ""
@@ -332,7 +342,8 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
     preview, source = get_message_preview(orig_msg)
 
     if callback.data == "time_custom":
-        await state.update_data(message_id=orig_msg.message_id, preview=preview, source=source)
+        # Запоминаем ID меню бота, чтобы потом его удалить
+        await state.update_data(message_id=orig_msg.message_id, preview=preview, source=source, prompt_msg_id=callback.message.message_id)
         await state.set_state(ScheduleState.waiting_for_datetime)
         
         if now.hour < 8:
@@ -372,9 +383,13 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
 
     if scheduled_time:
         try:
+            # Обновляем текст меню
             await callback.message.edit_text(f"✅ Принято! Отправлю это сообщение тебе {label}.")
-            # Передаем превью и источник в базу данных
             add_message(callback.message.chat.id, orig_msg.message_id, scheduled_time.strftime('%Y-%m-%d %H:%M:%S'), preview, source)
+            
+            # Самоуничтожение подтверждения через 3 секунды
+            await asyncio.sleep(3)
+            await callback.message.delete()
         except TelegramAPIError:
             pass
 # 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
@@ -441,7 +456,6 @@ async def check_digests():
                     print(f"Ошибка дайджеста для {username}: {e}")
             
             if has_news:
-                # Использование оптимизированной функции разбивки текста
                 for chunk in chunk_html_text(digest_lines):
                     try:
                         await bot.send_message(user_id, chunk, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
