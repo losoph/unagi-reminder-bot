@@ -192,11 +192,11 @@ async def catch_message(message: types.Message, state: FSMContext):
     
     kb = [
         [
-            InlineKeyboardButton(text="🌅 Утро", callback_data="time_morning"),
-            InlineKeyboardButton(text="☀️ День", callback_data="time_day"),
-            InlineKeyboardButton(text="🌙 Вечер", callback_data="time_evening")
+            InlineKeyboardButton(text="🌅 Утром в 9", callback_data="time_morning"),
+            InlineKeyboardButton(text="☀️ Днем в 14", callback_data="time_day"),
+            InlineKeyboardButton(text="🌙 Вечером в 20", callback_data="time_evening")
         ],
-        [InlineKeyboardButton(text="⏱ Через минуту (тест)", callback_data="time_now")],
+        [InlineKeyboardButton(text="⏱ Через 3 часа", callback_data="time_now")],
         [InlineKeyboardButton(text="📅 Точная дата и время", callback_data="time_custom")]
     ]
     
@@ -204,7 +204,7 @@ async def catch_message(message: types.Message, state: FSMContext):
         kb.append([InlineKeyboardButton(text="📡 Собирать дайджест", callback_data="digest_setup")])
         await state.update_data(channel_username=channel_username, channel_title=channel_title)
         
-    await message.reply("Что мне сделать с этим сообщением?", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await message.reply("Что мне сделать с этим сообщением? Могу добавить в утренний дайджет (для открытых каналов) либо вернуть тебе это сообщение в определенное время", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data == "digest_setup")
 async def setup_digest(callback: CallbackQuery, state: FSMContext):
@@ -297,8 +297,8 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
             scheduled_time += timedelta(days=1)
         label = "на 20:00"
     elif callback.data == "time_now":
-        scheduled_time = now + timedelta(minutes=1)
-        label = "через 1 минуту (тест)"
+        scheduled_time = now + timedelta(minutes=90)
+        label = "через 3 часа"
 
     if scheduled_time:
         if callback.message.reply_to_message is None:
