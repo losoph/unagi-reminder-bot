@@ -139,3 +139,4 @@ def delete_subscription(sub_id):
     cursor.execute('DELETE FROM subscriptions WHERE id = ?', (sub_id,))
     conn.commit()
     conn.close()
+    

@@ -1,7 +1,7 @@
 import asyncio
 import os
 import html
-import logging # <-- Включаем систему логов
+import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -21,7 +21,6 @@ from database import (
 )
 from scraper import get_latest_posts
 
-# ЗАСТАВЛЯЕМ БОТА ВЫВОДИТЬ ВСЕ ОШИБКИ В КОНСОЛЬ RAILWAY
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 load_dotenv()
@@ -37,6 +36,39 @@ TZ = ZoneInfo("Europe/Moscow")
 class ScheduleState(StatesGroup):
     waiting_for_datetime = State()
 
+# 👇👇👇 НОВЫЙ КОД: Вспомогательные функции (Оптимизация и вытаскивание цитат) 👇👇👇
+def chunk_html_text(lines, max_length=4000):
+    """Оптимизация: универсальная функция для разбивки длинных текстов"""
+    chunks, current = [], ""
+    for line in lines:
+        if len(current) + len(line) > max_length:
+            chunks.append(current)
+            current = line + "\n"
+        else:
+            current += line + "\n"
+    if current:
+        chunks.append(current)
+    return chunks
+
+def get_message_preview(msg: types.Message):
+    """Вытаскивает первые 40 символов сообщения и имя автора/канала"""
+    text = msg.text or msg.caption or "🖼 Медиафайл"
+    preview = text.replace('\n', ' ')[:40] + "..." if len(text) > 40 else text.replace('\n', ' ')
+    
+    source = "Твой текст"
+    if msg.forward_origin:
+        if msg.forward_origin.type == "channel":
+            source = getattr(msg.forward_origin.chat, 'title', 'Канал')
+        elif msg.forward_origin.type == "user":
+            source = getattr(msg.forward_origin.sender_user, 'first_name', 'Пользователь')
+        elif msg.forward_origin.type == "hidden_user":
+            source = getattr(msg.forward_origin, 'sender_user_name', 'Скрытый пользователь')
+        elif msg.forward_origin.type == "chat":
+            source = getattr(msg.forward_origin.chat, 'title', 'Группа')
+            
+    return preview, source
+# 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -47,11 +79,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "3️⃣ Напиши /list для управления задачами."
     )
 
+# 👇👇👇 НОВЫЙ КОД: Полностью переписанный умный /list и обработчики кнопок 👇👇👇
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.chat.id
-    
     user_msgs = get_user_messages(user_id)
     user_subs = get_user_subscriptions(user_id)
     
@@ -60,44 +92,89 @@ async def cmd_list(message: types.Message, state: FSMContext):
         return
         
     if user_msgs:
-        await message.answer("⏳ **Твои разовые напоминания:**", parse_mode="Markdown")
-        for msg in user_msgs:
-            db_id, send_at = msg
+        text_lines = ["⏳ <b>Твои разовые напоминания:</b>\n"]
+        buttons = []
+        for idx, msg in enumerate(user_msgs, 1):
+            db_id, send_at, preview, source = msg
             dt_obj = datetime.strptime(send_at, '%Y-%m-%d %H:%M:%S')
-            pretty_time = dt_obj.strftime('%d.%m.%Y в %H:%M')
+            source_safe = html.escape(source or "Неизвестно")
+            preview_safe = html.escape(preview or "Без текста")
             
-            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_{db_id}")]])
-            await message.answer(f"📌 Напоминание на: {pretty_time}", reply_markup=kb)
+            text_lines.append(f"{idx}. 📌 <b>{dt_obj.strftime('%d.%m в %H:%M')}</b> | От: {source_safe}\n<i>{preview_safe}</i>\n")
+            buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"cancel_{db_id}"))
+            
+        kb_rows = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
+        await message.answer("\n".join(text_lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
     if user_subs:
-        await message.answer("📡 **Твои подписки на дайджесты:**", parse_mode="Markdown")
+        text_lines = ["📡 <b>Твои подписки на дайджесты:</b>\n"]
+        buttons = []
         period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
-        for sub in user_subs:
+        for idx, sub in enumerate(user_subs, 1):
             sub_id, username, title, period, next_send_at = sub
             dt_obj = datetime.strptime(next_send_at, '%Y-%m-%d %H:%M:%S')
-            pretty_time = dt_obj.strftime('%d.%m.%Y в %H:%M')
             
-            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отменить сбор", callback_data=f"unsub_{sub_id}")]])
-            await message.answer(f"📰 Канал: *{title}*\n🔄 Частота: {period_ru.get(period, period)}\nСлед. отчет: {pretty_time}", reply_markup=kb, parse_mode="Markdown")
+            text_lines.append(f"{idx}. 📰 <b>{html.escape(title or 'Канал')}</b> ({period_ru.get(period, period)})\nСлед: {dt_obj.strftime('%d.%m в %H:%M')}\n")
+            buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"unsub_{sub_id}"))
+            
+        kb_rows = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
+        await message.answer("\n".join(text_lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 @dp.callback_query(F.data.startswith("cancel_"))
 async def handle_cancel(callback: CallbackQuery):
     db_id = int(callback.data.split("_")[1])
     delete_message(db_id)
+    
+    # Перерисовываем список напоминаний
+    user_msgs = get_user_messages(callback.message.chat.id)
+    if not user_msgs:
+        await callback.message.edit_text("📭 Все разовые напоминания отменены.")
+        return
+        
+    text_lines = ["⏳ <b>Твои разовые напоминания:</b>\n"]
+    buttons = []
+    for idx, msg in enumerate(user_msgs, 1):
+        db_id, send_at, preview, source = msg
+        dt_obj = datetime.strptime(send_at, '%Y-%m-%d %H:%M:%S')
+        text_lines.append(f"{idx}. 📌 <b>{dt_obj.strftime('%d.%m в %H:%M')}</b> | От: {html.escape(source or 'Неизвестно')}\n<i>{html.escape(preview or 'Без текста')}</i>\n")
+        buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"cancel_{db_id}"))
+        
+    kb_rows = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
     try:
-        await callback.message.edit_text("🚫 Напоминание отменено.")
+        await callback.message.edit_text("\n".join(text_lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
     except TelegramAPIError:
         pass
+    await callback.answer("Удалено!")
 
 @dp.callback_query(F.data.startswith("unsub_"))
 async def handle_unsub(callback: CallbackQuery):
     sub_id = int(callback.data.split("_")[1])
     delete_subscription(sub_id)
+    
+    # Перерисовываем список подписок
+    user_subs = get_user_subscriptions(callback.message.chat.id)
+    if not user_subs:
+        await callback.message.edit_text("📭 Все подписки на дайджесты отменены.")
+        return
+        
+    text_lines = ["📡 <b>Твои подписки на дайджесты:</b>\n"]
+    buttons = []
+    period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
+    for idx, sub in enumerate(user_subs, 1):
+        sub_id, username, title, period, next_send_at = sub
+        dt_obj = datetime.strptime(next_send_at, '%Y-%m-%d %H:%M:%S')
+        text_lines.append(f"{idx}. 📰 <b>{html.escape(title or 'Канал')}</b> ({period_ru.get(period, period)})\nСлед: {dt_obj.strftime('%d.%m в %H:%M')}\n")
+        buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"unsub_{sub_id}"))
+        
+    kb_rows = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
     try:
-        await callback.message.edit_text("🚫 Подписка на дайджест отменена.")
+        await callback.message.edit_text("\n".join(text_lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
     except TelegramAPIError:
         pass
+    await callback.answer("Удалено!")
+# 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
 
+# 👇👇👇 НОВЫЙ КОД: Сохранение цитат при выборе точного времени 👇👇👇
 @dp.message(ScheduleState.waiting_for_datetime)
 async def process_custom_datetime(message: types.Message, state: FSMContext):
     try:
@@ -108,20 +185,21 @@ async def process_custom_datetime(message: types.Message, state: FSMContext):
             
         data = await state.get_data()
         msg_id = data.get('message_id')
-        chat_id = message.chat.id
+        preview = data.get('preview', '')
+        source = data.get('source', '')
         
         if not msg_id:
             await message.answer("Ошибка: не найден ID сообщения. Попробуй переслать его заново.")
             await state.clear()
             return
             
-        add_message(user_id=chat_id, message_id=msg_id, send_at=scheduled_time.strftime('%Y-%m-%d %H:%M:%S'))
+        add_message(message.chat.id, msg_id, scheduled_time.strftime('%Y-%m-%d %H:%M:%S'), preview, source)
         await message.answer(f"✅ Принято! Запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}.")
         await state.clear()
     except ValueError:
         await message.answer("❌ Неверный формат. Пример: 15.03.2026 14:30")
+# 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
 
-# --- КОМАНДА ДЛЯ СРОЧНОГО СБОРА (С МАЯЧКАМИ DEBUG) ---
 @dp.message(Command("test_digest"))
 async def cmd_test_digest(message: types.Message, state: FSMContext):
     await state.clear()
@@ -152,28 +230,17 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
                 for p in posts:
                     text_safe = html.escape(p['text'])
                     digest_lines.append(f"🔹 <i>{text_safe}</i> <a href='{p['link']}'>[Читать]</a>\n")
-                digest_lines.append("") # Пустая строка между каналами
+                digest_lines.append("") 
         except Exception as e:
-            has_news = True  # Специально ставим True, чтобы бот не скрыл текст ошибки
+            has_news = True  
             digest_lines.append(f"❌ Ошибка парсинга канала <b>{title_safe}</b>: {e}\n")
             
     if not has_news:
         await message.answer("📭 За последние 24 часа новых постов ни в одном из каналов не было.")
         return
         
-    # Умная разбивка текста: не режем HTML-теги пополам
-    chunks = []
-    current_chunk = ""
-    for line in digest_lines:
-        if len(current_chunk) + len(line) > 4000:
-            chunks.append(current_chunk)
-            current_chunk = line + "\n"
-        else:
-            current_chunk += line + "\n"
-    if current_chunk:
-        chunks.append(current_chunk)
-        
-    for chunk in chunks:
+    # Использование оптимизированной функции разбивки текста
+    for chunk in chunk_html_text(digest_lines):
         await message.answer(chunk, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 @dp.message()
@@ -249,6 +316,7 @@ async def save_subscription(callback: CallbackQuery, state: FSMContext):
         pass
     await state.clear()
 
+# 👇👇👇 НОВЫЙ КОД: Сохранение цитат при выборе быстрых кнопок 👇👇👇
 @dp.callback_query(F.data.startswith("time_"))
 async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -256,13 +324,15 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
     scheduled_time = None
     label = ""
 
-    if callback.data == "time_custom":
-        if callback.message.reply_to_message is None:
-            await callback.message.edit_text("❌ Ошибка: не могу найти оригинальное сообщение.")
-            return
+    if callback.message.reply_to_message is None:
+        await callback.message.edit_text("❌ Ошибка: не могу найти оригинальное сообщение.")
+        return
+        
+    orig_msg = callback.message.reply_to_message
+    preview, source = get_message_preview(orig_msg)
 
-        msg_id = callback.message.reply_to_message.message_id
-        await state.update_data(message_id=msg_id)
+    if callback.data == "time_custom":
+        await state.update_data(message_id=orig_msg.message_id, preview=preview, source=source)
         await state.set_state(ScheduleState.waiting_for_datetime)
         
         if now.hour < 8:
@@ -301,18 +371,13 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
         label = "через 3 часа"
 
     if scheduled_time:
-        if callback.message.reply_to_message is None:
-            await callback.message.edit_text("❌ Ошибка: не могу найти оригинальное сообщение.")
-            return
-
-        chat_id = callback.message.chat.id
-        msg_id = callback.message.reply_to_message.message_id
-        
         try:
             await callback.message.edit_text(f"✅ Принято! Отправлю это сообщение тебе {label}.")
-            add_message(user_id=chat_id, message_id=msg_id, send_at=scheduled_time.strftime('%Y-%m-%d %H:%M:%S'))
+            # Передаем превью и источник в базу данных
+            add_message(callback.message.chat.id, orig_msg.message_id, scheduled_time.strftime('%Y-%m-%d %H:%M:%S'), preview, source)
         except TelegramAPIError:
             pass
+# 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
 
 async def check_messages():
     while True:
@@ -336,10 +401,8 @@ async def check_digests():
         now_str = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
         due_subs = get_due_subscriptions(now_str)
         
-        # Группируем задачи по пользователям
         users_subs = {}
         for sub in due_subs:
-            # sub = (id, user_id, channel_username, channel_title, period, last_scraped_at)
             user_id = sub[1]
             if user_id not in users_subs:
                 users_subs[user_id] = []
@@ -361,9 +424,8 @@ async def check_digests():
                         for p in posts:
                             text_safe = html.escape(p['text'])
                             digest_lines.append(f"🔹 <i>{text_safe}</i> <a href='{p['link']}'>[Читать]</a>\n")
-                        digest_lines.append("") # Пустая строка
+                        digest_lines.append("") 
                         
-                    # Обновляем таймер в базе в любом случае
                     now = datetime.now(TZ)
                     if period == "daily":
                         next_time = now + timedelta(days=1)
@@ -378,20 +440,9 @@ async def check_digests():
                 except Exception as e:
                     print(f"Ошибка дайджеста для {username}: {e}")
             
-            # Отправляем газету ТОЛЬКО если есть новости
             if has_news:
-                chunks = []
-                current_chunk = ""
-                for line in digest_lines:
-                    if len(current_chunk) + len(line) > 4000:
-                        chunks.append(current_chunk)
-                        current_chunk = line + "\n"
-                    else:
-                        current_chunk += line + "\n"
-                if current_chunk:
-                    chunks.append(current_chunk)
-                    
-                for chunk in chunks:
+                # Использование оптимизированной функции разбивки текста
+                for chunk in chunk_html_text(digest_lines):
                     try:
                         await bot.send_message(user_id, chunk, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
                     except Exception as e:
