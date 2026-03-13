@@ -17,7 +17,8 @@ from database import (
     add_message, get_pending_messages, mark_as_sent, init_db, 
     get_user_messages, delete_message,
     add_subscription, get_due_subscriptions, update_subscription_time, 
-    get_user_subscriptions, delete_subscription
+    get_user_subscriptions, delete_subscription,
+    add_saved_message, get_user_tags, get_saved_messages, get_saved_message_by_id, delete_saved_message # <-- Добавлены импорты
 )
 from scraper import get_latest_posts
 
@@ -35,6 +36,11 @@ TZ = ZoneInfo("Europe/Moscow")
 
 class ScheduleState(StatesGroup):
     waiting_for_datetime = State()
+
+# 👇👇👇 НОВЫЙ КОД: Состояние для ввода тега 👇👇👇
+class SaveState(StatesGroup):
+    waiting_for_tag = State()
+# 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
 
 def chunk_html_text(lines, max_length=4000):
     chunks, current = [], ""
@@ -70,9 +76,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "Привет! Я готов.\n\n"
-        "1️⃣ Перешли мне любое сообщение, чтобы отложить его.\n"
+        "1️⃣ Перешли мне любое сообщение, чтобы отложить его или сохранить в базу знаний.\n"
         "2️⃣ Перешли пост из открытого канала, чтобы подписаться на его дайджест.\n"
-        "3️⃣ Напиши /list для управления задачами."
+        "3️⃣ Напиши /list для задач или /saved для Избранного."
     )
 
 @dp.message(Command("list"))
@@ -166,7 +172,92 @@ async def handle_unsub(callback: CallbackQuery):
         pass
     await callback.answer("Удалено!")
 
-# 👇👇👇 НОВЫЙ КОД: Уборка мусора при ручном вводе времени 👇👇👇
+# 👇👇👇 НОВЫЙ КОД: Логика команды /saved и просмотра сохраненных текстов 👇👇👇
+@dp.message(Command("saved"))
+async def cmd_saved(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.chat.id
+    saved_msgs = get_saved_messages(user_id)
+    
+    if not saved_msgs:
+        await message.answer("📭 Твоя база знаний пока пуста.")
+        return
+        
+    # Группируем сообщения по тегам
+    grouped = {}
+    for msg in saved_msgs:
+        tag = msg[1]
+        if tag not in grouped:
+            grouped[tag] = []
+        grouped[tag].append(msg)
+        
+    text_lines = ["📁 <b>Твоя база знаний:</b>\n"]
+    buttons = []
+    
+    idx = 1
+    for tag, msgs in grouped.items():
+        text_lines.append(f"🏷 <b>{html.escape(tag)}</b>")
+        for m in msgs:
+            db_id, _, full_text, source, saved_at = m
+            preview = full_text.replace('\n', ' ')[:40] + "..." if len(full_text) > 40 else full_text.replace('\n', ' ')
+            source_safe = html.escape(source or "Неизвестно")
+            preview_safe = html.escape(preview or "Без текста")
+            
+            text_lines.append(f"{idx}. От: {source_safe} | <i>{preview_safe}</i>")
+            # Кнопка чтения и удаления для каждой закладки
+            buttons.append([
+                InlineKeyboardButton(text=f"📖 Читать {idx}", callback_data=f"read_saved_{db_id}"),
+                InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"del_saved_{db_id}")
+            ])
+            idx += 1
+        text_lines.append("") 
+        
+    await message.answer("\n".join(text_lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("read_saved_"))
+async def read_saved(callback: CallbackQuery):
+    db_id = int(callback.data.split("_")[2])
+    msg_data = get_saved_message_by_id(db_id)
+    if not msg_data:
+        await callback.answer("❌ Сообщение не найдено", show_alert=True)
+        return
+        
+    full_text, source, tag, saved_at = msg_data
+    dt_obj = datetime.strptime(saved_at, '%Y-%m-%d %H:%M:%S')
+    
+    # Формируем красивую карточку полного поста
+    text = f"🏷 <b>Тег:</b> {html.escape(tag)}\n" \
+           f"👤 <b>Источник:</b> {html.escape(source)}\n" \
+           f"📅 <b>Сохранено:</b> {dt_obj.strftime('%d.%m.%Y в %H:%M')}\n\n" \
+           f"📝 <b>Текст:</b>\n{html.escape(full_text)}"
+           
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Закрыть", callback_data="close_msg")]])
+    
+    chunks = chunk_html_text(text.split('\n'))
+    for i, chunk in enumerate(chunks):
+        if i == len(chunks) - 1:
+            await callback.message.answer(chunk, parse_mode="HTML", reply_markup=kb)
+        else:
+            await callback.message.answer(chunk, parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data == "close_msg")
+async def close_msg(callback: CallbackQuery):
+    try:
+        await callback.message.delete()
+    except TelegramAPIError:
+        pass
+
+@dp.callback_query(F.data.startswith("del_saved_"))
+async def handle_del_saved(callback: CallbackQuery, state: FSMContext): # <-- Добавили state сюда
+    db_id = int(callback.data.split("_")[2])
+    delete_saved_message(db_id)
+    await callback.answer("✅ Закладка удалена!")
+    # Передаем state напрямую
+    await cmd_saved(callback.message, state)
+    
+# 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
+
 @dp.message(ScheduleState.waiting_for_datetime)
 async def process_custom_datetime(message: types.Message, state: FSMContext):
     try:
@@ -179,7 +270,7 @@ async def process_custom_datetime(message: types.Message, state: FSMContext):
         msg_id = data.get('message_id')
         preview = data.get('preview', '')
         source = data.get('source', '')
-        prompt_msg_id = data.get('prompt_msg_id') # ID вопроса бота
+        prompt_msg_id = data.get('prompt_msg_id') 
         
         if not msg_id:
             await message.answer("Ошибка: не найден ID сообщения. Попробуй переслать его заново.")
@@ -188,7 +279,6 @@ async def process_custom_datetime(message: types.Message, state: FSMContext):
             
         add_message(message.chat.id, msg_id, scheduled_time.strftime('%Y-%m-%d %H:%M:%S'), preview, source)
         
-        # Зачистка: удаляем сообщение пользователя с датой и вопрос бота
         try:
             await message.delete() 
             if prompt_msg_id:
@@ -196,7 +286,6 @@ async def process_custom_datetime(message: types.Message, state: FSMContext):
         except TelegramAPIError:
             pass
             
-        # Отправляем подтверждение и запускаем таймер на его удаление
         confirm_msg = await message.answer(f"✅ Принято! Запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}.")
         await state.clear()
         
@@ -208,6 +297,38 @@ async def process_custom_datetime(message: types.Message, state: FSMContext):
             
     except ValueError:
         await message.answer("❌ Неверный формат. Пример: 15.03.2026 14:30")
+
+# 👇👇👇 НОВЫЙ КОД: Сохранение тега (Ввод текста) 👇👇👇
+@dp.message(SaveState.waiting_for_tag)
+async def process_tag(message: types.Message, state: FSMContext):
+    tag = message.text.strip()
+    data = await state.get_data()
+    
+    orig_msg_id = data.get('orig_msg_id')
+    full_text = data.get('full_text')
+    source = data.get('source')
+    prompt_msg_id = data.get('prompt_msg_id')
+    
+    saved_at = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
+    add_saved_message(message.chat.id, full_text, source, tag, saved_at)
+    
+    try:
+        await message.delete() 
+        if prompt_msg_id:
+            await bot.delete_message(message.chat.id, prompt_msg_id) 
+        if orig_msg_id:
+            await bot.delete_message(message.chat.id, orig_msg_id) 
+    except TelegramAPIError:
+        pass
+        
+    confirm_msg = await message.answer(f"✅ Сохранено в базу знаний под тегом <b>{html.escape(tag)}</b>", parse_mode="HTML")
+    await state.clear()
+    
+    await asyncio.sleep(3)
+    try:
+        await confirm_msg.delete()
+    except TelegramAPIError:
+        pass
 # 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
 
 @dp.message(Command("test_digest"))
@@ -266,21 +387,26 @@ async def catch_message(message: types.Message, state: FSMContext):
             channel_username = message.forward_origin.chat.username
             channel_title = message.forward_origin.chat.title
     
+    # 👇👇👇 НОВЫЙ КОД: Добавили кнопку "📁 В закладки" 👇👇👇
     kb = [
         [
             InlineKeyboardButton(text="🌅 Утром в 9", callback_data="time_morning"),
             InlineKeyboardButton(text="☀️ Днем в 14", callback_data="time_day"),
             InlineKeyboardButton(text="🌙 Вечером в 20", callback_data="time_evening")
         ],
-        [InlineKeyboardButton(text="⏱ Через 3 часа", callback_data="time_now")],
-        [InlineKeyboardButton(text="📅 Точная дата и время", callback_data="time_custom")]
+        [
+            InlineKeyboardButton(text="⏱ Через 3 часа", callback_data="time_now"),
+            InlineKeyboardButton(text="📅 Точная дата", callback_data="time_custom")
+        ],
+        [InlineKeyboardButton(text="📁 В закладки (База знаний)", callback_data="bookmark_setup")]
     ]
+    # 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
     
     if is_public_channel:
         kb.append([InlineKeyboardButton(text="📡 Собирать дайджест", callback_data="digest_setup")])
         await state.update_data(channel_username=channel_username, channel_title=channel_title)
         
-    await message.reply("Что мне сделать с этим сообщением? Могу добавить в утренний дайджет (для открытых каналов) либо вернуть тебе это сообщение в определенное время", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await message.reply("Что мне сделать с этим сообщением?", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data == "digest_setup")
 async def setup_digest(callback: CallbackQuery, state: FSMContext):
@@ -291,7 +417,6 @@ async def setup_digest(callback: CallbackQuery, state: FSMContext):
     ]
     await callback.message.edit_text("Как часто присылать новые посты из этого канала?", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-# 👇👇👇 НОВЫЙ КОД: Зачистка чата при подписке на дайджест 👇👇👇
 @dp.callback_query(F.data.startswith("period_"))
 async def save_subscription(callback: CallbackQuery, state: FSMContext):
     period = callback.data.split("_")[1]
@@ -313,10 +438,8 @@ async def save_subscription(callback: CallbackQuery, state: FSMContext):
     
     period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
     
-    # 1. Показываем всплывающее окно поверх чата
     await callback.answer(f"✅ Дайджест {title} оформлен!\nБудет приходить {period_ru[period]} в 07:00.", show_alert=True)
     
-    # 2. Удаляем мусор (исходный пост и меню бота)
     try:
         if callback.message.reply_to_message:
             await bot.delete_message(callback.message.chat.id, callback.message.reply_to_message.message_id)
@@ -325,9 +448,40 @@ async def save_subscription(callback: CallbackQuery, state: FSMContext):
         pass
         
     await state.clear()
+
+# 👇👇👇 НОВЫЙ КОД: Обработчик нажатия на "В закладки" (Показывает теги) 👇👇👇
+@dp.callback_query(F.data == "bookmark_setup")
+async def setup_bookmark(callback: CallbackQuery, state: FSMContext):
+    orig_msg = callback.message.reply_to_message
+    if not orig_msg:
+        await callback.message.edit_text("❌ Ошибка: не могу найти оригинальное сообщение.")
+        return
+        
+    # Сохраняем полный текст, чтобы не зависеть от источника
+    full_text = orig_msg.text or orig_msg.caption or "🖼 Медиафайл (без текста)"
+    _, source = get_message_preview(orig_msg)
+    
+    await state.update_data(
+        orig_msg_id=orig_msg.message_id, 
+        full_text=full_text, 
+        source=source,
+        prompt_msg_id=callback.message.message_id
+    )
+    await state.set_state(SaveState.waiting_for_tag)
+    
+    # Достаем уже существующие теги пользователя
+    tags = get_user_tags(callback.message.chat.id)
+    tags_text = ""
+    if tags:
+        tags_formatted = "  ".join([f"`{t}`" for t in tags])
+        tags_text = f"\n\n📝 *Твои прошлые теги* (нажми, чтобы скопировать):\n{tags_formatted}"
+        
+    await callback.message.edit_text(
+        f"Напиши тег для этого сообщения (например: Идеи, Статьи, Важное).{tags_text}",
+        parse_mode="Markdown"
+    )
 # 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
 
-# 👇👇👇 НОВЫЙ КОД: Магическая уборка при быстрых кнопках напоминаний 👇👇👇
 @dp.callback_query(F.data.startswith("time_"))
 async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
     now = datetime.now(TZ)
@@ -342,7 +496,6 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
     preview, source = get_message_preview(orig_msg)
 
     if callback.data == "time_custom":
-        # Запоминаем ID меню бота, чтобы потом его удалить
         await state.update_data(message_id=orig_msg.message_id, preview=preview, source=source, prompt_msg_id=callback.message.message_id)
         await state.set_state(ScheduleState.waiting_for_datetime)
         
@@ -383,16 +536,13 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
 
     if scheduled_time:
         try:
-            # Обновляем текст меню
             await callback.message.edit_text(f"✅ Принято! Отправлю это сообщение тебе {label}.")
             add_message(callback.message.chat.id, orig_msg.message_id, scheduled_time.strftime('%Y-%m-%d %H:%M:%S'), preview, source)
             
-            # Самоуничтожение подтверждения через 3 секунды
             await asyncio.sleep(3)
             await callback.message.delete()
         except TelegramAPIError:
             pass
-# 👆👆👆 КОНЕЦ НОВОГО КОДА 👆👆👆
 
 async def check_messages():
     while True:
