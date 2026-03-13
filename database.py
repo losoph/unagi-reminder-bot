@@ -20,12 +20,11 @@ def init_db():
         )
     ''')
     
-    # Умное обновление старой базы данных
     try:
         cursor.execute("ALTER TABLE scheduled_messages ADD COLUMN text_preview TEXT")
         cursor.execute("ALTER TABLE scheduled_messages ADD COLUMN source_name TEXT")
     except sqlite3.OperationalError:
-        pass # Если колонки уже есть, Питон просто проигнорирует ошибку
+        pass 
         
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS subscriptions (
@@ -39,11 +38,21 @@ def init_db():
         )
     ''')
     
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS saved_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            full_text TEXT,
+            source_name TEXT,
+            tag TEXT,
+            saved_at DATETIME
+        )
+    ''')
+    
     conn.commit()
     conn.close()
     print(f"База данных успешно инициализирована по пути: {DB_PATH}")
 
-# ИЗМЕНЕНИЕ: добавили текст и источник
 def add_message(user_id, message_id, send_at, text_preview="", source_name=""):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -70,7 +79,6 @@ def mark_as_sent(msg_id):
     conn.commit()
     conn.close()
 
-# ИЗМЕНЕНИЕ: достаем текст и источник
 def get_user_messages(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -139,4 +147,44 @@ def delete_subscription(sub_id):
     cursor.execute('DELETE FROM subscriptions WHERE id = ?', (sub_id,))
     conn.commit()
     conn.close()
-    
+
+def add_saved_message(user_id, full_text, source_name, tag, saved_at):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO saved_messages (user_id, full_text, source_name, tag, saved_at) 
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, full_text, source_name, tag, saved_at))
+    conn.commit()
+    conn.close()
+
+def get_user_tags(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT DISTINCT tag FROM saved_messages WHERE user_id = ?', (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [r[0] for r in rows if r[0]]
+
+def get_saved_messages(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, tag, full_text, source_name, saved_at FROM saved_messages WHERE user_id = ? ORDER BY tag, saved_at DESC', (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def get_saved_message_by_id(msg_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT full_text, source_name, tag, saved_at FROM saved_messages WHERE id = ?', (msg_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+def delete_saved_message(msg_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM saved_messages WHERE id = ?', (msg_id,))
+    conn.commit()
+    conn.close()
