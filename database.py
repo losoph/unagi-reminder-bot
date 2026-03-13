@@ -8,18 +8,25 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Таблица разовых напоминаний
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS scheduled_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             message_id INTEGER,
             send_at DATETIME,
-            is_sent INTEGER DEFAULT 0
+            is_sent INTEGER DEFAULT 0,
+            text_preview TEXT,
+            source_name TEXT
         )
     ''')
     
-    # Таблица подписок на каналы
+    # Умное обновление старой базы данных
+    try:
+        cursor.execute("ALTER TABLE scheduled_messages ADD COLUMN text_preview TEXT")
+        cursor.execute("ALTER TABLE scheduled_messages ADD COLUMN source_name TEXT")
+    except sqlite3.OperationalError:
+        pass # Если колонки уже есть, Питон просто проигнорирует ошибку
+        
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS subscriptions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,11 +43,14 @@ def init_db():
     conn.close()
     print(f"База данных успешно инициализирована по пути: {DB_PATH}")
 
-def add_message(user_id, message_id, send_at):
+# ИЗМЕНЕНИЕ: добавили текст и источник
+def add_message(user_id, message_id, send_at, text_preview="", source_name=""):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('INSERT INTO scheduled_messages (user_id, message_id, send_at) VALUES (?, ?, ?)', 
-                   (user_id, message_id, send_at))
+    cursor.execute('''
+        INSERT INTO scheduled_messages (user_id, message_id, send_at, text_preview, source_name) 
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, message_id, send_at, text_preview, source_name))
     conn.commit()
     conn.close()
 
@@ -60,11 +70,16 @@ def mark_as_sent(msg_id):
     conn.commit()
     conn.close()
 
+# ИЗМЕНЕНИЕ: достаем текст и источник
 def get_user_messages(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('SELECT id, send_at FROM scheduled_messages WHERE user_id = ? AND is_sent = 0 ORDER BY send_at', 
-                   (user_id,))
+    cursor.execute('''
+        SELECT id, send_at, text_preview, source_name 
+        FROM scheduled_messages 
+        WHERE user_id = ? AND is_sent = 0 
+        ORDER BY send_at
+    ''', (user_id,))
     rows = cursor.fetchall()
     conn.close()
     return rows
@@ -112,7 +127,6 @@ def update_subscription_time(sub_id, last_scraped_at, next_send_at):
 def get_user_subscriptions(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # Здесь учтен наш исправленный запрос с channel_username
     cursor.execute('SELECT id, channel_username, channel_title, period, next_send_at FROM subscriptions WHERE user_id = ? ORDER BY next_send_at', 
                    (user_id,))
     rows = cursor.fetchall()
@@ -125,4 +139,3 @@ def delete_subscription(sub_id):
     cursor.execute('DELETE FROM subscriptions WHERE id = ?', (sub_id,))
     conn.commit()
     conn.close()
-    
