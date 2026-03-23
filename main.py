@@ -1,4 +1,5 @@
 import asyncio
+import calendar
 import os
 import html
 import logging
@@ -66,42 +67,23 @@ def chunk_html_text(lines, max_length=4000):
         chunks.append(current)
     return chunks
 
-def truncate_error(error, max_length=500):
-    message = str(error).strip() or error.__class__.__name__
-    return message[: max_length - 3] + "..." if len(message) > max_length else message
+def get_next_digest_time(period: str, now: datetime | None = None) -> datetime:
+    now = now or datetime.now(TZ)
+    base_time = now.replace(hour=7, minute=0, second=0, microsecond=0)
 
-def classify_telegram_send_error(error: Exception):
-    permanent_error_types = (TelegramForbiddenError, TelegramNotFound)
-    temporary_error_types = (TelegramRetryAfter, TelegramServerError, TelegramNetworkError)
+    if period == "daily":
+        return base_time + timedelta(days=1)
 
-    if isinstance(error, permanent_error_types):
-        return True, truncate_error(error)
-    if isinstance(error, temporary_error_types):
-        return False, truncate_error(error)
-    if isinstance(error, TelegramBadRequest):
-        error_text = str(error).lower()
-        permanent_patterns = (
-            "chat not found",
-            "message to forward not found",
-            "message identifier is not specified",
-            "have no rights",
-            "bot was blocked",
-            "user is deactivated",
-        )
-        is_permanent = any(pattern in error_text for pattern in permanent_patterns)
-        return is_permanent, truncate_error(error)
-    if isinstance(error, TelegramAPIError):
-        return False, truncate_error(error)
-    return False, truncate_error(error)
+    if period == "weekly":
+        return base_time + timedelta(days=7)
 
-async def send_digest_chunks(user_id: int, digest_lines: list[str]):
-    for chunk in chunk_html_text(digest_lines):
-        await bot.send_message(
-            user_id,
-            chunk,
-            parse_mode="HTML",
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-        )
+    if period == "monthly":
+        year = base_time.year + (1 if base_time.month == 12 else 0)
+        month = 1 if base_time.month == 12 else base_time.month + 1
+        day = min(base_time.day, calendar.monthrange(year, month)[1])
+        return base_time.replace(year=year, month=month, day=day)
+
+    raise ValueError(f"Unsupported digest period: {period}")
 
 def get_message_preview(msg: types.Message):
     text = msg.text or msg.caption or "🖼 Медиафайл"
@@ -478,10 +460,8 @@ async def save_subscription(callback: CallbackQuery, state: FSMContext):
         return
         
     now = datetime.now(TZ)
-    next_send = now.replace(hour=7, minute=0, second=0, microsecond=0)
-    if next_send <= now:
-        next_send += timedelta(days=1)
-        
+    next_send = get_next_digest_time(period, now)
+
     last_scraped = now.strftime('%Y-%m-%d %H:%M:%S')
     add_subscription(callback.message.chat.id, username, title, period, last_scraped, next_send.strftime('%Y-%m-%d %H:%M:%S'))
     
@@ -580,7 +560,7 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
             scheduled_time += timedelta(days=1)
         label = "на 20:00"
     elif callback.data == "time_now":
-        scheduled_time = now + timedelta(minutes=90)
+        scheduled_time = now + timedelta(hours=3)
         label = "через 3 часа"
 
     if scheduled_time:
@@ -662,38 +642,12 @@ async def check_digests():
                             digest_lines.append(f"🔹 <i>{text_safe}</i> <a href='{p['link']}'>[Читать]</a>\n")
                         digest_lines.append("") 
                         
-                    if period == "daily":
-                        next_time = now + timedelta(days=1)
-                    elif period == "weekly":
-                        next_time = now + timedelta(days=7)
-                    else:
-                        next_time = now + timedelta(days=30)
-                        
-                    next_send_str = next_time.replace(hour=7, minute=0, second=0, microsecond=0).strftime('%Y-%m-%d %H:%M:%S')
-                    successful_subscriptions.append((sub_id, next_send_str, bool(posts)))
-                except ChannelFetchError as e:
-                    new_failure_count = failure_count + 1
-                    is_permanent = e.permanent
-                    mark_subscription_delivery_error(
-                        sub_id,
-                        truncate_error(e),
-                        now_str,
-                        new_failure_count,
-                        is_permanent or new_failure_count >= MAX_DIGEST_RETRIES,
-                    )
-                    if not (is_permanent or new_failure_count >= MAX_DIGEST_RETRIES):
-                        user_has_temporary_failures = True
-                    logging.log(
-                        logging.ERROR if (is_permanent or new_failure_count >= MAX_DIGEST_RETRIES) else logging.WARNING,
-                        "Не удалось собрать дайджест для канала @%s (subscription_id=%s, user_id=%s). Попытка %s/%s. Статус: %s. Ошибка: %s",
-                        username,
-                        sub_id,
-                        uid,
-                        new_failure_count,
-                        MAX_DIGEST_RETRIES,
-                        "permanent" if (is_permanent or new_failure_count >= MAX_DIGEST_RETRIES) else "temporary",
-                        e,
-                    )
+                    now = datetime.now(TZ)
+                    next_send_str = get_next_digest_time(period, now).strftime('%Y-%m-%d %H:%M:%S')
+                    update_subscription_time(sub_id, now_str, next_send_str)
+                    
+                except Exception as e:
+                    print(f"Ошибка дайджеста для {username}: {e}")
             
             if has_news:
                 try:
