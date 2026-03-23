@@ -1,4 +1,5 @@
 import asyncio
+import calendar
 import os
 import html
 import logging
@@ -53,6 +54,24 @@ def chunk_html_text(lines, max_length=4000):
     if current:
         chunks.append(current)
     return chunks
+
+def get_next_digest_time(period: str, now: datetime | None = None) -> datetime:
+    now = now or datetime.now(TZ)
+    base_time = now.replace(hour=7, minute=0, second=0, microsecond=0)
+
+    if period == "daily":
+        return base_time + timedelta(days=1)
+
+    if period == "weekly":
+        return base_time + timedelta(days=7)
+
+    if period == "monthly":
+        year = base_time.year + (1 if base_time.month == 12 else 0)
+        month = 1 if base_time.month == 12 else base_time.month + 1
+        day = min(base_time.day, calendar.monthrange(year, month)[1])
+        return base_time.replace(year=year, month=month, day=day)
+
+    raise ValueError(f"Unsupported digest period: {period}")
 
 def get_message_preview(msg: types.Message):
     text = msg.text or msg.caption or "🖼 Медиафайл"
@@ -429,10 +448,8 @@ async def save_subscription(callback: CallbackQuery, state: FSMContext):
         return
         
     now = datetime.now(TZ)
-    next_send = now.replace(hour=7, minute=0, second=0, microsecond=0)
-    if next_send <= now:
-        next_send += timedelta(days=1)
-        
+    next_send = get_next_digest_time(period, now)
+
     last_scraped = now.strftime('%Y-%m-%d %H:%M:%S')
     add_subscription(callback.message.chat.id, username, title, period, last_scraped, next_send.strftime('%Y-%m-%d %H:%M:%S'))
     
@@ -592,14 +609,7 @@ async def check_digests():
                         digest_lines.append("") 
                         
                     now = datetime.now(TZ)
-                    if period == "daily":
-                        next_time = now + timedelta(days=1)
-                    elif period == "weekly":
-                        next_time = now + timedelta(days=7)
-                    else:
-                        next_time = now + timedelta(days=30)
-                        
-                    next_send_str = next_time.replace(hour=7, minute=0, second=0, microsecond=0).strftime('%Y-%m-%d %H:%M:%S')
+                    next_send_str = get_next_digest_time(period, now).strftime('%Y-%m-%d %H:%M:%S')
                     update_subscription_time(sub_id, now_str, next_send_str)
                     
                 except Exception as e:
