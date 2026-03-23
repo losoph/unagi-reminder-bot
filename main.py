@@ -531,7 +531,7 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
             scheduled_time += timedelta(days=1)
         label = "на 20:00"
     elif callback.data == "time_now":
-        scheduled_time = now + timedelta(minutes=90)
+        scheduled_time = now + timedelta(hours=3)
         label = "через 3 часа"
 
     if scheduled_time:
