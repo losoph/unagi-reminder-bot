@@ -1,10 +1,7 @@
 import asyncio
-import os
 import html
 import logging
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from dotenv import load_dotenv
+from datetime import timedelta
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -18,21 +15,28 @@ from database import (
     get_user_messages, delete_message,
     add_subscription, get_due_subscriptions, update_subscription_time, 
     get_user_subscriptions, delete_subscription,
-    add_saved_message, get_user_tags, get_saved_messages, get_saved_message_by_id, delete_saved_message # <-- Добавлены импорты
+    add_saved_message, get_user_tags, get_saved_messages, get_saved_message_by_id, delete_saved_message,
+    ensure_user, get_user_timezone_name
 )
 from scraper import get_latest_posts
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+from config import BOT_TOKEN
+from datetime_utils import (
+    format_for_user,
+    get_user_timezone,
+    now_local,
+    now_utc,
+    parse_user_input_datetime,
+    serialize_db_datetime,
+)
 
 if not BOT_TOKEN:
     raise ValueError("❌ Токен бота не найден! Проверьте файл .env")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-TZ = ZoneInfo("Europe/Moscow")
 
 class ScheduleState(StatesGroup):
     waiting_for_datetime = State()
@@ -74,6 +78,7 @@ def get_message_preview(msg: types.Message):
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
+    ensure_user(message.chat.id)
     await message.answer(
         "Привет! Я готов.\n\n"
         "1️⃣ Перешли мне любое сообщение, чтобы отложить его или сохранить в базу знаний.\n"
@@ -85,6 +90,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def cmd_list(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.chat.id
+    ensure_user(user_id)
     user_msgs = get_user_messages(user_id)
     user_subs = get_user_subscriptions(user_id)
     
@@ -92,16 +98,18 @@ async def cmd_list(message: types.Message, state: FSMContext):
         await message.answer("📭 У тебя нет активных напоминаний или подписок.")
         return
         
+    user_tz = get_user_timezone(get_user_timezone_name(user_id))
+
     if user_msgs:
         text_lines = ["⏳ <b>Твои разовые напоминания:</b>\n"]
         buttons = []
         for idx, msg in enumerate(user_msgs, 1):
             db_id, send_at, preview, source = msg
-            dt_obj = datetime.strptime(send_at, '%Y-%m-%d %H:%M:%S')
+            send_at_local = format_for_user(send_at, user_tz=user_tz, fmt='%d.%m в %H:%M')
             source_safe = html.escape(source or "Неизвестно")
             preview_safe = html.escape(preview or "Без текста")
             
-            text_lines.append(f"{idx}. 📌 <b>{dt_obj.strftime('%d.%m в %H:%M')}</b> | От: {source_safe}\n<i>{preview_safe}</i>\n")
+            text_lines.append(f"{idx}. 📌 <b>{send_at_local}</b> | От: {source_safe}\n<i>{preview_safe}</i>\n")
             buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"cancel_{db_id}"))
             
         kb_rows = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
@@ -113,9 +121,9 @@ async def cmd_list(message: types.Message, state: FSMContext):
         period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
         for idx, sub in enumerate(user_subs, 1):
             sub_id, username, title, period, next_send_at = sub
-            dt_obj = datetime.strptime(next_send_at, '%Y-%m-%d %H:%M:%S')
+            next_send_local = format_for_user(next_send_at, user_tz=user_tz, fmt='%d.%m в %H:%M')
             
-            text_lines.append(f"{idx}. 📰 <b>{html.escape(title or 'Канал')}</b> ({period_ru.get(period, period)})\nСлед: {dt_obj.strftime('%d.%m в %H:%M')}\n")
+            text_lines.append(f"{idx}. 📰 <b>{html.escape(title or 'Канал')}</b> ({period_ru.get(period, period)})\nСлед: {next_send_local}\n")
             buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"unsub_{sub_id}"))
             
         kb_rows = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
@@ -131,12 +139,13 @@ async def handle_cancel(callback: CallbackQuery):
         await callback.message.edit_text("📭 Все разовые напоминания отменены.")
         return
         
+    user_tz = get_user_timezone(get_user_timezone_name(callback.message.chat.id))
     text_lines = ["⏳ <b>Твои разовые напоминания:</b>\n"]
     buttons = []
     for idx, msg in enumerate(user_msgs, 1):
         db_id, send_at, preview, source = msg
-        dt_obj = datetime.strptime(send_at, '%Y-%m-%d %H:%M:%S')
-        text_lines.append(f"{idx}. 📌 <b>{dt_obj.strftime('%d.%m в %H:%M')}</b> | От: {html.escape(source or 'Неизвестно')}\n<i>{html.escape(preview or 'Без текста')}</i>\n")
+        send_at_local = format_for_user(send_at, user_tz=user_tz, fmt='%d.%m в %H:%M')
+        text_lines.append(f"{idx}. 📌 <b>{send_at_local}</b> | От: {html.escape(source or 'Неизвестно')}\n<i>{html.escape(preview or 'Без текста')}</i>\n")
         buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"cancel_{db_id}"))
         
     kb_rows = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
@@ -156,13 +165,14 @@ async def handle_unsub(callback: CallbackQuery):
         await callback.message.edit_text("📭 Все подписки на дайджесты отменены.")
         return
         
+    user_tz = get_user_timezone(get_user_timezone_name(callback.message.chat.id))
     text_lines = ["📡 <b>Твои подписки на дайджесты:</b>\n"]
     buttons = []
     period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
     for idx, sub in enumerate(user_subs, 1):
         sub_id, username, title, period, next_send_at = sub
-        dt_obj = datetime.strptime(next_send_at, '%Y-%m-%d %H:%M:%S')
-        text_lines.append(f"{idx}. 📰 <b>{html.escape(title or 'Канал')}</b> ({period_ru.get(period, period)})\nСлед: {dt_obj.strftime('%d.%m в %H:%M')}\n")
+        next_send_local = format_for_user(next_send_at, user_tz=user_tz, fmt='%d.%m в %H:%M')
+        text_lines.append(f"{idx}. 📰 <b>{html.escape(title or 'Канал')}</b> ({period_ru.get(period, period)})\nСлед: {next_send_local}\n")
         buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"unsub_{sub_id}"))
         
     kb_rows = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
@@ -177,6 +187,7 @@ async def handle_unsub(callback: CallbackQuery):
 async def cmd_saved(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.chat.id
+    ensure_user(user_id)
     saved_msgs = get_saved_messages(user_id)
     
     if not saved_msgs:
@@ -223,12 +234,13 @@ async def read_saved(callback: CallbackQuery):
         return
         
     full_text, source, tag, saved_at = msg_data
-    dt_obj = datetime.strptime(saved_at, '%Y-%m-%d %H:%M:%S')
+    user_tz = get_user_timezone(get_user_timezone_name(callback.message.chat.id))
+    saved_at_local = format_for_user(saved_at, user_tz=user_tz)
     
     # Формируем красивую карточку полного поста
     text = f"🏷 <b>Тег:</b> {html.escape(tag)}\n" \
            f"👤 <b>Источник:</b> {html.escape(source)}\n" \
-           f"📅 <b>Сохранено:</b> {dt_obj.strftime('%d.%m.%Y в %H:%M')}\n\n" \
+           f"📅 <b>Сохранено:</b> {saved_at_local}\n\n" \
            f"📝 <b>Текст:</b>\n{html.escape(full_text)}"
            
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Закрыть", callback_data="close_msg")]])
@@ -261,8 +273,9 @@ async def handle_del_saved(callback: CallbackQuery, state: FSMContext): # <-- Д
 @dp.message(ScheduleState.waiting_for_datetime)
 async def process_custom_datetime(message: types.Message, state: FSMContext):
     try:
-        scheduled_time = datetime.strptime(message.text, "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
-        if scheduled_time < datetime.now(TZ):
+        user_tz = get_user_timezone(get_user_timezone_name(message.chat.id))
+        scheduled_time = parse_user_input_datetime(message.text, user_tz=user_tz)
+        if scheduled_time < now_local(user_tz):
             await message.answer("Эта дата уже в прошлом! Попробуй еще раз (ДД.ММ.ГГГГ ЧЧ:ММ):")
             return
             
@@ -277,7 +290,7 @@ async def process_custom_datetime(message: types.Message, state: FSMContext):
             await state.clear()
             return
             
-        add_message(message.chat.id, msg_id, scheduled_time.strftime('%Y-%m-%d %H:%M:%S'), preview, source)
+        add_message(message.chat.id, msg_id, serialize_db_datetime(scheduled_time), preview, source)
         
         try:
             await message.delete() 
@@ -309,7 +322,7 @@ async def process_tag(message: types.Message, state: FSMContext):
     source = data.get('source')
     prompt_msg_id = data.get('prompt_msg_id')
     
-    saved_at = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
+    saved_at = serialize_db_datetime(now_utc())
     add_saved_message(message.chat.id, full_text, source, tag, saved_at)
     
     try:
@@ -335,6 +348,7 @@ async def process_tag(message: types.Message, state: FSMContext):
 async def cmd_test_digest(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.chat.id
+    ensure_user(user_id)
     user_subs = get_user_subscriptions(user_id)
     
     if not user_subs:
@@ -343,8 +357,9 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
         
     await message.answer("⏳ Собираю единый дайджест за последние 24 часа...")
     
-    now_tz = datetime.now(TZ)
-    last_24h_str = (now_tz - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+    user_tz = get_user_timezone(get_user_timezone_name(user_id))
+    now_tz = now_local(user_tz)
+    last_24h_str = serialize_db_datetime(now_tz - timedelta(days=1))
     
     digest_lines = [f"📰 <b>Твоя тестовая утренняя газета</b> ☕️\n\n"]
     has_news = False
@@ -376,6 +391,7 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
 @dp.message()
 async def catch_message(message: types.Message, state: FSMContext):
     await state.clear() 
+    ensure_user(message.chat.id)
     
     is_public_channel = False
     channel_username = None
@@ -428,13 +444,14 @@ async def save_subscription(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text("❌ Ошибка: данные канала утеряны.")
         return
         
-    now = datetime.now(TZ)
+    user_tz = get_user_timezone(get_user_timezone_name(callback.message.chat.id))
+    now = now_local(user_tz)
     next_send = now.replace(hour=7, minute=0, second=0, microsecond=0)
     if next_send <= now:
         next_send += timedelta(days=1)
         
-    last_scraped = now.strftime('%Y-%m-%d %H:%M:%S')
-    add_subscription(callback.message.chat.id, username, title, period, last_scraped, next_send.strftime('%Y-%m-%d %H:%M:%S'))
+    last_scraped = serialize_db_datetime(now)
+    add_subscription(callback.message.chat.id, username, title, period, last_scraped, serialize_db_datetime(next_send))
     
     period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
     
@@ -484,7 +501,8 @@ async def setup_bookmark(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("time_"))
 async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
-    now = datetime.now(TZ)
+    user_tz = get_user_timezone(get_user_timezone_name(callback.message.chat.id))
+    now = now_local(user_tz)
     scheduled_time = None
     label = ""
 
@@ -531,13 +549,13 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
             scheduled_time += timedelta(days=1)
         label = "на 20:00"
     elif callback.data == "time_now":
-        scheduled_time = now + timedelta(minutes=90)
+        scheduled_time = now + timedelta(hours=3)
         label = "через 3 часа"
 
     if scheduled_time:
         try:
             await callback.message.edit_text(f"✅ Принято! Отправлю это сообщение тебе {label}.")
-            add_message(callback.message.chat.id, orig_msg.message_id, scheduled_time.strftime('%Y-%m-%d %H:%M:%S'), preview, source)
+            add_message(callback.message.chat.id, orig_msg.message_id, serialize_db_datetime(scheduled_time), preview, source)
             
             await asyncio.sleep(3)
             await callback.message.delete()
@@ -546,7 +564,7 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
 
 async def check_messages():
     while True:
-        now_str = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
+        now_str = serialize_db_datetime(now_utc())
         pending = get_pending_messages(now_str)
         
         for msg in pending:
@@ -563,7 +581,7 @@ async def check_messages():
 
 async def check_digests():
     while True:
-        now_str = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
+        now_str = serialize_db_datetime(now_utc())
         due_subs = get_due_subscriptions(now_str)
         
         users_subs = {}
@@ -591,7 +609,8 @@ async def check_digests():
                             digest_lines.append(f"🔹 <i>{text_safe}</i> <a href='{p['link']}'>[Читать]</a>\n")
                         digest_lines.append("") 
                         
-                    now = datetime.now(TZ)
+                    user_tz = get_user_timezone(get_user_timezone_name(user_id))
+                    now = now_local(user_tz)
                     if period == "daily":
                         next_time = now + timedelta(days=1)
                     elif period == "weekly":
@@ -599,7 +618,7 @@ async def check_digests():
                     else:
                         next_time = now + timedelta(days=30)
                         
-                    next_send_str = next_time.replace(hour=7, minute=0, second=0, microsecond=0).strftime('%Y-%m-%d %H:%M:%S')
+                    next_send_str = serialize_db_datetime(next_time.replace(hour=7, minute=0, second=0, microsecond=0))
                     update_subscription_time(sub_id, now_str, next_send_str)
                     
                 except Exception as e:
