@@ -1,6 +1,12 @@
+import asyncio
 import aiohttp
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+
+class ChannelFetchError(Exception):
+    def __init__(self, message, *, permanent=False):
+        super().__init__(message)
+        self.permanent = permanent
 
 async def get_latest_posts(channel_username, last_scraped_at_str):
     # Убираем @, если он случайно сохранился в базе
@@ -25,11 +31,23 @@ async def get_latest_posts(channel_username, last_scraped_at_str):
                 print(f"[SCRAPER] 📡 Статус ответа сервера Телеграм: {response.status}")
                 if response.status != 200:
                     print(f"[SCRAPER] ❌ Ошибка: Сервер вернул код {response.status}")
-                    return []
+                    raise ChannelFetchError(
+                        f"Не удалось получить канал @{clean_username}: HTTP {response.status}",
+                        permanent=response.status in {403, 404},
+                    )
                 html = await response.text()
-        except Exception as e:
+        except aiohttp.ClientError as e:
             print(f"[SCRAPER] ❌ Ошибка сети: {e}")
-            return []
+            raise ChannelFetchError(
+                f"Сетевая ошибка при чтении канала @{clean_username}: {e}",
+                permanent=False,
+            ) from e
+        except asyncio.TimeoutError as e:
+            print(f"[SCRAPER] ❌ Таймаут сети: {e}")
+            raise ChannelFetchError(
+                f"Таймаут при чтении канала @{clean_username}",
+                permanent=False,
+            ) from e
             
     soup = BeautifulSoup(html, 'html.parser')
     messages = soup.find_all('div', class_='tgme_widget_message')
