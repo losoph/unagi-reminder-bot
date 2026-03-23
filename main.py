@@ -12,16 +12,26 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, LinkPreviewOptions
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramNotFound,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 
 from database import (
     add_message, get_pending_messages, mark_as_sent, init_db, 
+    mark_message_delivery_error,
     get_user_messages, delete_message,
-    add_subscription, get_due_subscriptions, update_subscription_time, 
+    add_subscription, get_due_subscriptions, update_subscription_time,
+    mark_subscription_delivery_error,
     get_user_subscriptions, delete_subscription,
     add_saved_message, get_user_tags, get_saved_messages, get_saved_message_by_id, delete_saved_message # <-- Добавлены импорты
 )
-from scraper import get_latest_posts
+from scraper import ChannelFetchError, get_latest_posts
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -34,6 +44,8 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 TZ = ZoneInfo("Europe/Moscow")
+MAX_MESSAGE_RETRIES = 5
+MAX_DIGEST_RETRIES = 5
 
 class ScheduleState(StatesGroup):
     waiting_for_datetime = State()
@@ -567,14 +579,33 @@ async def check_messages():
         pending = get_pending_messages(now_str)
         
         for msg in pending:
-            db_id, chat_id, message_id = msg
+            db_id, chat_id, message_id, retry_count = msg
+            attempt_number = retry_count + 1
             try:
                 chat_id = int(chat_id)
                 await bot.forward_message(chat_id=chat_id, from_chat_id=chat_id, message_id=message_id)
                 mark_as_sent(db_id)
-            except Exception as e:
-                print(f"❌ Ошибка отправки {message_id}: {e}")
-                mark_as_sent(db_id)
+            except TelegramAPIError as e:
+                is_permanent, error_text = classify_telegram_send_error(e)
+                retries_exhausted = attempt_number >= MAX_MESSAGE_RETRIES
+                mark_message_delivery_error(
+                    db_id,
+                    error_text,
+                    now_str,
+                    attempt_number,
+                    is_permanent or retries_exhausted,
+                )
+                log_level = logging.ERROR if is_permanent or retries_exhausted else logging.WARNING
+                logging.log(
+                    log_level,
+                    "Не удалось отправить сообщение %s пользователю %s. Попытка %s/%s. Статус: %s. Ошибка: %s",
+                    message_id,
+                    chat_id,
+                    attempt_number,
+                    MAX_MESSAGE_RETRIES,
+                    "permanent" if (is_permanent or retries_exhausted) else "temporary",
+                    error_text,
+                )
         
         await asyncio.sleep(30)
 
@@ -593,10 +624,13 @@ async def check_digests():
         for user_id, subs in users_subs.items():
             digest_lines = [f"📰 <b>Твоя утренняя газета</b> ☕️\n\n"]
             has_news = False
+            user_has_temporary_failures = False
+            successful_subscriptions = []
             
             for sub in subs:
-                sub_id, uid, username, title, period, last_scraped = sub
+                sub_id, uid, username, title, period, last_scraped, failure_count = sub
                 title_safe = html.escape(title) if title else "Канал"
+                now = datetime.now(TZ)
                 
                 try:
                     posts = await get_latest_posts(username, last_scraped)
@@ -616,11 +650,35 @@ async def check_digests():
                     print(f"Ошибка дайджеста для {username}: {e}")
             
             if has_news:
-                for chunk in chunk_html_text(digest_lines):
-                    try:
-                        await bot.send_message(user_id, chunk, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
-                    except Exception as e:
-                        print(f"Ошибка отправки лонгрида пользователю {user_id}: {e}")
+                try:
+                    await send_digest_chunks(user_id, digest_lines)
+                    for sub_id, next_send_str, _ in successful_subscriptions:
+                        update_subscription_time(sub_id, now_str, next_send_str)
+                except TelegramAPIError as e:
+                    is_permanent, error_text = classify_telegram_send_error(e)
+                    for sub_id, _, _, _, _, _, failure_count in subs:
+                        new_failure_count = failure_count + 1
+                        mark_subscription_delivery_error(
+                            sub_id,
+                            error_text,
+                            now_str,
+                            new_failure_count,
+                            is_permanent or new_failure_count >= MAX_DIGEST_RETRIES,
+                        )
+                    retries_exhausted = any(failure_count + 1 >= MAX_DIGEST_RETRIES for _, _, _, _, _, _, failure_count in subs)
+                    logging.log(
+                        logging.ERROR if (is_permanent or retries_exhausted) else logging.WARNING,
+                        "Не удалось отправить дайджест пользователю %s. Статус: %s. Ошибка: %s",
+                        user_id,
+                        "permanent" if (is_permanent or retries_exhausted) else "temporary",
+                        error_text,
+                    )
+            else:
+                for sub_id, next_send_str, _ in successful_subscriptions:
+                    update_subscription_time(sub_id, now_str, next_send_str)
+
+            if user_has_temporary_failures:
+                logging.info("Для пользователя %s дайджест будет повторён позже из-за временных ошибок.", user_id)
         
         await asyncio.sleep(60)
 
