@@ -22,6 +22,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from dotenv import load_dotenv
+from aiogram.types import FSInputFile
 
 from data.database import (
     add_message,
@@ -380,3 +381,13 @@ async def cmd_at(message: types.Message):
     except TelegramAPIError:
         pass
     await message.answer(f"✅ Отложил до {scheduled_time.strftime('%d.%m.%Y %H:%M')}.")
+
+@dp.message(Command("export"))
+async def cmd_export(message: types.Message):
+    # Бот сам возьмет правильный путь из переменных Railway
+    db_path = os.getenv("DB_PATH", "data/bot_data.db")
+    try:
+        document = FSInputFile(db_path)
+        await message.answer_document(document, caption="📦 Моя база данных с Railway")
+    except Exception as e:
+        await message.answer(f"Ошибка выгрузки: {e}")
