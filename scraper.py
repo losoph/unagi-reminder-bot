@@ -74,12 +74,13 @@ async def get_latest_posts(channel_username, last_scraped_at_str, session: aioht
             continue
 
         try:
-            post_time = datetime.fromisoformat(date_elem['datetime'].replace('Z', '+00:00'))
+            datetime_str = date_elem['datetime']
+            post_time = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
             if post_time.tzinfo is None:
                 post_time = post_time.replace(tzinfo=timezone.utc)
             else:
                 post_time = post_time.astimezone(timezone.utc)
-        except ValueError:
+        except (ValueError, KeyError):
             continue
 
         if post_time <= last_scraped_at:
@@ -87,6 +88,8 @@ async def get_latest_posts(channel_username, last_scraped_at_str, session: aioht
 
         text_elem = msg.find('div', class_='tgme_widget_message_text')
         text = text_elem.get_text(separator=' ', strip=True) if text_elem else "Медиа-файл или сообщение без текста"
+        if len(text) > 300:
+            text = text[:297] + "..."
 
         link = f"https://t.me/{clean_username}"
         link_elem = msg.find('a', class_='tgme_widget_message_date')
@@ -96,7 +99,7 @@ async def get_latest_posts(channel_username, last_scraped_at_str, session: aioht
         new_posts.append(
             {
                 'time': post_time,
-                'text': text[:300] + "..." if len(text) > 300 else text,
+                'text': text,
                 'link': link,
             }
         )

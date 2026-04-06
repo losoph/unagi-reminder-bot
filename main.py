@@ -67,6 +67,7 @@ TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Moscow"))
 MAX_MESSAGE_RETRIES = 5
 MAX_DIGEST_RETRIES = 5
 DIGEST_FETCH_CONCURRENCY = 5
+DIGEST_CHECK_INTERVAL_SECONDS = int(os.getenv("DIGEST_CHECK_INTERVAL_SECONDS", 30 * 60))  # Можно переопределить через .env
 CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 
 USER_FACING_ERROR = "Что-то пошло не так. Попробуй ещё раз позже."
@@ -78,6 +79,8 @@ _QUICK_RESCHEDULE_ACTION: dict[str, str] = {
     "later": "now",
 }
 
+_PERIOD_RU = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
+
 
 class ScheduleState(StatesGroup):
     waiting_for_datetime = State()
@@ -88,15 +91,19 @@ class SaveState(StatesGroup):
 
 
 def chunk_html_text(lines, max_length=4000):
-    chunks, current = [], ""
+    chunks, current_lines = [], []
+    current_len = 0
     for line in lines:
-        if len(current) + len(line) > max_length:
-            chunks.append(current)
-            current = line + "\n"
+        line_len = len(line) + 1
+        if current_len + line_len > max_length and current_lines:
+            chunks.append("\n".join(current_lines) + "\n")
+            current_lines = [line]
+            current_len = line_len
         else:
-            current += line + "\n"
-    if current:
-        chunks.append(current)
+            current_lines.append(line)
+            current_len += line_len
+    if current_lines:
+        chunks.append("\n".join(current_lines) + "\n")
     return chunks
 
 
@@ -129,7 +136,8 @@ def get_next_digest_time(period: str, now: datetime | None = None) -> datetime:
 
 def get_message_preview(msg: types.Message):
     text = msg.text or msg.caption or "🖼 Медиафайл"
-    preview = text.replace('\n', ' ')[:40] + "..." if len(text) > 40 else text.replace('\n', ' ')
+    normalized_text = text.replace('\n', ' ')
+    preview = normalized_text[:37] + "..." if len(normalized_text) > 40 else normalized_text
 
     source = "Твой текст"
     if msg.forward_origin:
@@ -475,8 +483,8 @@ async def cmd_list(message: types.Message, state: FSMContext):
         for idx, msg in enumerate(user_msgs, 1):
             db_id, send_at, preview, source = msg
             dt_obj = display_db_datetime(send_at)
-            source_safe = html.escape(source or "Неизвестно")
-            preview_safe = html.escape(preview or "Без текста")
+            source_safe = html.escape(source) if source else "Неизвестно"
+            preview_safe = html.escape(preview) if preview else "Без текста"
 
             text_lines.append(
                 f"{idx}. 📌 <b>{dt_obj.strftime('%d.%m в %H:%M')}</b> | От: {source_safe}\n"
@@ -494,13 +502,13 @@ async def cmd_list(message: types.Message, state: FSMContext):
     if user_subs:
         text_lines = ["📡 <b>Твои подписки на дайджесты:</b>\n"]
         buttons = []
-        period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
         for idx, sub in enumerate(user_subs, 1):
             sub_id, _, title, period, next_send_at = sub
             dt_obj = display_db_datetime(next_send_at)
+            period_label = _PERIOD_RU.get(period, period)
 
             text_lines.append(
-                f"{idx}. 📰 <b>{html.escape(title or 'Канал')}</b> ({period_ru.get(period, period)})\n"
+                f"{idx}. 📰 <b>{html.escape(title) if title else 'Канал'}</b> ({period_label})\n"
                 f"След: {dt_obj.strftime('%d.%m в %H:%M')}\n"
             )
             buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"unsub_{sub_id}"))
@@ -537,9 +545,11 @@ async def handle_cancel(callback: CallbackQuery):
     for idx, msg in enumerate(user_msgs, 1):
         item_id, send_at, preview, source = msg
         dt_obj = display_db_datetime(send_at)
+        source_safe = html.escape(source) if source else "Неизвестно"
+        preview_safe = html.escape(preview) if preview else "Без текста"
         text_lines.append(
-            f"{idx}. 📌 <b>{dt_obj.strftime('%d.%m в %H:%M')}</b> | От: {html.escape(source or 'Неизвестно')}\n"
-            f"<i>{html.escape(preview or 'Без текста')}</i>\n"
+            f"{idx}. 📌 <b>{dt_obj.strftime('%d.%m в %H:%M')}</b> | От: {source_safe}\n"
+            f"<i>{preview_safe}</i>\n"
         )
         buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"cancel_{item_id}"))
 
@@ -576,12 +586,12 @@ async def handle_unsub(callback: CallbackQuery):
 
     text_lines = ["📡 <b>Твои подписки на дайджесты:</b>\n"]
     buttons = []
-    period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
     for idx, sub in enumerate(user_subs, 1):
         item_id, _, title, period, next_send_at = sub
         dt_obj = display_db_datetime(next_send_at)
+        period_label = _PERIOD_RU.get(period, period)
         text_lines.append(
-            f"{idx}. 📰 <b>{html.escape(title or 'Канал')}</b> ({period_ru.get(period, period)})\n"
+            f"{idx}. 📰 <b>{html.escape(title) if title else 'Канал'}</b> ({period_label})\n"
             f"След: {dt_obj.strftime('%d.%m в %H:%M')}\n"
         )
         buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"unsub_{item_id}"))
@@ -621,9 +631,10 @@ async def cmd_saved(message: types.Message, state: FSMContext):
         text_lines.append(f"🏷 <b>{html.escape(tag)}</b>")
         for item in msgs:
             db_id, _, full_text, source, _ = item
-            preview = full_text.replace('\n', ' ')[:40] + "..." if len(full_text) > 40 else full_text.replace('\n', ' ')
-            source_safe = html.escape(source or "Неизвестно")
-            preview_safe = html.escape(preview or "Без текста")
+            normalized_full = full_text.replace('\n', ' ')
+            preview = normalized_full[:37] + "..." if len(normalized_full) > 40 else normalized_full
+            source_safe = html.escape(source) if source else "Неизвестно"
+            preview_safe = html.escape(preview) if preview else "Без текста"
 
             text_lines.append(f"{idx}. От: {source_safe} | <i>{preview_safe}</i>")
             buttons.append(
@@ -661,11 +672,14 @@ async def read_saved(callback: CallbackQuery):
 
     full_text, source, tag, saved_at = msg_data
     dt_obj = display_db_datetime(saved_at)
+    tag_safe = html.escape(tag) if tag else "Без тега"
+    source_safe = html.escape(source) if source else "Неизвестно"
+    full_text_safe = html.escape(full_text) if full_text else "Без текста"
     text = (
-        f"🏷 <b>Тег:</b> {html.escape(tag or 'Без тега')}\n"
-        f"👤 <b>Источник:</b> {html.escape(source or 'Неизвестно')}\n"
+        f"🏷 <b>Тег:</b> {tag_safe}\n"
+        f"👤 <b>Источник:</b> {source_safe}\n"
         f"📅 <b>Сохранено:</b> {dt_obj.strftime('%d.%m.%Y в %H:%M')}\n\n"
-        f"📝 <b>Текст:</b>\n{html.escape(full_text or 'Без текста')}"
+        f"📝 <b>Текст:</b>\n{full_text_safe}"
     )
 
     kb = InlineKeyboardMarkup(
@@ -1083,82 +1097,90 @@ async def check_messages():
 
 async def check_digests():
     semaphore = asyncio.Semaphore(DIGEST_FETCH_CONCURRENCY)
+    logger.info("📬 Сервис дайджестов запущен (проверка каждые %d сек / %d мин)", 
+                DIGEST_CHECK_INTERVAL_SECONDS, DIGEST_CHECK_INTERVAL_SECONDS // 60)
 
     async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
         while True:
             now_str = serialize_datetime(utc_now())
             due_subs = get_due_subscriptions(now_str)
+            
+            if not due_subs:
+                logger.debug("⏭ Нет дайджестов для отправки. Следующая проверка через %d мин", 
+                             DIGEST_CHECK_INTERVAL_SECONDS // 60)
+            else:
+                logger.info("🔄 Начинаю проверку %s дайджестов (next_send_at <= %s)", len(due_subs), now_str)
 
-            users_subs = {}
-            for sub in due_subs:
-                users_subs.setdefault(sub[1], []).append(sub)
+                users_subs = {}
+                for sub in due_subs:
+                    users_subs.setdefault(sub[1], []).append(sub)
 
-            for user_id, subs in users_subs.items():
-                digest_lines = ["📰 <b>Твоя утренняя газета</b> ☕️\n\n"]
-                has_news = False
-                user_has_temporary_failures = False
-                successful_subscriptions = []
+                for user_id, subs in users_subs.items():
+                    digest_lines = ["📰 <b>Твоя утренняя газета</b> ☕️\n\n"]
+                    has_news = False
+                    user_has_temporary_failures = False
+                    successful_subscriptions = []
 
-                results = await asyncio.gather(
-                    *(fetch_subscription_posts(sub, session, semaphore, now_str) for sub in subs),
-                    return_exceptions=False,
-                )
-
-                for result in results:
-                    if result["status"] == "error":
-                        if not result["is_permanent"]:
-                            user_has_temporary_failures = True
-                        continue
-
-                    successful_subscriptions.append((result["sub_id"], result["next_send_str"]))
-                    if result["posts"]:
-                        has_news = True
-                        digest_lines.append(f"📌 <b>{result['title_safe']}</b>")
-                        for post in result["posts"]:
-                            text_safe = html.escape(post["text"])
-                            digest_lines.append(f"🔹 <i>{text_safe}</i> <a href='{post['link']}'>[Читать]</a>\n")
-                        digest_lines.append("")
-
-                if has_news:
-                    try:
-                        await send_digest_chunks(user_id, digest_lines)
-                        for sub_id, next_send_str in successful_subscriptions:
-                            update_subscription_time(sub_id, now_str, next_send_str)
-                    except TelegramAPIError as exc:
-                        is_permanent, error_text = classify_telegram_send_error(exc)
-                        for sub_id, _ in successful_subscriptions:
-                            original = next((item for item in subs if item[0] == sub_id), None)
-                            failure_count = original[6] if original else 0
-                            new_failure_count = failure_count + 1
-                            mark_subscription_delivery_error(
-                                sub_id,
-                                error_text,
-                                now_str,
-                                new_failure_count,
-                                is_permanent or new_failure_count >= MAX_DIGEST_RETRIES,
-                            )
-                        retries_exhausted = any(
-                            (next((item[6] for item in subs if item[0] == sub_id), 0) + 1) >= MAX_DIGEST_RETRIES
-                            for sub_id, _ in successful_subscriptions
-                        )
-                        logger.log(
-                            logging.ERROR if (is_permanent or retries_exhausted) else logging.WARNING,
-                            "Не удалось отправить дайджест пользователю %s. Статус: %s. Ошибка: %s",
-                            user_id,
-                            "permanent" if (is_permanent or retries_exhausted) else "temporary",
-                            error_text,
-                        )
-                else:
-                    for sub_id, next_send_str in successful_subscriptions:
-                        update_subscription_time(sub_id, now_str, next_send_str)
-
-                if user_has_temporary_failures:
-                    logger.info(
-                        "Для пользователя %s дайджест будет частично повторён позже из-за временных ошибок чтения каналов.",
-                        user_id,
+                    results = await asyncio.gather(
+                        *(fetch_subscription_posts(sub, session, semaphore, now_str) for sub in subs),
+                        return_exceptions=False,
                     )
 
-            await asyncio.sleep(60)
+                    for result in results:
+                        if result["status"] == "error":
+                            if not result["is_permanent"]:
+                                user_has_temporary_failures = True
+                            continue
+
+                        successful_subscriptions.append((result["sub_id"], result["next_send_str"]))
+                        if result["posts"]:
+                            has_news = True
+                            digest_lines.append(f"📌 <b>{result['title_safe']}</b>")
+                            for post in result["posts"]:
+                                text_safe = html.escape(post["text"])
+                                digest_lines.append(f"🔹 <i>{text_safe}</i> <a href='{post['link']}'>[Читать]</a>\n")
+                            digest_lines.append("")
+
+                    if has_news:
+                        try:
+                            await send_digest_chunks(user_id, digest_lines)
+                            for sub_id, next_send_str in successful_subscriptions:
+                                update_subscription_time(sub_id, now_str, next_send_str)
+                        except TelegramAPIError as exc:
+                            is_permanent, error_text = classify_telegram_send_error(exc)
+                            for sub_id, _ in successful_subscriptions:
+                                original = next((item for item in subs if item[0] == sub_id), None)
+                                failure_count = original[6] if original else 0
+                                new_failure_count = failure_count + 1
+                                mark_subscription_delivery_error(
+                                    sub_id,
+                                    error_text,
+                                    now_str,
+                                    new_failure_count,
+                                    is_permanent or new_failure_count >= MAX_DIGEST_RETRIES,
+                                )
+                            retries_exhausted = any(
+                                (next((item[6] for item in subs if item[0] == sub_id), 0) + 1) >= MAX_DIGEST_RETRIES
+                                for sub_id, _ in successful_subscriptions
+                            )
+                            logger.log(
+                                logging.ERROR if (is_permanent or retries_exhausted) else logging.WARNING,
+                                "Не удалось отправить дайджест пользователю %s. Статус: %s. Ошибка: %s",
+                                user_id,
+                                "permanent" if (is_permanent or retries_exhausted) else "temporary",
+                                error_text,
+                            )
+                    else:
+                        for sub_id, next_send_str in successful_subscriptions:
+                            update_subscription_time(sub_id, now_str, next_send_str)
+
+                    if user_has_temporary_failures:
+                        logger.info(
+                            "Для пользователя %s дайджест будет частично повторён позже из-за временных ошибок чтения каналов.",
+                            user_id,
+                        )
+
+            await asyncio.sleep(DIGEST_CHECK_INTERVAL_SECONDS)
 
 
 async def cleanup_database():
@@ -1176,7 +1198,12 @@ async def main():
     asyncio.create_task(check_messages())
     asyncio.create_task(check_digests())
     asyncio.create_task(cleanup_database())
-    logger.info("Бот успешно запущен и ждет сообщений...")
+    logger.info("✅ Бот успешно запущен")
+    logger.info("📋 Фоновые процессы:")
+    logger.info("  • Напоминания: проверка каждые 30 сек")
+    logger.info("  • Дайджесты: проверка каждые %d мин (оптимизировано с 1 мин)", DIGEST_CHECK_INTERVAL_SECONDS // 60)
+    logger.info("  • Очистка БД: раз в %d часов", CLEANUP_INTERVAL_SECONDS // 3600)
+    logger.info("🚀 Ожидаю входящих сообщений...")
     await dp.start_polling(bot)
 
 

@@ -20,11 +20,13 @@ def get_connection():
     if DB_PATH != ":memory:":
         Path(DB_PATH).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA busy_timeout = 5000")
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA temp_store = MEMORY")
+        conn.execute("PRAGMA cache_size = -64000")
         yield conn
     finally:
         conn.close()
@@ -47,7 +49,9 @@ def utc_now() -> datetime:
 
 
 def normalize_channel_username(channel_username: str) -> str:
-    return channel_username.strip().removeprefix("@").lower()
+    if isinstance(channel_username, str):
+        return channel_username.lstrip('@').lower()
+    return ""
 
 
 def truncate_error_text(error_text: str | None) -> str | None:
