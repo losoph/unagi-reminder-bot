@@ -23,7 +23,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from dotenv import load_dotenv
 
-from database import (
+from data.database import (
     add_message,
     add_saved_message,
     add_subscription,
@@ -286,6 +286,9 @@ async def cmd_morning(message: types.Message):
 
     db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
     scheduled_time, label = get_quick_scheduled_time("morning", local_now())
+    if scheduled_time is None:
+        await message.answer("❌ Ошибка при планировании времени.")
+        return
     add_message(message.chat.id, source_message_id, serialize_datetime(scheduled_time), preview or "", source or "")
     delete_message(message.chat.id, db_id)
     try:
@@ -305,6 +308,9 @@ async def cmd_day(message: types.Message):
 
     db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
     scheduled_time, label = get_quick_scheduled_time("day", local_now())
+    if scheduled_time is None:
+        await message.answer("❌ Ошибка при планировании времени.")
+        return
     add_message(message.chat.id, source_message_id, serialize_datetime(scheduled_time), preview or "", source or "")
     delete_message(message.chat.id, db_id)
     try:
@@ -324,6 +330,9 @@ async def cmd_evening(message: types.Message):
 
     db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
     scheduled_time, label = get_quick_scheduled_time("evening", local_now())
+    if scheduled_time is None:
+        await message.answer("❌ Ошибка при планировании времени.")
+        return
     add_message(message.chat.id, source_message_id, serialize_datetime(scheduled_time), preview or "", source or "")
     delete_message(message.chat.id, db_id)
     try:
@@ -343,6 +352,9 @@ async def cmd_later(message: types.Message):
 
     db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
     scheduled_time, label = get_quick_scheduled_time("now", local_now())
+    if scheduled_time is None:
+        await message.answer("❌ Ошибка при планировании времени.")
+        return
     add_message(message.chat.id, source_message_id, serialize_datetime(scheduled_time), preview or "", source or "")
     delete_message(message.chat.id, db_id)
     try:

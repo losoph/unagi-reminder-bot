@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import aiohttp
 from bs4 import BeautifulSoup
 
-from database import parse_db_datetime
+from data.database import parse_db_datetime
 
 logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
