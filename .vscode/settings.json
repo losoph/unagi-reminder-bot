@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^/Users/adm/Documents/py/\\.venv/bin/python -m py_compile main\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
