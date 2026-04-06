@@ -17,10 +17,10 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
     TelegramServerError,
 )
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, FSInputFile, InaccessibleMessage, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, InaccessibleMessage, Message
 from dotenv import load_dotenv
 
 from data.database import (
@@ -45,6 +45,7 @@ from data.database import (
     mark_subscription_delivery_error,
     normalize_channel_username,
     parse_db_datetime,
+    replace_sent_reminder_with_pending,
     serialize_datetime,
     update_subscription_time,
     utc_now,
@@ -67,6 +68,15 @@ MAX_MESSAGE_RETRIES = 5
 MAX_DIGEST_RETRIES = 5
 DIGEST_FETCH_CONCURRENCY = 5
 CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
+
+USER_FACING_ERROR = "Что-то пошло не так. Попробуй ещё раз позже."
+
+_QUICK_RESCHEDULE_ACTION: dict[str, str] = {
+    "morning": "morning",
+    "day": "day",
+    "evening": "evening",
+    "later": "now",
+}
 
 
 class ScheduleState(StatesGroup):
@@ -151,6 +161,23 @@ def get_callback_message(callback: CallbackQuery) -> Message | None:
     if message is None or isinstance(message, InaccessibleMessage):
         return None
     return message
+
+
+def parse_callback_int_suffix(data: str | None, prefix: str) -> int | None:
+    if not data or not data.startswith(prefix):
+        return None
+    rest = data[len(prefix) :]
+    try:
+        return int(rest)
+    except ValueError:
+        return None
+
+
+def parse_callback_strip_prefix(data: str | None, prefix: str) -> str | None:
+    if not data or not data.startswith(prefix):
+        return None
+    rest = data[len(prefix) :]
+    return rest if rest else None
 
 
 def build_time_selection_keyboard(prefix: str) -> InlineKeyboardMarkup:
@@ -284,73 +311,54 @@ async def cmd_start(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message(Command("morning"))
-async def cmd_morning(message: types.Message):
+async def _reschedule_replied_reminder(
+    message: types.Message,
+    quick_action: str,
+    success_answer: str,
+) -> None:
     scheduled_msg = get_replied_sent_schedule(message)
     if not scheduled_msg:
         await message.answer("Ответь этой командой на доставленное напоминание от бота.")
         return
 
     db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
-    scheduled_time, label = get_quick_scheduled_time("morning", local_now())
+    scheduled_time, label = get_quick_scheduled_time(quick_action, local_now())
     if scheduled_time is None:
         await message.answer("❌ Ошибка при планировании времени.")
         return
-    add_message(message.chat.id, source_message_id, serialize_datetime(scheduled_time), preview or "", source or "")
-    delete_message(message.chat.id, db_id)
+    try:
+        replace_sent_reminder_with_pending(
+            message.chat.id,
+            db_id,
+            source_message_id,
+            serialize_datetime(scheduled_time),
+            preview or "",
+            source or "",
+        )
+    except Exception:
+        logger.exception("replace_sent_reminder_with_pending failed")
+        await message.answer(USER_FACING_ERROR)
+        return
     try:
         if message.reply_to_message is not None:
             await message.reply_to_message.delete()
         await message.delete()
     except TelegramAPIError:
         pass
-    await message.answer(f"✅ Отложил {label}.")
+    await message.answer(success_answer.format(label=label))
 
 
-@dp.message(Command("day"))
-async def cmd_day(message: types.Message):
-    scheduled_msg = get_replied_sent_schedule(message)
-    if not scheduled_msg:
-        await message.answer("Ответь этой командой на доставленное напоминание от бота.")
+@dp.message(Command("morning", "day", "evening", "later"))
+async def cmd_quick_reschedule(message: types.Message, command: CommandObject):
+    cmd = (command.command or "").lower()
+    action = _QUICK_RESCHEDULE_ACTION.get(cmd)
+    if action is None:
         return
-
-    db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
-    scheduled_time, label = get_quick_scheduled_time("day", local_now())
-    if scheduled_time is None:
-        await message.answer("❌ Ошибка при планировании времени.")
-        return
-    add_message(message.chat.id, source_message_id, serialize_datetime(scheduled_time), preview or "", source or "")
-    delete_message(message.chat.id, db_id)
-    try:
-        if message.reply_to_message is not None:
-            await message.reply_to_message.delete()
-        await message.delete()
-    except TelegramAPIError:
-        pass
-    await message.answer(f"✅ Отложил {label}.")
-
-
-@dp.message(Command("evening"))
-async def cmd_evening(message: types.Message):
-    scheduled_msg = get_replied_sent_schedule(message)
-    if not scheduled_msg:
-        await message.answer("Ответь этой командой на доставленное напоминание от бота.")
-        return
-
-    db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
-    scheduled_time, label = get_quick_scheduled_time("evening", local_now())
-    if scheduled_time is None:
-        await message.answer("❌ Ошибка при планировании времени.")
-        return
-    add_message(message.chat.id, source_message_id, serialize_datetime(scheduled_time), preview or "", source or "")
-    delete_message(message.chat.id, db_id)
-    try:
-        if message.reply_to_message is not None:
-            await message.reply_to_message.delete()
-        await message.delete()
-    except TelegramAPIError:
-        pass
-    await message.answer(f"✅ Отложил {label}.")
+    await _reschedule_replied_reminder(
+        message,
+        action,
+        "✅ Отложил {label}.",
+    )
 
 
 @dp.message(Command("at"))
@@ -378,8 +386,19 @@ async def cmd_at(message: types.Message):
         return
 
     db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
-    add_message(message.chat.id, source_message_id, serialize_datetime(scheduled_time), preview or "", source or "")
-    delete_message(message.chat.id, db_id)
+    try:
+        replace_sent_reminder_with_pending(
+            message.chat.id,
+            db_id,
+            source_message_id,
+            serialize_datetime(scheduled_time),
+            preview or "",
+            source or "",
+        )
+    except Exception:
+        logger.exception("replace_sent_reminder_with_pending failed in cmd_at")
+        await message.answer(USER_FACING_ERROR)
+        return
     try:
         if message.reply_to_message is not None:
             await message.reply_to_message.delete()
@@ -387,39 +406,6 @@ async def cmd_at(message: types.Message):
     except TelegramAPIError:
         pass
     await message.answer(f"✅ Отложил до {scheduled_time.strftime('%d.%m.%Y %H:%M')}.")
-
-@dp.message(Command("export"))
-async def cmd_export(message: types.Message):
-    # Бот сам возьмет правильный путь из переменных Railway
-    db_path = os.getenv("DB_PATH", "data/bot_data.db")
-    try:
-        document = FSInputFile(db_path)
-        await message.answer_document(document, caption="📦 Моя база данных с Railway")
-    except Exception as e:
-        await message.answer(f"Ошибка выгрузки: {e}")
-
-
-@dp.message(Command("later"))
-async def cmd_later(message: types.Message):
-    scheduled_msg = get_replied_sent_schedule(message)
-    if not scheduled_msg:
-        await message.answer("Ответь этой командой на доставленное напоминание от бота.")
-        return
-
-    db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
-    scheduled_time, label = get_quick_scheduled_time("now", local_now())
-    if scheduled_time is None:
-        await message.answer("❌ Ошибка при планировании времени.")
-        return
-    add_message(message.chat.id, source_message_id, serialize_datetime(scheduled_time), preview or "", source or "")
-    delete_message(message.chat.id, db_id)
-    try:
-        if message.reply_to_message is not None:
-            await message.reply_to_message.delete()
-        await message.delete()
-    except TelegramAPIError:
-        pass
-    await message.answer(f"✅ Отложил {label}.")
 
 
 @dp.message(Command("save"))
@@ -534,13 +520,11 @@ async def handle_cancel(callback: CallbackQuery):
         await callback.answer("❌ Сообщение недоступно.")
         return
 
-    callback_data = callback.data or ""
-    parts = callback_data.split("_", 1)
-    if len(parts) != 2:
+    db_id = parse_callback_int_suffix(callback.data, "cancel_")
+    if db_id is None:
         await callback.answer("❌ Некорректные данные.")
         return
 
-    db_id = int(parts[1])
     delete_message(callback_message.chat.id, db_id)
 
     user_msgs = get_user_messages(callback_message.chat.id)
@@ -578,13 +562,11 @@ async def handle_unsub(callback: CallbackQuery):
         await callback.answer("❌ Сообщение недоступно.")
         return
 
-    callback_data = callback.data or ""
-    parts = callback_data.split("_", 1)
-    if len(parts) != 2:
+    sub_id = parse_callback_int_suffix(callback.data, "unsub_")
+    if sub_id is None:
         await callback.answer("❌ Некорректные данные.")
         return
 
-    sub_id = int(parts[1])
     delete_subscription(callback_message.chat.id, sub_id)
 
     user_subs = get_user_subscriptions(callback_message.chat.id)
@@ -667,13 +649,11 @@ async def read_saved(callback: CallbackQuery):
         await callback.answer("❌ Сообщение недоступно.")
         return
 
-    callback_data = callback.data or ""
-    parts = callback_data.split("_", 2)
-    if len(parts) != 3:
+    db_id = parse_callback_int_suffix(callback.data, "read_saved_")
+    if db_id is None:
         await callback.answer("❌ Некорректные данные.")
         return
 
-    db_id = int(parts[2])
     msg_data = get_saved_message_by_id(callback_message.chat.id, db_id)
     if not msg_data:
         await callback.answer("❌ Сообщение не найдено", show_alert=True)
@@ -705,27 +685,28 @@ async def read_saved(callback: CallbackQuery):
 async def close_msg(callback: CallbackQuery):
     callback_message = get_callback_message(callback)
     if callback_message is None:
+        await callback.answer("❌ Сообщение недоступно.")
         return
 
     try:
         await callback_message.delete()
     except TelegramAPIError:
         pass
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("del_saved_"))
 async def handle_del_saved(callback: CallbackQuery, state: FSMContext):
     callback_message = get_callback_message(callback)
     if callback_message is None:
+        await callback.answer("❌ Сообщение недоступно.")
         return
 
-    callback_data = callback.data or ""
-    parts = callback_data.split("_", 2)
-    if len(parts) != 3:
+    db_id = parse_callback_int_suffix(callback.data, "del_saved_")
+    if db_id is None:
         await callback.answer("❌ Некорректные данные.")
         return
 
-    db_id = int(parts[2])
     delete_saved_message(callback_message.chat.id, db_id)
     await callback.answer("✅ Закладка удалена!")
     await cmd_saved(callback_message, state)
@@ -855,8 +836,12 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
 
     for result in results:
         if isinstance(result, BaseException):
+            logger.error(
+                "test_digest channel fetch failed",
+                exc_info=(type(result), result, result.__traceback__),
+            )
             has_news = True
-            digest_lines.append(f"❌ Ошибка парсинга канала: {html.escape(str(result))}\n")
+            digest_lines.append("❌ Не удалось получить данные одного из каналов.\n")
             continue
 
         title, _, posts = result
@@ -926,13 +911,10 @@ async def save_subscription(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Сообщение недоступно.")
         return
 
-    callback_data = callback.data or ""
-    parts = callback_data.split("_", 1)
-    if len(parts) != 2:
+    period = parse_callback_strip_prefix(callback.data, "period_")
+    if period is None:
         await callback.answer("❌ Некорректные данные.")
         return
-
-    period = parts[1]
     data = await state.get_data()
     username = data.get("channel_username")
     title = data.get("channel_title")
@@ -1020,13 +1002,10 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
 
     orig_msg = callback_message.reply_to_message
     preview, source = get_message_preview(orig_msg)
-    callback_data = callback.data or ""
-    parts = callback_data.split("_", 1)
-    if len(parts) != 2:
+    action = parse_callback_strip_prefix(callback.data, "time_")
+    if action is None:
         await callback_message.edit_text("❌ Некорректные данные.")
         return
-
-    action = parts[1]
 
     if action == "custom":
         await state.update_data(

@@ -389,6 +389,40 @@ def delete_message(user_id, msg_id):
         conn.commit()
 
 
+def replace_sent_reminder_with_pending(
+    user_id: int,
+    old_db_id: int,
+    message_id: int,
+    send_at: str,
+    text_preview: str = "",
+    source_name: str = "",
+) -> None:
+    """Atomically insert a new pending reminder and remove the delivered row."""
+    created_at = serialize_datetime(utc_now())
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """
+                INSERT INTO scheduled_messages (
+                    user_id, message_id, send_at, created_at, text_preview, source_name, delivery_status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                """,
+                (user_id, message_id, send_at, created_at, text_preview, source_name),
+            )
+            cur = conn.execute(
+                "DELETE FROM scheduled_messages WHERE id = ? AND user_id = ?",
+                (old_db_id, user_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("Scheduled row missing or already changed")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def get_scheduled_message_by_delivered_message_id(user_id, delivered_message_id):
     with get_connection() as conn:
         row = conn.execute(
