@@ -1,9 +1,11 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 import aiohttp
 from bs4 import BeautifulSoup
+
+from database import parse_db_datetime
 
 logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
@@ -23,7 +25,7 @@ class ChannelFetchError(Exception):
 
 
 def _parse_last_scraped_at(last_scraped_at_str: str | None) -> datetime:
-    return datetime.strptime(last_scraped_at_str, '%Y-%m-%d %H:%M:%S') if last_scraped_at_str else datetime.min
+    return parse_db_datetime(last_scraped_at_str)
 
 
 async def _load_channel_html(session: aiohttp.ClientSession, url: str, clean_username: str) -> str:
@@ -72,8 +74,11 @@ async def get_latest_posts(channel_username, last_scraped_at_str, session: aioht
             continue
 
         try:
-            post_time_str = date_elem['datetime'][:19]
-            post_time = datetime.strptime(post_time_str, '%Y-%m-%dT%H:%M:%S') + timedelta(hours=3)
+            post_time = datetime.fromisoformat(date_elem['datetime'].replace('Z', '+00:00'))
+            if post_time.tzinfo is None:
+                post_time = post_time.replace(tzinfo=timezone.utc)
+            else:
+                post_time = post_time.astimezone(timezone.utc)
         except ValueError:
             continue
 

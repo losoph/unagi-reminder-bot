@@ -27,12 +27,14 @@ from database import (
     add_message,
     add_saved_message,
     add_subscription,
+    cleanup_old_records,
     delete_message,
     delete_saved_message,
     delete_subscription,
     get_due_subscriptions,
     get_pending_messages,
     get_saved_message_by_id,
+    get_scheduled_message_by_delivered_message_id,
     get_saved_messages,
     get_user_messages,
     get_user_subscriptions,
@@ -41,7 +43,11 @@ from database import (
     mark_as_sent,
     mark_message_delivery_error,
     mark_subscription_delivery_error,
+    normalize_channel_username,
+    parse_db_datetime,
+    serialize_datetime,
     update_subscription_time,
+    utc_now,
 )
 from scraper import ChannelFetchError, REQUEST_TIMEOUT, get_latest_posts
 
@@ -56,10 +62,11 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-TZ = ZoneInfo("Europe/Moscow")
+TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Moscow"))
 MAX_MESSAGE_RETRIES = 5
 MAX_DIGEST_RETRIES = 5
 DIGEST_FETCH_CONCURRENCY = 5
+CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 
 
 class ScheduleState(StatesGroup):
@@ -83,8 +90,16 @@ def chunk_html_text(lines, max_length=4000):
     return chunks
 
 
+def local_now() -> datetime:
+    return datetime.now(TZ)
+
+
+def display_db_datetime(value: str) -> datetime:
+    return parse_db_datetime(value).astimezone(TZ)
+
+
 def get_next_digest_time(period: str, now: datetime | None = None) -> datetime:
-    now = now or datetime.now(TZ)
+    now = now or local_now()
     base_time = now.replace(hour=7, minute=0, second=0, microsecond=0)
 
     if period == "daily":
@@ -120,6 +135,65 @@ def get_message_preview(msg: types.Message):
     return preview, source
 
 
+def get_message_full_text(msg: types.Message) -> str:
+    return msg.text or msg.caption or "🖼 Медиафайл (без текста)"
+
+
+def get_replied_sent_schedule(message: types.Message):
+    replied = message.reply_to_message
+    if not replied:
+        return None
+    return get_scheduled_message_by_delivered_message_id(message.chat.id, replied.message_id)
+
+
+def build_time_selection_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🌅 Утро", callback_data=f"{prefix}_morning"),
+                InlineKeyboardButton(text="☀️ День", callback_data=f"{prefix}_day"),
+                InlineKeyboardButton(text="🌙 Вечер", callback_data=f"{prefix}_evening"),
+            ],
+            [
+                InlineKeyboardButton(text="⏱ На 3 часа", callback_data=f"{prefix}_now"),
+                InlineKeyboardButton(text="✍️ Вручную", callback_data=f"{prefix}_custom"),
+            ],
+        ]
+    )
+
+
+def get_quick_scheduled_time(action: str, now: datetime) -> tuple[datetime | None, str]:
+    if action == "morning":
+        return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0), "завтра на 09:00"
+
+    if action == "day":
+        scheduled_time = now.replace(hour=14, minute=0, second=0, microsecond=0)
+        if now.hour >= 14:
+            scheduled_time += timedelta(days=1)
+        return scheduled_time, "на 14:00"
+
+    if action == "evening":
+        scheduled_time = now.replace(hour=20, minute=0, second=0, microsecond=0)
+        if now.hour >= 20:
+            scheduled_time += timedelta(days=1)
+        return scheduled_time, "на 20:00"
+
+    if action == "now":
+        return now + timedelta(hours=3), "через 3 часа"
+
+    return None, ""
+
+
+def get_suggested_manual_time(now: datetime) -> datetime:
+    if now.hour < 8:
+        return now.replace(hour=9, minute=0, second=0, microsecond=0)
+    if now.hour < 13:
+        return now.replace(hour=14, minute=0, second=0, microsecond=0)
+    if now.hour < 20:
+        return now.replace(hour=20, minute=0, second=0, microsecond=0)
+    return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+
+
 def classify_telegram_send_error(error: TelegramAPIError) -> tuple[bool, str]:
     if isinstance(error, TelegramRetryAfter):
         return False, f"Retry after {error.retry_after} seconds"
@@ -152,7 +226,7 @@ async def fetch_subscription_posts(
 ):
     sub_id, _, username, title, period, last_scraped, failure_count = sub
     title_safe = html.escape(title) if title else "Канал"
-    next_send_str = get_next_digest_time(period, datetime.now(TZ)).strftime('%Y-%m-%d %H:%M:%S')
+    next_send_str = serialize_datetime(get_next_digest_time(period, local_now()))
 
     async with semaphore:
         try:
@@ -198,8 +272,166 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "Привет! Я готов.\n\n"
         "1️⃣ Перешли мне любое сообщение, чтобы отложить его или сохранить в базу знаний.\n"
         "2️⃣ Перешли пост из открытого канала, чтобы подписаться на его дайджест.\n"
-        "3️⃣ Напиши /list для задач или /saved для Избранного."
+        "3️⃣ Напиши /list для задач или /saved для Избранного.\n"
+        "4️⃣ Для уже доставленного напоминания ответь на него командой: /morning, /day, /evening, /later, /at ДД.ММ.ГГГГ ЧЧ:ММ, /save, /delete."
     )
+
+
+@dp.message(Command("morning"))
+async def cmd_morning(message: types.Message):
+    scheduled_msg = get_replied_sent_schedule(message)
+    if not scheduled_msg:
+        await message.answer("Ответь этой командой на доставленное напоминание от бота.")
+        return
+
+    db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
+    scheduled_time, label = get_quick_scheduled_time("morning", local_now())
+    add_message(message.chat.id, source_message_id, serialize_datetime(scheduled_time), preview or "", source or "")
+    delete_message(message.chat.id, db_id)
+    try:
+        await message.reply_to_message.delete()
+        await message.delete()
+    except TelegramAPIError:
+        pass
+    await message.answer(f"✅ Отложил {label}.")
+
+
+@dp.message(Command("day"))
+async def cmd_day(message: types.Message):
+    scheduled_msg = get_replied_sent_schedule(message)
+    if not scheduled_msg:
+        await message.answer("Ответь этой командой на доставленное напоминание от бота.")
+        return
+
+    db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
+    scheduled_time, label = get_quick_scheduled_time("day", local_now())
+    add_message(message.chat.id, source_message_id, serialize_datetime(scheduled_time), preview or "", source or "")
+    delete_message(message.chat.id, db_id)
+    try:
+        await message.reply_to_message.delete()
+        await message.delete()
+    except TelegramAPIError:
+        pass
+    await message.answer(f"✅ Отложил {label}.")
+
+
+@dp.message(Command("evening"))
+async def cmd_evening(message: types.Message):
+    scheduled_msg = get_replied_sent_schedule(message)
+    if not scheduled_msg:
+        await message.answer("Ответь этой командой на доставленное напоминание от бота.")
+        return
+
+    db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
+    scheduled_time, label = get_quick_scheduled_time("evening", local_now())
+    add_message(message.chat.id, source_message_id, serialize_datetime(scheduled_time), preview or "", source or "")
+    delete_message(message.chat.id, db_id)
+    try:
+        await message.reply_to_message.delete()
+        await message.delete()
+    except TelegramAPIError:
+        pass
+    await message.answer(f"✅ Отложил {label}.")
+
+
+@dp.message(Command("later"))
+async def cmd_later(message: types.Message):
+    scheduled_msg = get_replied_sent_schedule(message)
+    if not scheduled_msg:
+        await message.answer("Ответь этой командой на доставленное напоминание от бота.")
+        return
+
+    db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
+    scheduled_time, label = get_quick_scheduled_time("now", local_now())
+    add_message(message.chat.id, source_message_id, serialize_datetime(scheduled_time), preview or "", source or "")
+    delete_message(message.chat.id, db_id)
+    try:
+        await message.reply_to_message.delete()
+        await message.delete()
+    except TelegramAPIError:
+        pass
+    await message.answer(f"✅ Отложил {label}.")
+
+
+@dp.message(Command("at"))
+async def cmd_at(message: types.Message):
+    scheduled_msg = get_replied_sent_schedule(message)
+    if not scheduled_msg:
+        await message.answer("Ответь этой командой на доставленное напоминание от бота.")
+        return
+
+    command_text = (message.text or "").strip()
+    parts = command_text.split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if not arg:
+        await message.answer("Формат: /at ДД.ММ.ГГГГ ЧЧ:ММ")
+        return
+
+    try:
+        scheduled_time = datetime.strptime(arg, "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
+    except ValueError:
+        await message.answer("❌ Неверный формат. Пример: /at 06.04.2026 18:30")
+        return
+
+    if scheduled_time < local_now():
+        await message.answer("❌ Эта дата уже в прошлом.")
+        return
+
+    db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
+    add_message(message.chat.id, source_message_id, serialize_datetime(scheduled_time), preview or "", source or "")
+    delete_message(message.chat.id, db_id)
+    try:
+        await message.reply_to_message.delete()
+        await message.delete()
+    except TelegramAPIError:
+        pass
+    await message.answer(f"✅ Отложил до {scheduled_time.strftime('%d.%m.%Y %H:%M')}.")
+
+
+@dp.message(Command("save"))
+async def cmd_save_reply(message: types.Message, state: FSMContext):
+    scheduled_msg = get_replied_sent_schedule(message)
+    if not scheduled_msg:
+        await message.answer("Ответь этой командой на доставленное напоминание от бота.")
+        return
+
+    db_id, _, delivered_message_id, _, _, source, _ = scheduled_msg
+    full_text = get_message_full_text(message.reply_to_message)
+    tags = get_user_tags(message.chat.id)
+    tags_text = ""
+    if tags:
+        tags_formatted = "  ".join([f"`{tag}`" for tag in tags])
+        tags_text = f"\n\n📝 *Твои прошлые теги* (нажми, чтобы скопировать):\n{tags_formatted}"
+
+    prompt = await message.answer(
+        f"Напиши тег для этого сообщения (например: Идеи, Статьи, Важное).{tags_text}",
+        parse_mode="Markdown",
+    )
+    await state.update_data(
+        full_text=full_text,
+        source=source or "Неизвестно",
+        prompt_msg_id=prompt.message_id,
+        target_message_id=delivered_message_id,
+        scheduled_db_id=db_id,
+        command_message_id=message.message_id,
+    )
+    await state.set_state(SaveState.waiting_for_tag)
+
+
+@dp.message(Command("delete"))
+async def cmd_delete_reply(message: types.Message):
+    scheduled_msg = get_replied_sent_schedule(message)
+    if not scheduled_msg:
+        await message.answer("Ответь этой командой на доставленное напоминание от бота.")
+        return
+
+    db_id = scheduled_msg[0]
+    delete_message(message.chat.id, db_id)
+    try:
+        await message.reply_to_message.delete()
+        await message.delete()
+    except TelegramAPIError:
+        pass
 
 
 @dp.message(Command("list"))
@@ -218,7 +450,7 @@ async def cmd_list(message: types.Message, state: FSMContext):
         buttons = []
         for idx, msg in enumerate(user_msgs, 1):
             db_id, send_at, preview, source = msg
-            dt_obj = datetime.strptime(send_at, '%Y-%m-%d %H:%M:%S')
+            dt_obj = display_db_datetime(send_at)
             source_safe = html.escape(source or "Неизвестно")
             preview_safe = html.escape(preview or "Без текста")
 
@@ -238,7 +470,7 @@ async def cmd_list(message: types.Message, state: FSMContext):
         period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
         for idx, sub in enumerate(user_subs, 1):
             sub_id, _, title, period, next_send_at = sub
-            dt_obj = datetime.strptime(next_send_at, '%Y-%m-%d %H:%M:%S')
+            dt_obj = display_db_datetime(next_send_at)
 
             text_lines.append(
                 f"{idx}. 📰 <b>{html.escape(title or 'Канал')}</b> ({period_ru.get(period, period)})\n"
@@ -268,7 +500,7 @@ async def handle_cancel(callback: CallbackQuery):
     buttons = []
     for idx, msg in enumerate(user_msgs, 1):
         item_id, send_at, preview, source = msg
-        dt_obj = datetime.strptime(send_at, '%Y-%m-%d %H:%M:%S')
+        dt_obj = display_db_datetime(send_at)
         text_lines.append(
             f"{idx}. 📌 <b>{dt_obj.strftime('%d.%m в %H:%M')}</b> | От: {html.escape(source or 'Неизвестно')}\n"
             f"<i>{html.escape(preview or 'Без текста')}</i>\n"
@@ -302,7 +534,7 @@ async def handle_unsub(callback: CallbackQuery):
     period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
     for idx, sub in enumerate(user_subs, 1):
         item_id, _, title, period, next_send_at = sub
-        dt_obj = datetime.strptime(next_send_at, '%Y-%m-%d %H:%M:%S')
+        dt_obj = display_db_datetime(next_send_at)
         text_lines.append(
             f"{idx}. 📰 <b>{html.escape(title or 'Канал')}</b> ({period_ru.get(period, period)})\n"
             f"След: {dt_obj.strftime('%d.%m в %H:%M')}\n"
@@ -374,7 +606,7 @@ async def read_saved(callback: CallbackQuery):
         return
 
     full_text, source, tag, saved_at = msg_data
-    dt_obj = datetime.strptime(saved_at, '%Y-%m-%d %H:%M:%S')
+    dt_obj = display_db_datetime(saved_at)
     text = (
         f"🏷 <b>Тег:</b> {html.escape(tag or 'Без тега')}\n"
         f"👤 <b>Источник:</b> {html.escape(source or 'Неизвестно')}\n"
@@ -415,7 +647,7 @@ async def handle_del_saved(callback: CallbackQuery, state: FSMContext):
 async def process_custom_datetime(message: types.Message, state: FSMContext):
     try:
         scheduled_time = datetime.strptime(message.text, "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
-        if scheduled_time < datetime.now(TZ):
+        if scheduled_time < local_now():
             await message.answer("Эта дата уже в прошлом! Попробуй еще раз (ДД.ММ.ГГГГ ЧЧ:ММ):")
             return
 
@@ -430,7 +662,7 @@ async def process_custom_datetime(message: types.Message, state: FSMContext):
             await state.clear()
             return
 
-        add_message(message.chat.id, msg_id, scheduled_time.strftime('%Y-%m-%d %H:%M:%S'), preview, source)
+        add_message(message.chat.id, msg_id, serialize_datetime(scheduled_time), preview, source)
 
         try:
             await message.delete()
@@ -464,8 +696,11 @@ async def process_tag(message: types.Message, state: FSMContext):
     full_text = data.get('full_text')
     source = data.get('source')
     prompt_msg_id = data.get('prompt_msg_id')
+    target_message_id = data.get('target_message_id')
+    scheduled_db_id = data.get('scheduled_db_id')
+    command_message_id = data.get('command_message_id')
 
-    saved_at = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
+    saved_at = serialize_datetime(utc_now())
     add_saved_message(message.chat.id, full_text, source, tag, saved_at)
 
     try:
@@ -474,8 +709,15 @@ async def process_tag(message: types.Message, state: FSMContext):
             await bot.delete_message(message.chat.id, prompt_msg_id)
         if orig_msg_id:
             await bot.delete_message(message.chat.id, orig_msg_id)
+        if target_message_id:
+            await bot.delete_message(message.chat.id, target_message_id)
+        if command_message_id:
+            await bot.delete_message(message.chat.id, command_message_id)
     except TelegramAPIError:
         pass
+
+    if scheduled_db_id:
+        delete_message(message.chat.id, scheduled_db_id)
 
     confirm_msg = await message.answer(
         f"✅ Сохранено в базу знаний под тегом <b>{html.escape(tag)}</b>",
@@ -501,8 +743,8 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
         return
 
     await message.answer("⏳ Собираю единый дайджест за последние 24 часа...")
-    now_tz = datetime.now(TZ)
-    last_24h_str = (now_tz - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+    now_tz = local_now()
+    last_24h_str = serialize_datetime(now_tz - timedelta(days=1))
     digest_lines = ["📰 <b>Твоя тестовая утренняя газета</b> ☕️\n\n"]
     has_news = False
     semaphore = asyncio.Semaphore(DIGEST_FETCH_CONCURRENCY)
@@ -553,18 +795,8 @@ async def catch_message(message: types.Message, state: FSMContext):
             channel_username = message.forward_origin.chat.username
             channel_title = message.forward_origin.chat.title
 
-    kb = [
-        [
-            InlineKeyboardButton(text="🌅 Утром в 9", callback_data="time_morning"),
-            InlineKeyboardButton(text="☀️ Днем в 14", callback_data="time_day"),
-            InlineKeyboardButton(text="🌙 Вечером в 20", callback_data="time_evening"),
-        ],
-        [
-            InlineKeyboardButton(text="⏱ Через 3 часа", callback_data="time_now"),
-            InlineKeyboardButton(text="📅 Точная дата", callback_data="time_custom"),
-        ],
-        [InlineKeyboardButton(text="📁 В закладки (База знаний)", callback_data="bookmark_setup")],
-    ]
+    kb = build_time_selection_keyboard("time").inline_keyboard
+    kb.append([InlineKeyboardButton(text="📁 В закладки (База знаний)", callback_data="bookmark_setup")])
 
     if is_public_channel:
         kb.append([InlineKeyboardButton(text="📡 Собирать дайджест", callback_data="digest_setup")])
@@ -597,10 +829,19 @@ async def save_subscription(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text("❌ Ошибка: данные канала утеряны.")
         return
 
-    now = datetime.now(TZ)
+    username = normalize_channel_username(username)
+
+    now = local_now()
     next_send = get_next_digest_time(period, now)
-    last_scraped = now.strftime('%Y-%m-%d %H:%M:%S')
-    add_subscription(callback.message.chat.id, username, title, period, last_scraped, next_send.strftime('%Y-%m-%d %H:%M:%S'))
+    last_scraped = serialize_datetime(utc_now())
+    add_subscription(
+        callback.message.chat.id,
+        username,
+        title,
+        period,
+        last_scraped,
+        serialize_datetime(next_send),
+    )
 
     period_ru = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
     await callback.answer(
@@ -625,7 +866,7 @@ async def setup_bookmark(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text("❌ Ошибка: не могу найти оригинальное сообщение.")
         return
 
-    full_text = orig_msg.text or orig_msg.caption or "🖼 Медиафайл (без текста)"
+    full_text = get_message_full_text(orig_msg)
     _, source = get_message_preview(orig_msg)
 
     await state.update_data(
@@ -647,21 +888,18 @@ async def setup_bookmark(callback: CallbackQuery, state: FSMContext):
         parse_mode="Markdown",
     )
 
-
 @dp.callback_query(F.data.startswith("time_"))
 async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
-    now = datetime.now(TZ)
-    scheduled_time = None
-    label = ""
-
+    now = local_now()
     if callback.message.reply_to_message is None:
         await callback.message.edit_text("❌ Ошибка: не могу найти оригинальное сообщение.")
         return
 
     orig_msg = callback.message.reply_to_message
     preview, source = get_message_preview(orig_msg)
+    action = callback.data.split("_", 1)[1]
 
-    if callback.data == "time_custom":
+    if action == "custom":
         await state.update_data(
             message_id=orig_msg.message_id,
             preview=preview,
@@ -669,16 +907,7 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
             prompt_msg_id=callback.message.message_id,
         )
         await state.set_state(ScheduleState.waiting_for_datetime)
-
-        if now.hour < 8:
-            suggested_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        elif now.hour < 13:
-            suggested_time = now.replace(hour=14, minute=0, second=0, microsecond=0)
-        elif now.hour < 20:
-            suggested_time = now.replace(hour=20, minute=0, second=0, microsecond=0)
-        else:
-            suggested_time = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-
+        suggested_time = get_suggested_manual_time(now)
         suggested_str = suggested_time.strftime('%d.%m.%Y %H:%M')
         await callback.message.edit_text(
             "Напиши точную дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ\n\n"
@@ -688,22 +917,7 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
         )
         return
 
-    if callback.data == "time_morning":
-        scheduled_time = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-        label = "завтра на 09:00"
-    elif callback.data == "time_day":
-        scheduled_time = now.replace(hour=14, minute=0, second=0, microsecond=0)
-        if now.hour >= 14:
-            scheduled_time += timedelta(days=1)
-        label = "на 14:00"
-    elif callback.data == "time_evening":
-        scheduled_time = now.replace(hour=20, minute=0, second=0, microsecond=0)
-        if now.hour >= 20:
-            scheduled_time += timedelta(days=1)
-        label = "на 20:00"
-    elif callback.data == "time_now":
-        scheduled_time = now + timedelta(hours=3)
-        label = "через 3 часа"
+    scheduled_time, label = get_quick_scheduled_time(action, now)
 
     if scheduled_time:
         try:
@@ -711,7 +925,7 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
             add_message(
                 callback.message.chat.id,
                 orig_msg.message_id,
-                scheduled_time.strftime('%Y-%m-%d %H:%M:%S'),
+                serialize_datetime(scheduled_time),
                 preview,
                 source,
             )
@@ -723,14 +937,18 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
 
 async def check_messages():
     while True:
-        now_str = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
+        now_str = serialize_datetime(utc_now())
         pending = get_pending_messages(now_str)
 
         for db_id, chat_id, message_id, retry_count in pending:
             attempt_number = retry_count + 1
             try:
-                await bot.forward_message(chat_id=int(chat_id), from_chat_id=int(chat_id), message_id=message_id)
-                mark_as_sent(db_id)
+                sent_message = await bot.copy_message(
+                    chat_id=int(chat_id),
+                    from_chat_id=int(chat_id),
+                    message_id=message_id,
+                )
+                mark_as_sent(db_id, sent_message.message_id)
             except TelegramAPIError as exc:
                 is_permanent, error_text = classify_telegram_send_error(exc)
                 retries_exhausted = attempt_number >= MAX_MESSAGE_RETRIES
@@ -760,7 +978,7 @@ async def check_digests():
 
     async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
         while True:
-            now_str = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
+            now_str = serialize_datetime(utc_now())
             due_subs = get_due_subscriptions(now_str)
 
             users_subs = {}
@@ -835,11 +1053,21 @@ async def check_digests():
             await asyncio.sleep(60)
 
 
+async def cleanup_database():
+    while True:
+        now_str = serialize_datetime(utc_now())
+        cleanup_stats = cleanup_old_records(now_str)
+        if any(cleanup_stats.values()):
+            logger.info("Очистка SQLite завершена: %s", cleanup_stats)
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+
+
 async def main():
     init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(check_messages())
     asyncio.create_task(check_digests())
+    asyncio.create_task(cleanup_database())
     logger.info("Бот успешно запущен и ждет сообщений...")
     await dp.start_polling(bot)
 
