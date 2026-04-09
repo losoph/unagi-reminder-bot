@@ -77,6 +77,7 @@ _QUICK_RESCHEDULE_ACTION: dict[str, str] = {
     "day": "day",
     "evening": "evening",
     "later": "now",
+    "l": "now",
 }
 
 _PERIOD_RU = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
@@ -204,6 +205,20 @@ def build_time_selection_keyboard(prefix: str) -> InlineKeyboardMarkup:
     )
 
 
+def build_sent_reminder_actions_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⏰ Отложить", callback_data="sent_later"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data="sent_delete"),
+            ],
+            [
+                InlineKeyboardButton(text="📁 Сохранить", callback_data="sent_save"),
+            ],
+        ]
+    )
+
+
 def get_quick_scheduled_time(action: str, now: datetime) -> tuple[datetime | None, str]:
     if action == "morning":
         return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0), "завтра на 09:00"
@@ -315,8 +330,42 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "1️⃣ Перешли мне любое сообщение, чтобы отложить его или сохранить в базу знаний.\n"
         "2️⃣ Перешли пост из открытого канала, чтобы подписаться на его дайджест.\n"
         "3️⃣ Напиши /list для задач или /saved для Избранного.\n"
-        "4️⃣ Для уже доставленного напоминания ответь на него командой: /morning, /day, /evening, /later, /at ДД.ММ.ГГГГ ЧЧ:ММ, /save, /delete."
+        "4️⃣ Для уже доставленного напоминания используй кнопки под ним или ответь командой: "
+        "/morning, /day, /evening, /later (/l), /at ДД.ММ.ГГГГ ЧЧ:ММ, /save (/s), /delete (/d)."
     )
+
+
+async def start_save_flow(
+    message: types.Message,
+    state: FSMContext,
+    *,
+    full_text: str,
+    source: str,
+    target_message_id: int | None = None,
+    scheduled_db_id: int | None = None,
+    command_message_id: int | None = None,
+    orig_msg_id: int | None = None,
+) -> None:
+    tags = get_user_tags(message.chat.id)
+    tags_text = ""
+    if tags:
+        tags_formatted = "  ".join([f"`{tag}`" for tag in tags])
+        tags_text = f"\n\n📝 *Твои прошлые теги* (нажми, чтобы скопировать):\n{tags_formatted}"
+
+    prompt = await message.answer(
+        f"Напиши тег для этого сообщения (например: Идеи, Статьи, Важное).{tags_text}",
+        parse_mode="Markdown",
+    )
+    await state.update_data(
+        orig_msg_id=orig_msg_id,
+        full_text=full_text,
+        source=source or "Неизвестно",
+        prompt_msg_id=prompt.message_id,
+        target_message_id=target_message_id,
+        scheduled_db_id=scheduled_db_id,
+        command_message_id=command_message_id,
+    )
+    await state.set_state(SaveState.waiting_for_tag)
 
 
 async def _reschedule_replied_reminder(
@@ -356,7 +405,7 @@ async def _reschedule_replied_reminder(
     await message.answer(success_answer.format(label=label))
 
 
-@dp.message(Command("morning", "day", "evening", "later"))
+@dp.message(Command("morning", "day", "evening", "later", "l"))
 async def cmd_quick_reschedule(message: types.Message, command: CommandObject):
     cmd = (command.command or "").lower()
     action = _QUICK_RESCHEDULE_ACTION.get(cmd)
@@ -416,7 +465,7 @@ async def cmd_at(message: types.Message):
     await message.answer(f"✅ Отложил до {scheduled_time.strftime('%d.%m.%Y %H:%M')}.")
 
 
-@dp.message(Command("save"))
+@dp.message(Command("save", "s"))
 async def cmd_save_reply(message: types.Message, state: FSMContext):
     scheduled_msg = get_replied_sent_schedule(message)
     if not scheduled_msg:
@@ -428,28 +477,18 @@ async def cmd_save_reply(message: types.Message, state: FSMContext):
         await message.answer("Ответь этой командой на доставленное напоминание от бота.")
         return
     full_text = get_message_full_text(message.reply_to_message)
-    tags = get_user_tags(message.chat.id)
-    tags_text = ""
-    if tags:
-        tags_formatted = "  ".join([f"`{tag}`" for tag in tags])
-        tags_text = f"\n\n📝 *Твои прошлые теги* (нажми, чтобы скопировать):\n{tags_formatted}"
-
-    prompt = await message.answer(
-        f"Напиши тег для этого сообщения (например: Идеи, Статьи, Важное).{tags_text}",
-        parse_mode="Markdown",
-    )
-    await state.update_data(
+    await start_save_flow(
+        message,
+        state,
         full_text=full_text,
         source=source or "Неизвестно",
-        prompt_msg_id=prompt.message_id,
         target_message_id=delivered_message_id,
         scheduled_db_id=db_id,
         command_message_id=message.message_id,
     )
-    await state.set_state(SaveState.waiting_for_tag)
 
 
-@dp.message(Command("delete"))
+@dp.message(Command("delete", "d"))
 async def cmd_delete_reply(message: types.Message):
     scheduled_msg = get_replied_sent_schedule(message)
     if not scheduled_msg:
@@ -464,6 +503,155 @@ async def cmd_delete_reply(message: types.Message):
         await message.delete()
     except TelegramAPIError:
         pass
+
+
+@dp.callback_query(F.data == "sent_later")
+async def show_sent_reminder_time_actions(callback: CallbackQuery):
+    callback_message = get_callback_message(callback)
+    if callback_message is None:
+        await callback.answer("❌ Сообщение недоступно.")
+        return
+
+    scheduled_msg = get_scheduled_message_by_delivered_message_id(
+        callback_message.chat.id, callback_message.message_id
+    )
+    if not scheduled_msg:
+        await callback.answer("❌ Напоминание уже обработано.", show_alert=True)
+        return
+
+    await callback_message.answer(
+        "Когда напомнить снова?",
+        reply_markup=build_time_selection_keyboard(f"senttime_{callback_message.message_id}"),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("senttime_"))
+async def handle_sent_reminder_time_selection(callback: CallbackQuery, state: FSMContext):
+    callback_message = get_callback_message(callback)
+    if callback_message is None:
+        await callback.answer("❌ Сообщение недоступно.")
+        return
+
+    payload = parse_callback_strip_prefix(callback.data, "senttime_")
+    if payload is None:
+        await callback.answer("❌ Некорректные данные.")
+        return
+
+    try:
+        delivered_message_id_str, action = payload.rsplit("_", 1)
+        delivered_message_id = int(delivered_message_id_str)
+    except ValueError:
+        await callback.answer("❌ Некорректные данные.")
+        return
+
+    scheduled_msg = get_scheduled_message_by_delivered_message_id(
+        callback_message.chat.id, delivered_message_id
+    )
+    if not scheduled_msg:
+        await callback.answer("❌ Напоминание уже обработано.", show_alert=True)
+        return
+
+    db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
+    now = local_now()
+
+    if action == "custom":
+        suggested_time = get_suggested_manual_time(now)
+        suggested_str = suggested_time.strftime("%d.%m.%Y %H:%M")
+        prompt = await callback_message.answer(
+            "Напиши точную дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ\n\n"
+            "💡 *Лайфхак:* нажми на время ниже, чтобы скопировать его:\n\n"
+            f"`{suggested_str}`",
+            parse_mode="Markdown",
+        )
+        await state.update_data(
+            scheduled_db_id=db_id,
+            source_message_id=source_message_id,
+            preview=preview or "",
+            source=source or "",
+            prompt_msg_id=prompt.message_id,
+            target_message_id=delivered_message_id,
+            command_message_id=callback_message.message_id,
+        )
+        await state.set_state(ScheduleState.waiting_for_datetime)
+        await callback.answer()
+        return
+
+    scheduled_time, label = get_quick_scheduled_time(action, now)
+    if scheduled_time is None:
+        await callback.answer("❌ Ошибка при планировании времени.")
+        return
+
+    try:
+        replace_sent_reminder_with_pending(
+            callback_message.chat.id,
+            db_id,
+            source_message_id,
+            serialize_datetime(scheduled_time),
+            preview or "",
+            source or "",
+        )
+    except Exception:
+        logger.exception("replace_sent_reminder_with_pending failed in callback")
+        await callback.answer(USER_FACING_ERROR, show_alert=True)
+        return
+
+    for message_id in (delivered_message_id, callback_message.message_id):
+        try:
+            await bot.delete_message(callback_message.chat.id, message_id)
+        except TelegramAPIError:
+            pass
+
+    await callback.answer()
+    await bot.send_message(callback_message.chat.id, f"✅ Отложил {label}.")
+
+
+@dp.callback_query(F.data == "sent_save")
+async def save_sent_reminder(callback: CallbackQuery, state: FSMContext):
+    callback_message = get_callback_message(callback)
+    if callback_message is None:
+        await callback.answer("❌ Сообщение недоступно.")
+        return
+
+    scheduled_msg = get_scheduled_message_by_delivered_message_id(
+        callback_message.chat.id, callback_message.message_id
+    )
+    if not scheduled_msg:
+        await callback.answer("❌ Напоминание уже обработано.", show_alert=True)
+        return
+
+    db_id, _, delivered_message_id, _, _, source, _ = scheduled_msg
+    await start_save_flow(
+        callback_message,
+        state,
+        full_text=get_message_full_text(callback_message),
+        source=source or "Неизвестно",
+        target_message_id=delivered_message_id,
+        scheduled_db_id=db_id,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "sent_delete")
+async def delete_sent_reminder(callback: CallbackQuery):
+    callback_message = get_callback_message(callback)
+    if callback_message is None:
+        await callback.answer("❌ Сообщение недоступно.")
+        return
+
+    scheduled_msg = get_scheduled_message_by_delivered_message_id(
+        callback_message.chat.id, callback_message.message_id
+    )
+    if not scheduled_msg:
+        await callback.answer("❌ Напоминание уже обработано.", show_alert=True)
+        return
+
+    delete_message(callback_message.chat.id, scheduled_msg[0])
+    try:
+        await callback_message.delete()
+    except TelegramAPIError:
+        pass
+    await callback.answer("Удалено!")
 
 
 @dp.message(Command("list"))
@@ -741,25 +929,44 @@ async def process_custom_datetime(message: types.Message, state: FSMContext):
 
         data = await state.get_data()
         msg_id = data.get("message_id")
+        scheduled_db_id = data.get("scheduled_db_id")
+        source_message_id = data.get("source_message_id")
         preview = data.get("preview", "")
         source = data.get("source", "")
         prompt_msg_id = data.get("prompt_msg_id")
 
-        if not msg_id:
-            await message.answer("Ошибка: не найден ID сообщения. Попробуй переслать его заново.")
+        if msg_id:
+            add_message(message.chat.id, msg_id, serialize_datetime(scheduled_time), preview, source)
+            confirmation_text = f"✅ Принято! Запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}."
+        elif scheduled_db_id and source_message_id:
+            replace_sent_reminder_with_pending(
+                message.chat.id,
+                scheduled_db_id,
+                source_message_id,
+                serialize_datetime(scheduled_time),
+                preview,
+                source,
+            )
+            confirmation_text = f"✅ Отложил до {scheduled_time.strftime('%d.%m.%Y %H:%M')}."
+        else:
+            await message.answer("Ошибка: не найдено исходное напоминание. Попробуй отправить его заново.")
             await state.clear()
             return
-
-        add_message(message.chat.id, msg_id, serialize_datetime(scheduled_time), preview, source)
 
         try:
             await message.delete()
             if prompt_msg_id:
                 await bot.delete_message(message.chat.id, prompt_msg_id)
+            target_message_id = data.get("target_message_id")
+            if target_message_id:
+                await bot.delete_message(message.chat.id, target_message_id)
+            command_message_id = data.get("command_message_id")
+            if command_message_id:
+                await bot.delete_message(message.chat.id, command_message_id)
         except TelegramAPIError:
             pass
 
-        confirm_msg = await message.answer(f"✅ Принято! Запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}.")
+        confirm_msg = await message.answer(confirmation_text)
         await state.clear()
 
         await asyncio.sleep(3)
@@ -982,24 +1189,17 @@ async def setup_bookmark(callback: CallbackQuery, state: FSMContext):
     full_text = get_message_full_text(orig_msg)
     _, source = get_message_preview(orig_msg)
 
-    await state.update_data(
-        orig_msg_id=orig_msg.message_id,
+    await start_save_flow(
+        callback_message,
+        state,
         full_text=full_text,
         source=source,
-        prompt_msg_id=callback_message.message_id,
+        orig_msg_id=orig_msg.message_id,
     )
-    await state.set_state(SaveState.waiting_for_tag)
-
-    tags = get_user_tags(callback_message.chat.id)
-    tags_text = ""
-    if tags:
-        tags_formatted = "  ".join([f"`{tag}`" for tag in tags])
-        tags_text = f"\n\n📝 *Твои прошлые теги* (нажми, чтобы скопировать):\n{tags_formatted}"
-
-    await callback_message.edit_text(
-        f"Напиши тег для этого сообщения (например: Идеи, Статьи, Важное).{tags_text}",
-        parse_mode="Markdown",
-    )
+    try:
+        await callback_message.delete()
+    except TelegramAPIError:
+        pass
 
 
 @dp.callback_query(F.data.startswith("time_"))
@@ -1069,6 +1269,7 @@ async def check_messages():
                     chat_id=int(chat_id),
                     from_chat_id=int(chat_id),
                     message_id=message_id,
+                    reply_markup=build_sent_reminder_actions_keyboard(),
                 )
                 mark_as_sent(db_id, sent_message.message_id)
             except TelegramAPIError as exc:
