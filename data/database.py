@@ -247,6 +247,32 @@ def init_db():
                 saved_at DATETIME
             )
         ''')
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS digest_settings (
+                user_id INTEGER,
+                period TEXT,
+                send_hour INTEGER DEFAULT 7,
+                send_minute INTEGER DEFAULT 0,
+                weekday INTEGER,
+                month_day INTEGER,
+                monthly_mode TEXT DEFAULT 'date',
+                PRIMARY KEY (user_id, period)
+            )
+            '''
+        )
+
+        for statement in (
+            "ALTER TABLE digest_settings ADD COLUMN send_hour INTEGER DEFAULT 7",
+            "ALTER TABLE digest_settings ADD COLUMN send_minute INTEGER DEFAULT 0",
+            "ALTER TABLE digest_settings ADD COLUMN weekday INTEGER",
+            "ALTER TABLE digest_settings ADD COLUMN month_day INTEGER",
+            "ALTER TABLE digest_settings ADD COLUMN monthly_mode TEXT DEFAULT 'date'",
+        ):
+            try:
+                cursor.execute(statement)
+            except sqlite3.OperationalError:
+                pass
 
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_scheduled_messages_due ON scheduled_messages(send_at, is_sent, delivery_status)"
@@ -271,6 +297,9 @@ def init_db():
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_saved_messages_user_tag_date ON saved_messages(user_id, tag, saved_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_digest_settings_user_period ON digest_settings(user_id, period)"
         )
 
         _migrate_legacy_local_timestamps_to_utc(cursor)
@@ -539,6 +568,106 @@ def get_user_subscriptions(user_id):
             (user_id,),
         ).fetchall()
     return rows
+
+
+def get_subscription_by_id(user_id, sub_id):
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT id, user_id, channel_username, channel_title, period, last_scraped_at, next_send_at
+            FROM subscriptions
+            WHERE id = ? AND user_id = ? AND is_disabled = 0
+            ''',
+            (sub_id, user_id),
+        ).fetchone()
+    return row
+
+
+def update_subscriptions_next_send_at(user_id, period, next_send_at):
+    with get_connection() as conn:
+        conn.execute(
+            '''
+            UPDATE subscriptions
+            SET next_send_at = ?, digest_status = 'active', failure_count = 0, last_error = NULL
+            WHERE user_id = ? AND period = ? AND is_disabled = 0
+            ''',
+            (next_send_at, user_id, period),
+        )
+        conn.commit()
+
+
+def get_digest_settings(user_id):
+    with get_connection() as conn:
+        rows = conn.execute(
+            '''
+            SELECT period, send_hour, send_minute, weekday, month_day, monthly_mode
+            FROM digest_settings
+            WHERE user_id = ?
+            ''',
+            (user_id,),
+        ).fetchall()
+    return {row["period"]: row for row in rows}
+
+
+def upsert_digest_settings(
+    user_id,
+    period,
+    *,
+    send_hour=None,
+    send_minute=None,
+    weekday=None,
+    month_day=None,
+    monthly_mode=None,
+):
+    with get_connection() as conn:
+        existing = conn.execute(
+            '''
+            SELECT send_hour, send_minute, weekday, month_day, monthly_mode
+            FROM digest_settings
+            WHERE user_id = ? AND period = ?
+            ''',
+            (user_id, period),
+        ).fetchone()
+        values = {
+            "send_hour": existing["send_hour"] if existing else 7,
+            "send_minute": existing["send_minute"] if existing else 0,
+            "weekday": existing["weekday"] if existing else None,
+            "month_day": existing["month_day"] if existing else None,
+            "monthly_mode": existing["monthly_mode"] if existing else "date",
+        }
+        if send_hour is not None:
+            values["send_hour"] = send_hour
+        if send_minute is not None:
+            values["send_minute"] = send_minute
+        if weekday is not None:
+            values["weekday"] = weekday
+        if month_day is not None:
+            values["month_day"] = month_day
+        if monthly_mode is not None:
+            values["monthly_mode"] = monthly_mode
+
+        conn.execute(
+            '''
+            INSERT INTO digest_settings (user_id, period, send_hour, send_minute, weekday, month_day, monthly_mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, period) DO UPDATE SET
+                send_hour = excluded.send_hour,
+                send_minute = excluded.send_minute,
+                weekday = excluded.weekday,
+                month_day = excluded.month_day,
+                monthly_mode = excluded.monthly_mode
+            ''',
+            (
+                user_id,
+                period,
+                values["send_hour"],
+                values["send_minute"],
+                values["weekday"],
+                values["month_day"],
+                values["monthly_mode"],
+            ),
+        )
+        conn.commit()
 
 
 def delete_subscription(user_id, sub_id):
