@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
 
 if not BOT_TOKEN:
     raise ValueError("❌ Токен бота не найден! Проверьте файл .env")
@@ -554,41 +555,39 @@ async def send_digest_chunks(user_id: int, digest_lines: list[str]):
         )
 
 
-async def send_digest_intro(user_id: int, title: str):
-    await bot.send_message(
-        user_id,
-        title,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="⚙️ Настройки дайджеста", callback_data="digest_settings")]
-            ]
-        ),
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
-    )
+def build_bot_deep_link(payload: str) -> str | None:
+    if not BOT_USERNAME:
+        return None
+    return f"https://t.me/{BOT_USERNAME}?start={payload}"
 
 
-async def send_digest_channel_block(
-    user_id: int,
-    sub_id: int,
-    period: str,
-    channel_title: str | None,
-    posts: list[dict],
-):
-    lines = [f"📌 <b>{html.escape(channel_title) if channel_title else 'Канал'}</b>"]
+def build_digest_action_link(label: str, payload: str) -> str:
+    deep_link = build_bot_deep_link(payload)
+    if deep_link:
+        return f"<a href='{deep_link}'>{label}</a>"
+    fallback_text = "/list_digest" if payload == "ds" else "/start"
+    return f"{label} ({fallback_text})"
+
+
+def append_digest_channel_lines(lines: list[str], sub_id: int, period: str, channel_title: str | None, posts: list[dict]):
+    unsubscribe_link = build_digest_action_link("Отписаться", f"du_{sub_id}")
+    lines.append(f"📌 <b>{html.escape(channel_title) if channel_title else 'Канал'}</b>  {unsubscribe_link}")
     for post in posts:
         text_safe = html.escape(post["text"])
         lines.append(f"🔹 <i>{text_safe}</i> <a href='{post['link']}'>[Читать]</a>\n")
 
-    chunks = chunk_html_text(lines)
-    for index, chunk in enumerate(chunks):
-        await bot.send_message(
-            user_id,
-            chunk,
-            parse_mode="HTML",
-            reply_markup=build_digest_channel_actions(sub_id, period) if index == 0 else None,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+    move_links = []
+    for target_period in ("daily", "weekly", "monthly"):
+        if target_period == period:
+            continue
+        move_links.append(
+            build_digest_action_link(
+                f"В {_PERIOD_TITLES[target_period].lower()}",
+                f"dm_{sub_id}_{target_period}",
+            )
         )
+    lines.append("Перенести: " + " | ".join(move_links))
+    lines.append("")
 
 
 async def fetch_subscription_posts(
@@ -641,14 +640,88 @@ async def fetch_subscription_posts(
             }
 
 
+async def handle_digest_deep_link(message: types.Message, payload: str) -> bool:
+    user_id = message.chat.id
+
+    if payload == "ds":
+        await message.answer(
+            render_digest_settings_text(user_id),
+            parse_mode="HTML",
+            reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id)),
+        )
+        return True
+
+    if payload.startswith("du_"):
+        sub_id = parse_callback_int_suffix(payload, "du_")
+        if sub_id is None:
+            return False
+        sub = get_subscription_by_id(user_id, sub_id)
+        if not sub:
+            await message.answer("Подписка уже удалена или не найдена.")
+            return True
+        delete_subscription(user_id, sub_id)
+        await message.answer(
+            f"🚫 Подписка на <b>{html.escape(sub['channel_title']) if sub['channel_title'] else 'канал'}</b> удалена.",
+            parse_mode="HTML",
+        )
+        await message.answer(
+            render_digest_settings_text(user_id),
+            parse_mode="HTML",
+            reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id)),
+        )
+        return True
+
+    if payload.startswith("dm_"):
+        payload_body = parse_callback_strip_prefix(payload, "dm_")
+        if not payload_body or "_" not in payload_body:
+            return False
+        sub_id_str, new_period = payload_body.split("_", 1)
+        try:
+            sub_id = int(sub_id_str)
+        except ValueError:
+            return False
+        sub = get_subscription_by_id(user_id, sub_id)
+        if not sub:
+            await message.answer("Подписка не найдена.")
+            return True
+        if new_period == sub["period"]:
+            await message.answer("Этот период уже выбран.")
+            return True
+        settings = resolve_digest_settings(user_id, new_period)
+        next_send_at = serialize_datetime(get_next_digest_time(new_period, local_now(), settings))
+        add_subscription(
+            user_id,
+            sub["channel_username"],
+            sub["channel_title"],
+            new_period,
+            sub["last_scraped_at"] or serialize_datetime(utc_now()),
+            next_send_at,
+        )
+        delete_subscription(user_id, sub_id)
+        await message.answer(
+            f"↪️ <b>{html.escape(sub['channel_title']) if sub['channel_title'] else 'Канал'}</b> перенесён в {_PERIOD_TITLES[new_period].lower()} дайджест.",
+            parse_mode="HTML",
+        )
+        await message.answer(
+            render_digest_settings_text(user_id),
+            parse_mode="HTML",
+            reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id)),
+        )
+        return True
+
+    return False
+
+
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message, state: FSMContext):
+async def cmd_start(message: types.Message, state: FSMContext, command: CommandObject):
     await state.clear()
+    if command.args and await handle_digest_deep_link(message, command.args.strip()):
+        return
     await message.answer(
         "Привет! Я готов.\n\n"
         "1️⃣ Перешли мне любое сообщение, чтобы отложить его или сохранить в базу знаний.\n"
         "2️⃣ Перешли пост из открытого канала, чтобы подписаться на его дайджест.\n"
-        "3️⃣ Напиши /list для задач или /saved для Избранного.\n"
+        "3️⃣ Напиши /list для задач, /list_digest для дайджестов или /saved для Избранного.\n"
         "4️⃣ Для уже доставленного напоминания используй кнопки под ним или ответь командой: "
         "/morning, /day, /evening, /later (/l), /at ДД.ММ.ГГГГ ЧЧ:ММ, /save (/s), /delete (/d)."
     )
@@ -978,10 +1051,9 @@ async def cmd_list(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.chat.id
     user_msgs = get_user_messages(user_id)
-    user_subs = get_user_subscriptions(user_id)
 
-    if not user_msgs and not user_subs:
-        await message.answer("📭 У тебя нет активных напоминаний или подписок.")
+    if not user_msgs:
+        await message.answer("📭 У тебя нет активных напоминаний.\n\nДля дайджестов используй /list_digest.")
         return
 
     if user_msgs:
@@ -1006,34 +1078,16 @@ async def cmd_list(message: types.Message, state: FSMContext):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
         )
 
-    if user_subs:
-        text_lines = ["📡 <b>Твои подписки на дайджесты:</b>\n"]
-        buttons = []
-        grouped = {"daily": [], "weekly": [], "monthly": []}
-        for sub in user_subs:
-            grouped.setdefault(sub[3], []).append(sub)
-        idx = 1
-        for period in ("daily", "weekly", "monthly"):
-            subs = grouped.get(period, [])
-            if not subs:
-                continue
-            text_lines.append(f"<b>{_PERIOD_TITLES[period]}</b>")
-            for sub in subs:
-                sub_id, _, title, _, next_send_at = sub
-                dt_obj = display_db_datetime(next_send_at)
-                text_lines.append(
-                    f"{idx}. 📰 <b>{html.escape(title) if title else 'Канал'}</b>\n"
-                    f"След: {dt_obj.strftime('%d.%m в %H:%M')}\n"
-                )
-                buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"unsub_{sub_id}"))
-                idx += 1
-        kb_rows = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
-        kb_rows.append([InlineKeyboardButton(text="⚙️ Настройки дайджеста", callback_data="digest_settings")])
-        await message.answer(
-            "\n".join(text_lines),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
-        )
+
+@dp.message(Command("list_digest"))
+async def cmd_list_digest(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.chat.id
+    await message.answer(
+        render_digest_settings_text(user_id),
+        parse_mode="HTML",
+        reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id)),
+    )
 
 
 @dp.callback_query(F.data.startswith("cancel_"))
@@ -1093,40 +1147,11 @@ async def handle_unsub(callback: CallbackQuery):
         return
 
     delete_subscription(callback_message.chat.id, sub_id)
-
-    user_subs = get_user_subscriptions(callback_message.chat.id)
-    if not user_subs:
-        await callback_message.edit_text("📭 Все подписки на дайджесты отменены.")
-        return
-
-    text_lines = ["📡 <b>Твои подписки на дайджесты:</b>\n"]
-    buttons = []
-    grouped = {"daily": [], "weekly": [], "monthly": []}
-    for sub in user_subs:
-        grouped.setdefault(sub[3], []).append(sub)
-    idx = 1
-    for period in ("daily", "weekly", "monthly"):
-        subs = grouped.get(period, [])
-        if not subs:
-            continue
-        text_lines.append(f"<b>{_PERIOD_TITLES[period]}</b>")
-        for sub in subs:
-            item_id, _, title, _, next_send_at = sub
-            dt_obj = display_db_datetime(next_send_at)
-            text_lines.append(
-                f"{idx}. 📰 <b>{html.escape(title) if title else 'Канал'}</b>\n"
-                f"След: {dt_obj.strftime('%d.%m в %H:%M')}\n"
-            )
-            buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"unsub_{item_id}"))
-            idx += 1
-
-    kb_rows = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
-    kb_rows.append([InlineKeyboardButton(text="⚙️ Настройки дайджеста", callback_data="digest_settings")])
     try:
         await callback_message.edit_text(
-            "\n".join(text_lines),
+            render_digest_settings_text(callback_message.chat.id),
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+            reply_markup=build_digest_settings_keyboard(get_user_subscriptions(callback_message.chat.id)),
         )
     except TelegramAPIError:
         pass
@@ -1647,13 +1672,17 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
         await message.answer("📭 За последние 24 часа новых постов ни в одном из каналов не было.")
         return
 
-    await send_digest_intro(user_id, "📰 <b>Твоя тестовая утренняя газета</b> ☕️")
+    digest_lines = ["📰 <b>Твоя тестовая утренняя газета</b> ☕️", ""]
     for result in results:
         if isinstance(result, BaseException):
             continue
         sub_id, period, title, _, posts = result
         if posts:
-            await send_digest_channel_block(user_id, sub_id, period, title, posts)
+            append_digest_channel_lines(digest_lines, sub_id, period, title, posts)
+    digest_lines.append(
+        build_digest_action_link("⚙️ Настройки дайджеста", "ds")
+    )
+    await send_digest_chunks(user_id, digest_lines)
 
 
 @dp.message()
@@ -1890,7 +1919,7 @@ async def check_digests():
                     users_subs.setdefault(sub[1], []).append(sub)
 
                 for user_id, subs in users_subs.items():
-                    channel_results = []
+                    digest_lines = ["📰 <b>Твоя утренняя газета</b> ☕️", ""]
                     has_news = False
                     user_has_temporary_failures = False
                     successful_subscriptions = []
@@ -1909,19 +1938,18 @@ async def check_digests():
                         successful_subscriptions.append((result["sub_id"], result["next_send_str"]))
                         if result["posts"]:
                             has_news = True
-                            channel_results.append(result)
+                            append_digest_channel_lines(
+                                digest_lines,
+                                result["sub_id"],
+                                result["period"],
+                                result["title"],
+                                result["posts"],
+                            )
 
                     if has_news:
                         try:
-                            await send_digest_intro(user_id, "📰 <b>Твоя утренняя газета</b> ☕️")
-                            for result in channel_results:
-                                await send_digest_channel_block(
-                                    user_id,
-                                    result["sub_id"],
-                                    result["period"],
-                                    result["title"],
-                                    result["posts"],
-                                )
+                            digest_lines.append(build_digest_action_link("⚙️ Настройки дайджеста", "ds"))
+                            await send_digest_chunks(user_id, digest_lines)
                             for sub_id, next_send_str in successful_subscriptions:
                                 update_subscription_time(sub_id, now_str, next_send_str)
                         except TelegramAPIError as exc:
@@ -1971,7 +1999,11 @@ async def cleanup_database():
 
 
 async def main():
+    global BOT_USERNAME
     init_db()
+    if not BOT_USERNAME:
+        me = await bot.get_me()
+        BOT_USERNAME = (me.username or "").lstrip("@")
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(check_messages())
     asyncio.create_task(check_digests())
