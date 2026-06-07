@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import (
     TelegramAPIError,
     TelegramBadRequest,
@@ -21,6 +22,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, InaccessibleMessage, Message
+from aiohttp_socks import ProxyConnector
 from dotenv import load_dotenv
 
 from data.database import (
@@ -62,11 +64,13 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
+TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY") or os.getenv("PROXY_URL")
 
 if not BOT_TOKEN:
     raise ValueError("❌ Токен бота не найден! Проверьте файл .env")
 
-bot = Bot(token=BOT_TOKEN)
+bot_session = AiohttpSession(proxy=TELEGRAM_PROXY) if TELEGRAM_PROXY else None
+bot = Bot(token=BOT_TOKEN, session=bot_session)
 dp = Dispatcher()
 TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Moscow"))
 MAX_MESSAGE_RETRIES = 5
@@ -76,6 +80,15 @@ DIGEST_CHECK_INTERVAL_SECONDS = int(os.getenv("DIGEST_CHECK_INTERVAL_SECONDS", 3
 CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 
 USER_FACING_ERROR = "Что-то пошло не так. Попробуй ещё раз позже."
+
+
+def create_telegram_http_session() -> aiohttp.ClientSession:
+    if TELEGRAM_PROXY:
+        return aiohttp.ClientSession(
+            timeout=REQUEST_TIMEOUT,
+            connector=ProxyConnector.from_url(TELEGRAM_PROXY),
+        )
+    return aiohttp.ClientSession(timeout=REQUEST_TIMEOUT)
 
 _QUICK_RESCHEDULE_ACTION: dict[str, str] = {
     "morning": "morning",
@@ -1645,7 +1658,7 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
     has_news = False
     semaphore = asyncio.Semaphore(DIGEST_FETCH_CONCURRENCY)
 
-    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+    async with create_telegram_http_session() as session:
         async def load_posts(subscription) -> tuple[int, str, str | None, str, list[dict]]:
             sub_id, username, title, period, _ = subscription
             async with semaphore:
@@ -1903,7 +1916,7 @@ async def check_digests():
     logger.info("📬 Сервис дайджестов запущен (проверка каждые %d сек / %d мин)", 
                 DIGEST_CHECK_INTERVAL_SECONDS, DIGEST_CHECK_INTERVAL_SECONDS // 60)
 
-    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+    async with create_telegram_http_session() as session:
         while True:
             now_str = serialize_datetime(utc_now())
             due_subs = get_due_subscriptions(now_str)
