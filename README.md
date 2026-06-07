@@ -58,3 +58,4 @@ docker compose up --build -d
 ```
 
 В контейнере база по умолчанию хранится в `/app/storage/bot_data.db`, это значение уже задано в `.env.example`.
+
