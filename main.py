@@ -107,6 +107,8 @@ _WEEKDAY_SHORT_RU = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "
 
 class ScheduleState(StatesGroup):
     waiting_for_datetime = State()
+    waiting_for_time = State()
+    waiting_for_minutes = State()
 
 
 class SaveState(StatesGroup):
@@ -492,7 +494,57 @@ def build_time_selection_keyboard(prefix: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="⏱ На 3 часа", callback_data=f"{prefix}_now"),
-                InlineKeyboardButton(text="✍️ Вручную", callback_data=f"{prefix}_custom"),
+                InlineKeyboardButton(text="🗓 Выбрать", callback_data=f"{prefix}_custom"),
+            ],
+        ]
+    )
+
+
+def build_manual_date_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Сегодня", callback_data="sdate_today"),
+                InlineKeyboardButton(text="Завтра", callback_data="sdate_tomorrow"),
+            ],
+            [
+                InlineKeyboardButton(text="Послезавтра", callback_data="sdate_after_tomorrow"),
+            ],
+            [
+                InlineKeyboardButton(text="В субботу", callback_data="sdate_saturday"),
+                InlineKeyboardButton(text="В понедельник", callback_data="sdate_monday"),
+            ],
+            [
+                InlineKeyboardButton(text="✍️ Вручную", callback_data="sdate_manual"),
+            ],
+        ]
+    )
+
+
+def build_manual_hour_keyboard() -> InlineKeyboardMarkup:
+    hours = [8, 9, 10, 13, 14, 15, 17, 18, 19, 20]
+    rows = [
+        [
+            InlineKeyboardButton(text=f"{hour:02d}", callback_data=f"shour_{hour}")
+            for hour in hours[index : index + 3]
+        ]
+        for index in range(0, len(hours), 3)
+    ]
+    rows.append([InlineKeyboardButton(text="✍️ Вручную время", callback_data="shour_manual")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_manual_minute_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="00", callback_data="smin_0"),
+                InlineKeyboardButton(text="15", callback_data="smin_15"),
+                InlineKeyboardButton(text="30", callback_data="smin_30"),
+                InlineKeyboardButton(text="45", callback_data="smin_45"),
+            ],
+            [
+                InlineKeyboardButton(text="✍️ Вручную минуты", callback_data="smin_manual"),
             ],
         ]
     )
@@ -542,6 +594,43 @@ def get_suggested_manual_time(now: datetime) -> datetime:
     if now.hour < 20:
         return now.replace(hour=20, minute=0, second=0, microsecond=0)
     return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+
+
+def get_manual_date(action: str, now: datetime) -> datetime | None:
+    if action == "today":
+        return now
+    if action == "tomorrow":
+        return now + timedelta(days=1)
+    if action == "after_tomorrow":
+        return now + timedelta(days=2)
+    if action in {"saturday", "monday"}:
+        target_weekday = 5 if action == "saturday" else 0
+        days_ahead = (target_weekday - now.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        return now + timedelta(days=days_ahead)
+    return None
+
+
+def build_scheduled_time_from_state(data: dict, *, hour: int, minute: int) -> datetime | None:
+    selected_date = data.get("selected_date")
+    if not selected_date:
+        return None
+    try:
+        scheduled_time = datetime.strptime(selected_date, "%Y-%m-%d").replace(
+            hour=hour,
+            minute=minute,
+            second=0,
+            microsecond=0,
+            tzinfo=TZ,
+        )
+    except (TypeError, ValueError):
+        return None
+    return scheduled_time
+
+
+def has_schedule_context(data: dict) -> bool:
+    return bool(data.get("message_id") or (data.get("scheduled_db_id") and data.get("source_message_id")))
 
 
 def classify_telegram_send_error(error: TelegramAPIError) -> tuple[bool, str]:
@@ -961,24 +1050,19 @@ async def handle_sent_reminder_time_selection(callback: CallbackQuery, state: FS
     now = local_now()
 
     if action == "custom":
-        suggested_time = get_suggested_manual_time(now)
-        suggested_str = suggested_time.strftime("%d.%m.%Y %H:%M")
-        prompt = await callback_message.answer(
-            "Напиши точную дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ\n\n"
-            "💡 *Лайфхак:* нажми на время ниже, чтобы скопировать его:\n\n"
-            f"`{suggested_str}`",
-            parse_mode="Markdown",
-        )
         await state.update_data(
             scheduled_db_id=db_id,
             source_message_id=source_message_id,
             preview=preview or "",
             source=source or "",
-            prompt_msg_id=prompt.message_id,
+            prompt_msg_id=callback_message.message_id,
             target_message_id=delivered_message_id,
             command_message_id=callback_message.message_id,
         )
-        await state.set_state(ScheduleState.waiting_for_datetime)
+        await callback_message.edit_text(
+            "Выбери дату:",
+            reply_markup=build_manual_date_keyboard(),
+        )
         await callback.answer()
         return
 
@@ -1529,6 +1613,69 @@ async def handle_del_saved(callback: CallbackQuery, state: FSMContext):
     await cmd_saved(callback_message, state)
 
 
+async def complete_manual_schedule(
+    chat_id: int,
+    state: FSMContext,
+    scheduled_time: datetime,
+    *,
+    reply_target: Message,
+    cleanup_message_id: int | None = None,
+) -> None:
+    if scheduled_time < local_now():
+        await reply_target.answer("Эта дата уже в прошлом! Попробуй еще раз.")
+        return
+
+    data = await state.get_data()
+    msg_id = data.get("message_id")
+    scheduled_db_id = data.get("scheduled_db_id")
+    source_message_id = data.get("source_message_id")
+    preview = data.get("preview", "")
+    source = data.get("source", "")
+
+    if msg_id:
+        add_message(chat_id, msg_id, serialize_datetime(scheduled_time), preview, source)
+        confirmation_text = f"✅ Принято! Запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}."
+    elif scheduled_db_id and source_message_id:
+        replace_sent_reminder_with_pending(
+            chat_id,
+            scheduled_db_id,
+            source_message_id,
+            serialize_datetime(scheduled_time),
+            preview,
+            source,
+        )
+        confirmation_text = f"✅ Отложил до {scheduled_time.strftime('%d.%m.%Y %H:%M')}."
+    else:
+        await reply_target.answer("Ошибка: не найдено исходное напоминание. Попробуй отправить его заново.")
+        await state.clear()
+        return
+
+    cleanup_ids = [
+        cleanup_message_id,
+        data.get("prompt_msg_id"),
+        data.get("target_message_id"),
+        data.get("command_message_id"),
+    ]
+    seen_ids = set()
+    for message_id in cleanup_ids:
+        if not message_id or message_id in seen_ids:
+            continue
+        seen_ids.add(message_id)
+        try:
+            await bot.delete_message(chat_id, message_id)
+        except TelegramAPIError:
+            pass
+
+    confirm_msg = await bot.send_message(chat_id, confirmation_text)
+    await state.clear()
+
+    await asyncio.sleep(3)
+    try:
+        await confirm_msg.delete()
+    except TelegramAPIError:
+        pass
+
+
 @dp.message(ScheduleState.waiting_for_datetime)
 async def process_custom_datetime(message: types.Message, state: FSMContext):
     text = (message.text or "").strip()
@@ -1538,60 +1685,83 @@ async def process_custom_datetime(message: types.Message, state: FSMContext):
 
     try:
         scheduled_time = datetime.strptime(text, "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
-        if scheduled_time < local_now():
-            await message.answer("Эта дата уже в прошлом! Попробуй еще раз (ДД.ММ.ГГГГ ЧЧ:ММ):")
-            return
-
-        data = await state.get_data()
-        msg_id = data.get("message_id")
-        scheduled_db_id = data.get("scheduled_db_id")
-        source_message_id = data.get("source_message_id")
-        preview = data.get("preview", "")
-        source = data.get("source", "")
-        prompt_msg_id = data.get("prompt_msg_id")
-
-        if msg_id:
-            add_message(message.chat.id, msg_id, serialize_datetime(scheduled_time), preview, source)
-            confirmation_text = f"✅ Принято! Запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}."
-        elif scheduled_db_id and source_message_id:
-            replace_sent_reminder_with_pending(
-                message.chat.id,
-                scheduled_db_id,
-                source_message_id,
-                serialize_datetime(scheduled_time),
-                preview,
-                source,
-            )
-            confirmation_text = f"✅ Отложил до {scheduled_time.strftime('%d.%m.%Y %H:%M')}."
-        else:
-            await message.answer("Ошибка: не найдено исходное напоминание. Попробуй отправить его заново.")
-            await state.clear()
-            return
-
-        try:
-            await message.delete()
-            if prompt_msg_id:
-                await bot.delete_message(message.chat.id, prompt_msg_id)
-            target_message_id = data.get("target_message_id")
-            if target_message_id:
-                await bot.delete_message(message.chat.id, target_message_id)
-            command_message_id = data.get("command_message_id")
-            if command_message_id:
-                await bot.delete_message(message.chat.id, command_message_id)
-        except TelegramAPIError:
-            pass
-
-        confirm_msg = await message.answer(confirmation_text)
-        await state.clear()
-
-        await asyncio.sleep(3)
-        try:
-            await confirm_msg.delete()
-        except TelegramAPIError:
-            pass
-
     except ValueError:
         await message.answer("❌ Неверный формат. Пример: 15.03.2026 14:30")
+        return
+
+    await complete_manual_schedule(
+        message.chat.id,
+        state,
+        scheduled_time,
+        reply_target=message,
+        cleanup_message_id=message.message_id,
+    )
+
+
+@dp.message(ScheduleState.waiting_for_time)
+async def process_custom_time(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    try:
+        hour_text, minute_text = text.split(":", maxsplit=1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except (ValueError, AttributeError):
+        await message.answer("❌ Неверный формат. Пример: 18:30")
+        return
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        await message.answer("❌ Время должно быть в формате ЧЧ:ММ.")
+        return
+
+    data = await state.get_data()
+    scheduled_time = build_scheduled_time_from_state(data, hour=hour, minute=minute)
+    if scheduled_time is None:
+        await message.answer("Ошибка: дата выбора утеряна. Попробуй выбрать время заново.")
+        await state.clear()
+        return
+
+    await complete_manual_schedule(
+        message.chat.id,
+        state,
+        scheduled_time,
+        reply_target=message,
+        cleanup_message_id=message.message_id,
+    )
+
+
+@dp.message(ScheduleState.waiting_for_minutes)
+async def process_custom_minutes(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    try:
+        minute = int(text)
+    except ValueError:
+        await message.answer("❌ Напиши минуты числом от 0 до 59.")
+        return
+
+    if not 0 <= minute <= 59:
+        await message.answer("❌ Минуты должны быть от 0 до 59.")
+        return
+
+    data = await state.get_data()
+    hour = data.get("selected_hour")
+    if hour is None:
+        await message.answer("Ошибка: час выбора утерян. Попробуй выбрать время заново.")
+        await state.clear()
+        return
+
+    scheduled_time = build_scheduled_time_from_state(data, hour=int(hour), minute=minute)
+    if scheduled_time is None:
+        await message.answer("Ошибка: дата выбора утеряна. Попробуй выбрать время заново.")
+        await state.clear()
+        return
+
+    await complete_manual_schedule(
+        message.chat.id,
+        state,
+        scheduled_time,
+        reply_target=message,
+        cleanup_message_id=message.message_id,
+    )
 
 
 @dp.message(SaveState.waiting_for_tag)
@@ -1843,15 +2013,11 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
             source=source,
             prompt_msg_id=callback_message.message_id,
         )
-        await state.set_state(ScheduleState.waiting_for_datetime)
-        suggested_time = get_suggested_manual_time(now)
-        suggested_str = suggested_time.strftime("%d.%m.%Y %H:%M")
         await callback_message.edit_text(
-            "Напиши точную дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ\n\n"
-            "💡 *Лайфхак:* нажми на время ниже, чтобы скопировать его:\n\n"
-            f"`{suggested_str}`",
-            parse_mode="Markdown",
+            "Выбери дату:",
+            reply_markup=build_manual_date_keyboard(),
         )
+        await callback.answer()
         return
 
     scheduled_time, label = get_quick_scheduled_time(action, now)
@@ -1870,6 +2036,156 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
             await callback_message.delete()
         except TelegramAPIError:
             pass
+
+
+@dp.callback_query(F.data.startswith("sdate_"))
+async def handle_manual_date_selection(callback: CallbackQuery, state: FSMContext):
+    callback_message = get_callback_message(callback)
+    if callback_message is None:
+        await callback.answer("❌ Сообщение недоступно.")
+        return
+
+    action = parse_callback_strip_prefix(callback.data, "sdate_")
+    if action is None:
+        await callback.answer("❌ Некорректные данные.")
+        return
+
+    data = await state.get_data()
+    if not has_schedule_context(data):
+        await callback.answer("❌ Выбор времени устарел. Отправь сообщение заново.", show_alert=True)
+        await state.clear()
+        return
+
+    if action == "manual":
+        suggested_time = get_suggested_manual_time(local_now())
+        suggested_str = suggested_time.strftime("%d.%m.%Y %H:%M")
+        await state.set_state(ScheduleState.waiting_for_datetime)
+        await callback_message.edit_text(
+            "Напиши точную дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ\n\n"
+            "💡 *Лайфхак:* нажми на время ниже, чтобы скопировать его:\n\n"
+            f"`{suggested_str}`",
+            parse_mode="Markdown",
+        )
+        await callback.answer()
+        return
+
+    selected = get_manual_date(action, local_now())
+    if selected is None:
+        await callback.answer("❌ Некорректная дата.")
+        return
+
+    await state.update_data(selected_date=selected.strftime("%Y-%m-%d"))
+    await callback_message.edit_text(
+        f"Дата: {selected.strftime('%d.%m.%Y')}\nВыбери час:",
+        reply_markup=build_manual_hour_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("shour_"))
+async def handle_manual_hour_selection(callback: CallbackQuery, state: FSMContext):
+    callback_message = get_callback_message(callback)
+    if callback_message is None:
+        await callback.answer("❌ Сообщение недоступно.")
+        return
+
+    action = parse_callback_strip_prefix(callback.data, "shour_")
+    if action is None:
+        await callback.answer("❌ Некорректные данные.")
+        return
+
+    data = await state.get_data()
+    if not has_schedule_context(data):
+        await callback.answer("❌ Выбор времени устарел. Отправь сообщение заново.", show_alert=True)
+        await state.clear()
+        return
+
+    if not data.get("selected_date"):
+        await callback.answer("❌ Сначала выбери дату.", show_alert=True)
+        return
+
+    if action == "manual":
+        await state.set_state(ScheduleState.waiting_for_time)
+        await callback_message.edit_text("Напиши время в формате ЧЧ:ММ, например 18:30.")
+        await callback.answer()
+        return
+
+    try:
+        hour = int(action)
+    except ValueError:
+        await callback.answer("❌ Некорректный час.")
+        return
+
+    if not 0 <= hour <= 23:
+        await callback.answer("❌ Некорректный час.")
+        return
+
+    await state.update_data(selected_hour=hour)
+    await callback_message.edit_text(
+        f"Время: {hour:02d}:00\nВыбери минуты:",
+        reply_markup=build_manual_minute_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smin_"))
+async def handle_manual_minute_selection(callback: CallbackQuery, state: FSMContext):
+    callback_message = get_callback_message(callback)
+    if callback_message is None:
+        await callback.answer("❌ Сообщение недоступно.")
+        return
+
+    action = parse_callback_strip_prefix(callback.data, "smin_")
+    if action is None:
+        await callback.answer("❌ Некорректные данные.")
+        return
+
+    data = await state.get_data()
+    if not has_schedule_context(data):
+        await callback.answer("❌ Выбор времени устарел. Отправь сообщение заново.", show_alert=True)
+        await state.clear()
+        return
+
+    hour = data.get("selected_hour")
+    if hour is None:
+        await callback.answer("❌ Сначала выбери час.", show_alert=True)
+        return
+
+    if action == "manual":
+        await state.set_state(ScheduleState.waiting_for_minutes)
+        await callback_message.edit_text("Напиши минуты числом от 0 до 59.")
+        await callback.answer()
+        return
+
+    try:
+        minute = int(action)
+    except ValueError:
+        await callback.answer("❌ Некорректные минуты.")
+        return
+
+    if not 0 <= minute <= 59:
+        await callback.answer("❌ Некорректные минуты.")
+        return
+
+    scheduled_time = build_scheduled_time_from_state(data, hour=int(hour), minute=minute)
+    if scheduled_time is None:
+        await callback.answer("❌ Дата выбора утеряна.", show_alert=True)
+        await state.clear()
+        return
+
+    try:
+        await complete_manual_schedule(
+            callback_message.chat.id,
+            state,
+            scheduled_time,
+            reply_target=callback_message,
+        )
+    except Exception:
+        logger.exception("complete_manual_schedule failed in minute picker")
+        await callback.answer(USER_FACING_ERROR, show_alert=True)
+        return
+
+    await callback.answer()
 
 
 async def check_messages():
