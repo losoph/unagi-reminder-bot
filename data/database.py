@@ -357,7 +357,7 @@ def get_pending_messages(current_time_str):
     with get_connection() as conn:
         rows = conn.execute(
             '''
-            SELECT id, user_id, message_id, retry_count
+            SELECT id, user_id, message_id, retry_count, text_preview, source_name
             FROM scheduled_messages
             WHERE send_at <= ? AND is_sent = 0 AND delivery_status != 'failed_permanent'
             ''',
@@ -734,6 +734,16 @@ def delete_saved_message(user_id, msg_id):
             (msg_id, user_id),
         )
         conn.commit()
+
+
+def update_saved_message_tag(user_id, msg_id, new_tag):
+    with get_connection() as conn:
+        conn.execute(
+            'UPDATE saved_messages SET tag = ? WHERE id = ? AND user_id = ?',
+            (new_tag, msg_id, user_id),
+        )
+        conn.commit()
+
 
 
 def cleanup_old_records(now_str: str) -> dict[str, int]:
