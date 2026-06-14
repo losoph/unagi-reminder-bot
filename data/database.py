@@ -9,6 +9,7 @@ DB_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LEGACY_STORAGE_OFFSET_HOURS = 3
 MESSAGE_RETENTION_DAYS = int(os.getenv("MESSAGE_RETENTION_DAYS", "30"))
 SUBSCRIPTION_FAILURE_RETENTION_DAYS = int(os.getenv("SUBSCRIPTION_FAILURE_RETENTION_DAYS", "90"))
+DIGEST_POST_RETENTION_DAYS = int(os.getenv("DIGEST_POST_RETENTION_DAYS", "30"))
 MAX_ERROR_TEXT_LENGTH = int(os.getenv("MAX_ERROR_TEXT_LENGTH", "800"))
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -231,6 +232,8 @@ def init_db():
             "ALTER TABLE subscriptions ADD COLUMN last_error TEXT",
             "ALTER TABLE subscriptions ADD COLUMN last_attempt_at DATETIME",
             "ALTER TABLE subscriptions ADD COLUMN is_disabled INTEGER DEFAULT 0",
+            "ALTER TABLE subscriptions ADD COLUMN is_paused INTEGER DEFAULT 0",
+            "ALTER TABLE subscriptions ADD COLUMN tag TEXT",
         ):
             try:
                 cursor.execute(statement)
@@ -247,6 +250,30 @@ def init_db():
                 saved_at DATETIME
             )
         ''')
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS digest_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                channel_username TEXT,
+                channel_title TEXT,
+                post_text TEXT,
+                post_link TEXT,
+                post_time DATETIME,
+                created_at DATETIME
+            )
+            '''
+        )
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS ai_usage (
+                user_id INTEGER,
+                usage_day TEXT,
+                request_count INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, usage_day)
+            )
+            '''
+        )
         cursor.execute(
             '''
             CREATE TABLE IF NOT EXISTS digest_settings (
@@ -300,6 +327,15 @@ def init_db():
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_digest_settings_user_period ON digest_settings(user_id, period)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_digest_posts_user_time ON digest_posts(user_id, post_time)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_digest_posts_user_channel ON digest_posts(user_id, channel_username, post_time)"
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_digest_posts_user_link ON digest_posts(user_id, post_link)"
         )
 
         _migrate_legacy_local_timestamps_to_utc(cursor)
@@ -471,7 +507,7 @@ def get_scheduled_message_by_delivered_message_id(user_id, delivered_message_id)
     return row
 
 
-def add_subscription(user_id, channel_username, channel_title, period, last_scraped_at, next_send_at):
+def add_subscription(user_id, channel_username, channel_title, period, last_scraped_at, next_send_at, tag=None):
     normalized_username = normalize_channel_username(channel_username)
     created_at = serialize_datetime(utc_now())
     with get_connection() as conn:
@@ -486,26 +522,42 @@ def add_subscription(user_id, channel_username, channel_title, period, last_scra
         ).fetchone()
 
         if existing_row:
-            conn.execute(
-                """
-                UPDATE subscriptions
-                SET channel_username = ?, channel_title = ?, last_scraped_at = ?, next_send_at = ?, digest_status = 'active',
-                    failure_count = 0, last_error = NULL, last_attempt_at = NULL
-                WHERE id = ?
-                """,
-                (normalized_username, channel_title, last_scraped_at, next_send_at, existing_row[0]),
-            )
+            sub_id = existing_row[0]
+            if tag is None:
+                conn.execute(
+                    """
+                    UPDATE subscriptions
+                    SET channel_username = ?, channel_title = ?, last_scraped_at = ?, next_send_at = ?,
+                        digest_status = 'active', failure_count = 0, last_error = NULL, last_attempt_at = NULL,
+                        is_paused = 0
+                    WHERE id = ?
+                    """,
+                    (normalized_username, channel_title, last_scraped_at, next_send_at, sub_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE subscriptions
+                    SET channel_username = ?, channel_title = ?, last_scraped_at = ?, next_send_at = ?,
+                        digest_status = 'active', failure_count = 0, last_error = NULL, last_attempt_at = NULL,
+                        is_paused = 0, tag = ?
+                    WHERE id = ?
+                    """,
+                    (normalized_username, channel_title, last_scraped_at, next_send_at, tag, sub_id),
+                )
         else:
-            conn.execute(
+            cursor = conn.execute(
                 '''
                 INSERT INTO subscriptions (
-                    user_id, channel_username, channel_title, period, created_at, last_scraped_at, next_send_at
+                    user_id, channel_username, channel_title, period, created_at, last_scraped_at, next_send_at, tag
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''',
-                (user_id, normalized_username, channel_title, period, created_at, last_scraped_at, next_send_at),
+                (user_id, normalized_username, channel_title, period, created_at, last_scraped_at, next_send_at, tag),
             )
+            sub_id = cursor.lastrowid
         conn.commit()
+    return sub_id
 
 
 def get_due_subscriptions(current_time_str):
@@ -514,7 +566,7 @@ def get_due_subscriptions(current_time_str):
             '''
             SELECT id, user_id, channel_username, channel_title, period, last_scraped_at, failure_count
             FROM subscriptions
-            WHERE next_send_at <= ? AND is_disabled = 0
+            WHERE next_send_at <= ? AND is_disabled = 0 AND is_paused = 0
             ''',
             (current_time_str,),
         ).fetchall()
@@ -560,7 +612,8 @@ def get_user_subscriptions(user_id):
     with get_connection() as conn:
         rows = conn.execute(
             '''
-            SELECT id, channel_username, channel_title, period, next_send_at
+            SELECT id, channel_username, channel_title, period, next_send_at,
+                   is_paused, tag, digest_status, failure_count
             FROM subscriptions
             WHERE user_id = ? AND is_disabled = 0
             ORDER BY next_send_at
@@ -574,7 +627,8 @@ def get_subscription_by_id(user_id, sub_id):
     with get_connection() as conn:
         row = conn.execute(
             '''
-            SELECT id, user_id, channel_username, channel_title, period, last_scraped_at, next_send_at
+            SELECT id, user_id, channel_username, channel_title, period, last_scraped_at, next_send_at,
+                   is_paused, tag, digest_status, failure_count, last_error
             FROM subscriptions
             WHERE id = ? AND user_id = ? AND is_disabled = 0
             ''',
@@ -679,6 +733,246 @@ def delete_subscription(user_id, sub_id):
         conn.commit()
 
 
+def count_user_subscriptions(user_id) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            'SELECT COUNT(*) FROM subscriptions WHERE user_id = ? AND is_disabled = 0',
+            (user_id,),
+        ).fetchone()
+    return row[0] if row else 0
+
+
+def set_subscription_paused(user_id, sub_id, paused: bool):
+    with get_connection() as conn:
+        conn.execute(
+            'UPDATE subscriptions SET is_paused = ? WHERE id = ? AND user_id = ? AND is_disabled = 0',
+            (1 if paused else 0, sub_id, user_id),
+        )
+        conn.commit()
+
+
+def set_all_subscriptions_paused(user_id, paused: bool) -> int:
+    with get_connection() as conn:
+        cursor = conn.execute(
+            'UPDATE subscriptions SET is_paused = ? WHERE user_id = ? AND is_disabled = 0 AND is_paused = ?',
+            (1 if paused else 0, user_id, 0 if paused else 1),
+        )
+        conn.commit()
+    return cursor.rowcount
+
+
+def unsubscribe_all(user_id) -> int:
+    with get_connection() as conn:
+        cursor = conn.execute(
+            'DELETE FROM subscriptions WHERE user_id = ? AND is_disabled = 0',
+            (user_id,),
+        )
+        conn.commit()
+    return cursor.rowcount
+
+
+def set_subscription_tag(user_id, sub_id, tag: str | None):
+    normalized = tag.strip() if isinstance(tag, str) and tag.strip() else None
+    with get_connection() as conn:
+        conn.execute(
+            'UPDATE subscriptions SET tag = ? WHERE id = ? AND user_id = ? AND is_disabled = 0',
+            (normalized, sub_id, user_id),
+        )
+        conn.commit()
+
+
+def get_subscription_tags(user_id):
+    with get_connection() as conn:
+        rows = conn.execute(
+            '''
+            SELECT DISTINCT tag FROM subscriptions
+            WHERE user_id = ? AND is_disabled = 0 AND tag IS NOT NULL AND tag != ''
+            ORDER BY tag COLLATE NOCASE
+            ''',
+            (user_id,),
+        ).fetchall()
+    return [row[0] for row in rows if row[0]]
+
+
+def add_digest_posts(user_id, channel_username, channel_title, posts):
+    """Persist scraped posts into the knowledge base (deduplicated by post_link)."""
+    if not posts:
+        return 0
+    normalized_username = normalize_channel_username(channel_username)
+    created_at = serialize_datetime(utc_now())
+    inserted = 0
+    with get_connection() as conn:
+        for post in posts:
+            post_time = post.get("time")
+            post_time_str = serialize_datetime(post_time) if post_time is not None else created_at
+            cursor = conn.execute(
+                '''
+                INSERT OR IGNORE INTO digest_posts (
+                    user_id, channel_username, channel_title, post_text, post_link, post_time, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    user_id,
+                    normalized_username,
+                    channel_title,
+                    post.get("text", ""),
+                    post.get("link", ""),
+                    post_time_str,
+                    created_at,
+                ),
+            )
+            inserted += cursor.rowcount
+        conn.commit()
+    return inserted
+
+
+def get_digest_posts(user_id, since_str, channel_username=None):
+    with get_connection() as conn:
+        if channel_username:
+            rows = conn.execute(
+                '''
+                SELECT channel_username, channel_title, post_text, post_link, post_time
+                FROM digest_posts
+                WHERE user_id = ? AND post_time >= ? AND channel_username = ?
+                ORDER BY post_time DESC
+                ''',
+                (user_id, since_str, normalize_channel_username(channel_username)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                '''
+                SELECT channel_username, channel_title, post_text, post_link, post_time
+                FROM digest_posts
+                WHERE user_id = ? AND post_time >= ?
+                ORDER BY post_time DESC
+                ''',
+                (user_id, since_str),
+            ).fetchall()
+    return rows
+
+
+def get_digest_post_channels(user_id, since_str):
+    """Return [(channel_username, channel_title, post_count)] over the window."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            '''
+            SELECT channel_username, MAX(channel_title) AS channel_title, COUNT(*) AS post_count
+            FROM digest_posts
+            WHERE user_id = ? AND post_time >= ?
+            GROUP BY channel_username
+            ORDER BY post_count DESC
+            ''',
+            (user_id, since_str),
+        ).fetchall()
+    return rows
+
+
+def get_ai_usage_today(user_id, day: str) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            'SELECT request_count FROM ai_usage WHERE user_id = ? AND usage_day = ?',
+            (user_id, day),
+        ).fetchone()
+    return row[0] if row else 0
+
+
+def increment_ai_usage(user_id, day: str) -> int:
+    with get_connection() as conn:
+        conn.execute(
+            '''
+            INSERT INTO ai_usage (user_id, usage_day, request_count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(user_id, usage_day) DO UPDATE SET request_count = request_count + 1
+            ''',
+            (user_id, day),
+        )
+        row = conn.execute(
+            'SELECT request_count FROM ai_usage WHERE user_id = ? AND usage_day = ?',
+            (user_id, day),
+        ).fetchone()
+        conn.commit()
+    return row[0] if row else 0
+
+
+def export_user_data(user_id) -> dict:
+    """Collect a user's reminders, bookmarks, subscriptions and digest settings for JSON export."""
+    with get_connection() as conn:
+        reminders = conn.execute(
+            '''
+            SELECT send_at, text_preview, source_name
+            FROM scheduled_messages
+            WHERE user_id = ? AND is_sent = 0 AND delivery_status != 'failed_permanent'
+            ORDER BY send_at
+            ''',
+            (user_id,),
+        ).fetchall()
+        bookmarks = conn.execute(
+            '''
+            SELECT tag, full_text, source_name, saved_at
+            FROM saved_messages
+            WHERE user_id = ?
+            ORDER BY saved_at
+            ''',
+            (user_id,),
+        ).fetchall()
+        subscriptions = conn.execute(
+            '''
+            SELECT channel_username, channel_title, period, tag, is_paused
+            FROM subscriptions
+            WHERE user_id = ? AND is_disabled = 0
+            ORDER BY channel_username
+            ''',
+            (user_id,),
+        ).fetchall()
+        digest_settings = conn.execute(
+            '''
+            SELECT period, send_hour, send_minute, weekday, month_day, monthly_mode
+            FROM digest_settings
+            WHERE user_id = ?
+            ''',
+            (user_id,),
+        ).fetchall()
+
+    return {
+        "reminders": [dict(row) for row in reminders],
+        "bookmarks": [dict(row) for row in bookmarks],
+        "subscriptions": [dict(row) for row in subscriptions],
+        "digest_settings": [dict(row) for row in digest_settings],
+    }
+
+
+def clear_subscription_failure(user_id, sub_id):
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE subscriptions
+            SET digest_status = 'active', failure_count = 0, last_error = NULL
+            WHERE id = ? AND user_id = ? AND is_disabled = 0
+            """,
+            (sub_id, user_id),
+        )
+        conn.commit()
+
+
+def get_app_meta(key: str) -> str | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT value FROM app_meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_app_meta(key: str, value: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO app_meta (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        conn.commit()
+
+
 def add_saved_message(user_id, full_text, source_name, tag, saved_at):
     with get_connection() as conn:
         conn.execute(
@@ -773,10 +1067,26 @@ def cleanup_old_records(now_str: str) -> dict[str, int]:
             """,
             (now_str, f"-{SUBSCRIPTION_FAILURE_RETENTION_DAYS} days"),
         ).rowcount
+        digest_posts_deleted = conn.execute(
+            """
+            DELETE FROM digest_posts
+            WHERE COALESCE(post_time, created_at) < datetime(?, ?)
+            """,
+            (now_str, f"-{DIGEST_POST_RETENTION_DAYS} days"),
+        ).rowcount
+        ai_usage_deleted = conn.execute(
+            """
+            DELETE FROM ai_usage
+            WHERE usage_day < date(?, '-2 days')
+            """,
+            (now_str,),
+        ).rowcount
         conn.commit()
 
     return {
         "scheduled_sent_deleted": scheduled_sent_deleted,
         "scheduled_failed_deleted": scheduled_failed_deleted,
         "subscriptions_failed_deleted": subscriptions_failed_deleted,
+        "digest_posts_deleted": digest_posts_deleted,
+        "ai_usage_deleted": ai_usage_deleted,
     }

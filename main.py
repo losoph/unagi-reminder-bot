@@ -1,6 +1,8 @@
 import asyncio
 import calendar
 import html
+import io
+import json
 import logging
 import os
 from datetime import datetime, timedelta
@@ -21,17 +23,24 @@ from aiogram.exceptions import (
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, InaccessibleMessage, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, InaccessibleMessage, Message
 from aiohttp_socks import ProxyConnector # type: ignore
 from dotenv import load_dotenv
 
 from data.database import (
+    add_digest_posts,
     add_message,
     add_saved_message,
     add_subscription,
     cleanup_old_records,
+    clear_subscription_failure,
+    count_user_subscriptions,
     delete_message,
     delete_saved_message,
+    export_user_data,
+    get_ai_usage_today,
+    get_digest_post_channels,
+    get_digest_posts,
     get_digest_settings,
     delete_subscription,
     get_due_subscriptions,
@@ -39,10 +48,12 @@ from data.database import (
     get_saved_message_by_id,
     get_scheduled_message_by_delivered_message_id,
     get_subscription_by_id,
+    get_subscription_tags,
     get_saved_messages,
     get_user_messages,
     get_user_subscriptions,
     get_user_tags,
+    increment_ai_usage,
     init_db,
     mark_as_sent,
     mark_message_delivery_error,
@@ -51,6 +62,10 @@ from data.database import (
     parse_db_datetime,
     replace_sent_reminder_with_pending,
     serialize_datetime,
+    set_all_subscriptions_paused,
+    set_subscription_paused,
+    set_subscription_tag,
+    unsubscribe_all,
     update_subscriptions_next_send_at,
     update_subscription_time,
     upsert_digest_settings,
@@ -58,6 +73,8 @@ from data.database import (
     update_saved_message_tag,
 )
 from scraper import ChannelFetchError, REQUEST_TIMEOUT, get_latest_posts
+import ai_assistant
+from telegraph_publisher import publish_digest
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -79,6 +96,17 @@ MAX_DIGEST_RETRIES = 5
 DIGEST_FETCH_CONCURRENCY = 5
 DIGEST_CHECK_INTERVAL_SECONDS = int(os.getenv("DIGEST_CHECK_INTERVAL_SECONDS", 30 * 60))  # Можно переопределить через .env
 CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
+# Дайджесты с таким числом постов и более публикуются в Telegraph одной ссылкой.
+DIGEST_TELEGRAPH_THRESHOLD = int(os.getenv("DIGEST_TELEGRAPH_THRESHOLD", "4"))
+# Лимиты на импорт, чтобы один файл не положил бота.
+MAX_IMPORT_SUBSCRIPTIONS = int(os.getenv("MAX_IMPORT_SUBSCRIPTIONS", "300"))
+MAX_IMPORT_BOOKMARKS = int(os.getenv("MAX_IMPORT_BOOKMARKS", "1000"))
+MAX_IMPORT_REMINDERS = int(os.getenv("MAX_IMPORT_REMINDERS", "500"))
+MAX_IMPORT_FILE_BYTES = int(os.getenv("MAX_IMPORT_FILE_BYTES", str(2 * 1024 * 1024)))
+AI_DAILY_LIMIT = ai_assistant.AI_DAILY_LIMIT
+# Средняя скорость чтения для оценки времени прочтения постов канала.
+READING_WORDS_PER_MINUTE = 180
+EXPORT_VERSION = 1
 
 USER_FACING_ERROR = "Что-то пошло не так. Попробуй ещё раз позже."
 
@@ -115,6 +143,14 @@ class ScheduleState(StatesGroup):
 class SaveState(StatesGroup):
     waiting_for_tag = State()
     waiting_for_new_tag = State()
+
+
+class SubTagState(StatesGroup):
+    waiting_for_folder = State()
+
+
+class ImportState(StatesGroup):
+    waiting_for_file = State()
 
 
 def chunk_html_text(lines, max_length=4000):
@@ -246,8 +282,18 @@ def format_digest_schedule(period: str, settings: dict[str, int | str]) -> str:
     return f"{month_day}-го числа в {time_part}"
 
 
-def build_digest_channel_actions(sub_id: int, current_period: str) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="🚫 Отписаться", callback_data=f"unsub_{sub_id}")]]
+def build_digest_channel_actions(sub_id: int, current_period: str, is_paused: bool = False) -> InlineKeyboardMarkup:
+    if is_paused:
+        toggle = InlineKeyboardButton(text="▶️ Возобновить", callback_data=f"dresume_{sub_id}")
+    else:
+        toggle = InlineKeyboardButton(text="⏸ Пауза", callback_data=f"dpause_{sub_id}")
+    rows = [
+        [
+            InlineKeyboardButton(text="🕒 Изменить время", callback_data=f"dsch_{current_period}"),
+            toggle,
+        ],
+        [InlineKeyboardButton(text="📁 Папка", callback_data=f"dtag_{sub_id}")],
+    ]
     move_buttons = []
     for period in ("daily", "weekly", "monthly"):
         if period == current_period:
@@ -259,8 +305,46 @@ def build_digest_channel_actions(sub_id: int, current_period: str) -> InlineKeyb
             )
         )
     rows.append(move_buttons)
-    rows.append([InlineKeyboardButton(text="⚙️ Настройки дайджеста", callback_data="digest_settings")])
+    rows.append([InlineKeyboardButton(text="🚫 Отписаться", callback_data=f"unsub_{sub_id}")])
+    rows.append([InlineKeyboardButton(text="⚙️ Все подписки", callback_data="digest_settings")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _subscription_status_marker(is_paused, digest_status) -> str:
+    if is_paused:
+        return "⏸"
+    if digest_status in ("failed_temporary", "failed_permanent"):
+        return "⚠️"
+    return "📰"
+
+
+def build_post_subscribe_keyboard(sub_id: int, period: str) -> InlineKeyboardMarkup:
+    """Quick actions shown right after a channel is added to a digest."""
+    rows = [
+        [InlineKeyboardButton(text="🕒 Изменить время", callback_data=f"dsch_{period}")],
+    ]
+    move_buttons = [
+        InlineKeyboardButton(
+            text=f"↪️ {_PERIOD_TITLES[other]}",
+            callback_data=f"dmove_{sub_id}_{other}",
+        )
+        for other in ("daily", "weekly", "monthly")
+        if other != period
+    ]
+    rows.append(move_buttons)
+    rows.append([InlineKeyboardButton(text="📁 Папка", callback_data=f"dtag_{sub_id}")])
+    rows.append([InlineKeyboardButton(text="⚙️ Все подписки", callback_data="digest_settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _sort_subscriptions_for_display(user_subs):
+    return sorted(
+        user_subs,
+        key=lambda s: (
+            (s[6] or "￿").lower(),  # tag/folder, untagged last
+            (s[2] or "").lower(),
+        ),
+    )
 
 
 def build_digest_settings_keyboard(user_subs) -> InlineKeyboardMarkup:
@@ -273,38 +357,76 @@ def build_digest_settings_keyboard(user_subs) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📆 Ежемесячный", callback_data="dsch_monthly"),
         ],
     ]
-    for sub in user_subs:
+    if user_subs:
+        rows.append([InlineKeyboardButton(text="🧠 Анализ каналов (ИИ)", callback_data="digest_ai")])
+        has_active = any(not s[5] for s in user_subs)
+        has_paused = any(s[5] for s in user_subs)
+        bulk_row = []
+        if has_active:
+            bulk_row.append(InlineKeyboardButton(text="⏸ Пауза всех", callback_data="dpauseall"))
+        if has_paused:
+            bulk_row.append(InlineKeyboardButton(text="▶️ Возобновить все", callback_data="dresumeall"))
+        if bulk_row:
+            rows.append(bulk_row)
+        rows.append([InlineKeyboardButton(text="🗑 Отписаться от всех", callback_data="dunsuball")])
+    rows.append([
+        InlineKeyboardButton(text="📤 Экспорт", callback_data="data_export"),
+        InlineKeyboardButton(text="📥 Импорт", callback_data="data_import"),
+    ])
+    for sub in _sort_subscriptions_for_display(user_subs):
         title = sub[2] or "Канал"
+        marker = _subscription_status_marker(sub[5], sub[7])
         short_title = title[:22] + "…" if len(title) > 23 else title
         rows.append(
-            [InlineKeyboardButton(text=f"📰 {short_title}", callback_data=f"dsub_{sub[0]}")]
+            [InlineKeyboardButton(text=f"{marker} {short_title}", callback_data=f"dsub_{sub[0]}")]
         )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def render_digest_settings_text(user_id: int) -> str:
     user_subs = get_user_subscriptions(user_id)
-    grouped = {"daily": [], "weekly": [], "monthly": []}
-    for sub in user_subs:
-        grouped.setdefault(sub[3], []).append(sub)
 
     lines = ["⚙️ <b>Настройки дайджеста</b>", ""]
+    lines.append("<b>Расписание:</b>")
     for period in ("daily", "weekly", "monthly"):
         settings = resolve_digest_settings(user_id, period)
         lines.append(
             f"• <b>{_PERIOD_TITLES[period]}</b>: {format_digest_schedule(period, settings)}"
         )
     lines.append("")
-    lines.append("<b>Подписки</b>")
-    for period in ("daily", "weekly", "monthly"):
-        subs = grouped.get(period, [])
-        lines.append(f"{_PERIOD_TITLES[period]}: {len(subs)}")
-        if subs:
-            for sub in subs:
-                lines.append(f"• {html.escape(sub[2]) if sub[2] else 'Канал'}")
-        else:
-            lines.append("• Пока пусто")
+
+    if not user_subs:
+        lines.append("<b>Подписки:</b> пока пусто.")
         lines.append("")
+        lines.append("💡 Перешли пост из открытого канала, чтобы подписаться.")
+        return "\n".join(lines).strip()
+
+    paused_count = sum(1 for s in user_subs if s[5])
+    failed_count = sum(1 for s in user_subs if s[7] in ("failed_temporary", "failed_permanent"))
+    summary = f"<b>Подписки ({len(user_subs)}"
+    if paused_count:
+        summary += f", ⏸ {paused_count}"
+    if failed_count:
+        summary += f", ⚠️ {failed_count}"
+    summary += "):</b>"
+    lines.append(summary)
+
+    grouped: dict[str, list] = {}
+    for sub in _sort_subscriptions_for_display(user_subs):
+        folder = sub[6] or "Без папки"
+        grouped.setdefault(folder, []).append(sub)
+
+    for folder, subs in grouped.items():
+        lines.append(f"\n📁 <b>{html.escape(folder)}</b>")
+        for sub in subs:
+            marker = _subscription_status_marker(sub[5], sub[7])
+            title = html.escape(sub[2]) if sub[2] else "Канал"
+            note = _PERIOD_RU.get(sub[3], sub[3])
+            if sub[5]:
+                note = "на паузе"
+            elif sub[7] in ("failed_temporary", "failed_permanent"):
+                note = "ошибка чтения"
+            lines.append(f"• {marker} {title} <i>({note})</i>")
     return "\n".join(lines).strip()
 
 
@@ -717,6 +839,50 @@ def append_digest_channel_lines(lines: list[str], sub_id: int, period: str, chan
     lines.append("")
 
 
+def render_digest_lines(title_plain: str, sections: list[dict]) -> list[str]:
+    lines = [f"📰 <b>{html.escape(title_plain)}</b> ☕️", ""]
+    for section in sections:
+        append_digest_channel_lines(
+            lines,
+            section["sub_id"],
+            section["period"],
+            section["title"],
+            section["posts"],
+        )
+    lines.append(build_digest_action_link("⚙️ Настройки дайджеста", "ds"))
+    return lines
+
+
+async def deliver_digest(user_id: int, title_plain: str, sections: list[dict]) -> bool:
+    """Send a digest, switching to Telegraph for large ones. Returns True if delivered."""
+    sections = [s for s in sections if s["posts"]]
+    total_posts = sum(len(s["posts"]) for s in sections)
+    if total_posts == 0:
+        return False
+
+    if total_posts >= DIGEST_TELEGRAPH_THRESHOLD:
+        url = await publish_digest(title_plain, sections)
+        if url:
+            settings_link = build_digest_action_link("⚙️ Настройки дайджеста", "ds")
+            text = (
+                f"📰 <b>{html.escape(title_plain)}</b> ☕️\n"
+                f"{len(sections)} каналов · {total_posts} постов\n\n"
+                f"📖 <a href='{url}'>Открыть дайджест целиком</a>\n\n"
+                f"{settings_link}"
+            )
+            await bot.send_message(
+                user_id,
+                text,
+                parse_mode="HTML",
+                link_preview_options=LinkPreviewOptions(is_disabled=False),
+            )
+            return True
+        logger.warning("Telegraph publish failed for user %s, falling back to chunks", user_id)
+
+    await send_digest_chunks(user_id, render_digest_lines(title_plain, sections))
+    return True
+
+
 async def fetch_subscription_posts(
     sub: tuple,
     session: aiohttp.ClientSession,
@@ -1018,7 +1184,13 @@ async def cmd_help(message: types.Message, state: FSMContext):
         "📡 <b>Подписки и Дайджесты:</b>\n"
         "/list_digest — Посмотреть и настроить мои подписки\n"
         "/test_digest — Мгновенно собрать дайджест по подпискам за 24ч\n"
-        "💡 <i>Перешлите пост из любого открытого канала, чтобы подписаться на него.</i>"
+        "/check — Проверить, что все каналы читаются\n"
+        "💡 <i>Перешлите пост из любого открытого канала, чтобы подписаться на него.</i>\n"
+        "💡 <i>В «Мои подписки» можно ставить каналы на паузу, раскладывать по папкам и спрашивать ИИ про частоту постинга и саммари.</i>\n"
+        "ℹ️ <i>Большие дайджесты (4+ постов) приходят одной ссылкой на Telegraph.</i>\n\n"
+        "💾 <b>Бэкап и перенос:</b>\n"
+        "/export — Выгрузить напоминания, закладки и подписки в JSON\n"
+        "/import — Загрузить JSON-файл, чтобы восстановить данные"
     )
     await message.answer(help_text, parse_mode="HTML")
 
@@ -1031,6 +1203,9 @@ async def set_bot_commands(bot: Bot):
         types.BotCommand(command="list_digest", description="📡 Мои подписки"),
         types.BotCommand(command="saved", description="📁 База знаний (закладки)"),
         types.BotCommand(command="test_digest", description="⏳ Собрать дайджест за 24ч"),
+        types.BotCommand(command="check", description="🔎 Проверить подписки"),
+        types.BotCommand(command="export", description="📤 Экспорт данных (JSON)"),
+        types.BotCommand(command="import", description="📥 Импорт данных (JSON)"),
         types.BotCommand(command="home", description="🏠 В главное меню"),
         types.BotCommand(command="back", description="🔙 Шаг назад"),
     ]
@@ -1463,37 +1638,55 @@ async def handle_unsub(callback: CallbackQuery):
     await callback.answer("Удалено!")
 
 
-@dp.callback_query(F.data == "digest_settings")
-async def open_digest_settings(callback: CallbackQuery):
+async def _refresh_digest_settings(callback: CallbackQuery):
     user_id = callback.from_user.id
     await edit_or_answer(
         callback,
         render_digest_settings_text(user_id),
         reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id)),
     )
+
+
+async def render_subscription_actions(callback: CallbackQuery, sub_id: int) -> bool:
+    user_id = callback.from_user.id
+    sub = get_subscription_by_id(user_id, sub_id)
+    if not sub:
+        await callback.answer("❌ Подписка не найдена.", show_alert=True)
+        return False
+    is_paused = bool(sub["is_paused"])
+    folder = sub["tag"] or "Без папки"
+    if is_paused:
+        status_line = "\n⏸ <i>На паузе</i>"
+    elif sub["digest_status"] in ("failed_temporary", "failed_permanent"):
+        status_line = "\n⚠️ <i>Последнее чтение канала не удалось</i>"
+    else:
+        status_line = ""
+    text = (
+        f"📰 <b>{html.escape(sub['channel_title']) if sub['channel_title'] else 'Канал'}</b>\n"
+        f"Периодичность: {_PERIOD_TITLES[sub['period']]}\n"
+        f"📁 Папка: {html.escape(folder)}\n"
+        f"Следующая отправка: {display_db_datetime(sub['next_send_at']).strftime('%d.%m в %H:%M')}"
+        f"{status_line}"
+    )
+    await edit_or_answer(callback, text, reply_markup=build_digest_channel_actions(sub_id, sub["period"], is_paused))
+    return True
+
+
+@dp.callback_query(F.data == "digest_settings")
+async def open_digest_settings(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(None)
+    await _refresh_digest_settings(callback)
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("dsub_"))
 async def open_digest_subscription_actions(callback: CallbackQuery):
-    user_id = callback.from_user.id
     sub_id = parse_callback_int_suffix(callback.data, "dsub_")
     if sub_id is None:
         await callback.answer("❌ Некорректные данные.", show_alert=True)
         return
-    sub = get_subscription_by_id(user_id, sub_id)
-    if not sub:
-        await callback.answer("❌ Подписка не найдена.", show_alert=True)
-        return
-    text = (
-        f"📰 <b>{html.escape(sub['channel_title']) if sub['channel_title'] else 'Канал'}</b>\n"
-        f"Сейчас: {_PERIOD_TITLES[sub['period']]}\n"
-        f"Следующая отправка: {display_db_datetime(sub['next_send_at']).strftime('%d.%m в %H:%M')}"
-    )
-    keyboard = build_digest_channel_actions(sub_id, sub["period"]).inline_keyboard
-    keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="digest_settings")])
-    await edit_or_answer(callback, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
-    await callback.answer()
+    if await render_subscription_actions(callback, sub_id):
+        await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("dmove_"))
@@ -1520,23 +1713,220 @@ async def move_digest_subscription(callback: CallbackQuery):
 
     settings = resolve_digest_settings(user_id, new_period)
     next_send_at = serialize_datetime(get_next_digest_time(new_period, local_now(), settings))
-    add_subscription(
+    new_sub_id = add_subscription(
         user_id,
         sub["channel_username"],
         sub["channel_title"],
         new_period,
         sub["last_scraped_at"] or serialize_datetime(utc_now()),
         next_send_at,
+        tag=sub["tag"],
     )
-    delete_subscription(user_id, sub_id)
+    if new_sub_id != sub_id:
+        delete_subscription(user_id, sub_id)
 
-    updated_subs = get_user_subscriptions(user_id)
+    await render_subscription_actions(callback, new_sub_id)
+    await callback.answer(f"Перенёс в {_PERIOD_TITLES[new_period].lower()} дайджест.")
+
+
+# ---------------------------------------------------------------------------
+# Подписки: пауза/возобновление, массовые операции, папки (Features 1–3)
+# ---------------------------------------------------------------------------
+
+
+@dp.callback_query(F.data.startswith("dpause_"))
+async def pause_subscription(callback: CallbackQuery):
+    sub_id = parse_callback_int_suffix(callback.data, "dpause_")
+    if sub_id is None:
+        await callback.answer("❌ Некорректные данные.", show_alert=True)
+        return
+    set_subscription_paused(callback.from_user.id, sub_id, True)
+    await render_subscription_actions(callback, sub_id)
+    await callback.answer("⏸ Подписка на паузе.")
+
+
+@dp.callback_query(F.data.startswith("dresume_"))
+async def resume_subscription(callback: CallbackQuery):
+    sub_id = parse_callback_int_suffix(callback.data, "dresume_")
+    if sub_id is None:
+        await callback.answer("❌ Некорректные данные.", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    set_subscription_paused(user_id, sub_id, False)
+    # Сдвигаем next_send_at вперёд, чтобы возобновлённая подписка не сработала мгновенно.
+    sub = get_subscription_by_id(user_id, sub_id)
+    if sub:
+        settings = resolve_digest_settings(user_id, sub["period"])
+        next_send_at = serialize_datetime(get_next_digest_time(sub["period"], local_now(), settings))
+        update_subscription_time(sub_id, sub["last_scraped_at"] or serialize_datetime(utc_now()), next_send_at)
+    await render_subscription_actions(callback, sub_id)
+    await callback.answer("▶️ Подписка возобновлена.")
+
+
+@dp.callback_query(F.data == "dpauseall")
+async def pause_all_subscriptions(callback: CallbackQuery):
+    changed = set_all_subscriptions_paused(callback.from_user.id, True)
+    await _refresh_digest_settings(callback)
+    await callback.answer(f"⏸ На паузе: {changed}")
+
+
+@dp.callback_query(F.data == "dresumeall")
+async def resume_all_subscriptions(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    changed = set_all_subscriptions_paused(user_id, False)
+    # Пересчитываем расписание для всех периодов после возобновления.
+    for period in ("daily", "weekly", "monthly"):
+        reschedule_user_period(user_id, period)
+    await _refresh_digest_settings(callback)
+    await callback.answer(f"▶️ Возобновлено: {changed}")
+
+
+@dp.callback_query(F.data == "dunsuball")
+async def confirm_unsubscribe_all(callback: CallbackQuery):
+    count = count_user_subscriptions(callback.from_user.id)
+    if not count:
+        await callback.answer("У тебя нет подписок.", show_alert=True)
+        return
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"🗑 Да, отписаться от всех ({count})", callback_data="dunsuball_yes")],
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data="digest_settings")],
+        ]
+    )
     await edit_or_answer(
         callback,
-        render_digest_settings_text(user_id),
-        reply_markup=build_digest_settings_keyboard(updated_subs),
+        f"⚠️ <b>Отписаться от всех каналов?</b>\nБудут удалены все {count} подписок. Действие необратимо.",
+        reply_markup=keyboard,
     )
-    await callback.answer(f"Перенёс в {_PERIOD_TITLES[new_period].lower()} дайджест.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "dunsuball_yes")
+async def unsubscribe_all_confirmed(callback: CallbackQuery):
+    removed = unsubscribe_all(callback.from_user.id)
+    await _refresh_digest_settings(callback)
+    await callback.answer(f"🗑 Удалено подписок: {removed}")
+
+
+def build_subscription_folder_keyboard(sub_id: int, folders: list[str]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for idx, folder in enumerate(folders):
+        display = folder[:15] + "…" if len(folder) > 16 else folder
+        row.append(InlineKeyboardButton(text=f"📁 {display}", callback_data=f"dtagset_{sub_id}_{idx}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="✍️ Новая папка", callback_data=f"dtagnew_{sub_id}")])
+    rows.append([InlineKeyboardButton(text="🗑 Убрать из папки", callback_data=f"dtagclear_{sub_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"dsub_{sub_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data.startswith("dtag_"))
+async def open_subscription_folder_menu(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    sub_id = parse_callback_int_suffix(callback.data, "dtag_")
+    if sub_id is None:
+        await callback.answer("❌ Некорректные данные.", show_alert=True)
+        return
+    sub = get_subscription_by_id(user_id, sub_id)
+    if not sub:
+        await callback.answer("❌ Подписка не найдена.", show_alert=True)
+        return
+    folders = get_subscription_tags(user_id)
+    await state.update_data(folder_sub_id=sub_id, folder_list=folders)
+    current = sub["tag"] or "Без папки"
+    text = (
+        f"📁 <b>Папка для канала</b>\n"
+        f"{html.escape(sub['channel_title']) if sub['channel_title'] else 'Канал'}\n\n"
+        f"Текущая папка: <b>{html.escape(current)}</b>\n\n"
+        f"Выбери папку, создай новую (✍️) или убери из папки:"
+    )
+    await edit_or_answer(callback, text, reply_markup=build_subscription_folder_keyboard(sub_id, folders))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("dtagset_"))
+async def set_subscription_folder(callback: CallbackQuery, state: FSMContext):
+    payload = parse_callback_strip_prefix(callback.data, "dtagset_")
+    if not payload or "_" not in payload:
+        await callback.answer("❌ Некорректные данные.", show_alert=True)
+        return
+    sub_id_str, idx_str = payload.rsplit("_", 1)
+    try:
+        sub_id = int(sub_id_str)
+        idx = int(idx_str)
+    except ValueError:
+        await callback.answer("❌ Некорректные данные.", show_alert=True)
+        return
+    data = await state.get_data()
+    folders = data.get("folder_list", [])
+    if idx >= len(folders):
+        await callback.answer("❌ Папка не найдена.", show_alert=True)
+        return
+    set_subscription_tag(callback.from_user.id, sub_id, folders[idx])
+    await render_subscription_actions(callback, sub_id)
+    await callback.answer(f"📁 Папка: {folders[idx]}")
+
+
+@dp.callback_query(F.data.startswith("dtagclear_"))
+async def clear_subscription_folder(callback: CallbackQuery):
+    sub_id = parse_callback_int_suffix(callback.data, "dtagclear_")
+    if sub_id is None:
+        await callback.answer("❌ Некорректные данные.", show_alert=True)
+        return
+    set_subscription_tag(callback.from_user.id, sub_id, None)
+    await render_subscription_actions(callback, sub_id)
+    await callback.answer("📁 Убрано из папки.")
+
+
+@dp.callback_query(F.data.startswith("dtagnew_"))
+async def prompt_new_subscription_folder(callback: CallbackQuery, state: FSMContext):
+    sub_id = parse_callback_int_suffix(callback.data, "dtagnew_")
+    if sub_id is None:
+        await callback.answer("❌ Некорректные данные.", show_alert=True)
+        return
+    await state.update_data(folder_sub_id=sub_id)
+    await state.set_state(SubTagState.waiting_for_folder)
+    await edit_or_answer(
+        callback,
+        "✍️ Пришли название новой папки текстом (например: Новости, Работа).",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"dsub_{sub_id}")]]
+        ),
+    )
+    await callback.answer()
+
+
+@dp.message(SubTagState.waiting_for_folder)
+async def process_new_subscription_folder(message: types.Message, state: FSMContext):
+    folder = (message.text or "").strip().lstrip("#").strip()
+    data = await state.get_data()
+    sub_id = data.get("folder_sub_id")
+    if not folder:
+        await message.answer("❌ Название папки не должно быть пустым. Попробуй ещё раз.")
+        return
+    if not sub_id:
+        await message.answer("❌ Не нашёл подписку. Открой /list_digest заново.")
+        await state.set_state(None)
+        return
+    set_subscription_tag(message.chat.id, sub_id, folder)
+    await state.set_state(None)
+    confirm = await message.answer(f"📁 Канал перенесён в папку <b>{html.escape(folder)}</b>.", parse_mode="HTML")
+    await asyncio.sleep(2)
+    try:
+        await confirm.delete()
+        await message.delete()
+    except TelegramAPIError:
+        pass
+    await message.answer(
+        render_digest_settings_text(message.chat.id),
+        parse_mode="HTML",
+        reply_markup=build_digest_settings_keyboard(get_user_subscriptions(message.chat.id)),
+    )
 
 
 @dp.callback_query(F.data.startswith("dsch_"))
@@ -1701,6 +2091,510 @@ async def save_digest_monthly_mode(callback: CallbackQuery):
         reply_markup=build_digest_schedule_keyboard("monthly"),
     )
     await callback.answer("Режим обновлён.")
+
+
+# ---------------------------------------------------------------------------
+# Проверка подписок (Feature 2)
+# ---------------------------------------------------------------------------
+
+
+@dp.message(Command("check"))
+async def cmd_check(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.chat.id
+    subs = get_user_subscriptions(user_id)
+    if not subs:
+        await message.answer("📭 У тебя нет подписок для проверки.")
+        return
+
+    status_msg = await message.answer("🔎 Проверяю доступность каналов...")
+    semaphore = asyncio.Semaphore(DIGEST_FETCH_CONCURRENCY)
+    old_marker = serialize_datetime(utc_now() - timedelta(days=3650))
+
+    async with create_telegram_http_session() as session:
+        async def check_one(sub):
+            sub_id, username, title = sub[0], sub[1], sub[2]
+            async with semaphore:
+                try:
+                    await get_latest_posts(username, old_marker, session=session)
+                    return sub_id, username, title, True, None
+                except ChannelFetchError as exc:
+                    return sub_id, username, title, False, str(exc)
+
+        results = await asyncio.gather(*(check_one(sub) for sub in subs))
+
+    ok = sum(1 for r in results if r[3])
+    lines = ["🔎 <b>Проверка подписок</b>", f"Доступно: {ok}/{len(results)}", ""]
+    for sub_id, username, title, success, err in results:
+        name = html.escape(title or username or "Канал")
+        if success:
+            clear_subscription_failure(user_id, sub_id)
+            lines.append(f"✅ {name}")
+        else:
+            lines.append(f"⚠️ {name} — {html.escape((err or '')[:80])}")
+
+    try:
+        await status_msg.edit_text("\n".join(lines), parse_mode="HTML")
+    except TelegramAPIError:
+        await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# ---------------------------------------------------------------------------
+# Анализ каналов через DeepSeek (Feature 9)
+# ---------------------------------------------------------------------------
+
+
+def _ai_today_key() -> str:
+    return local_now().strftime("%Y-%m-%d")
+
+
+def _ai_limit_reached(user_id: int) -> bool:
+    if AI_DAILY_LIMIT <= 0:
+        return False
+    return get_ai_usage_today(user_id, _ai_today_key()) >= AI_DAILY_LIMIT
+
+
+def _compute_channel_stats(posts: list[dict]) -> dict:
+    count = len(posts)
+    total_words = sum(len((p.get("text") or "").split()) for p in posts)
+    times = sorted(p["time"] for p in posts if p.get("time"))
+    if len(times) >= 2:
+        span_days = max((times[-1] - times[0]).total_seconds() / 86400, 0.5)
+    else:
+        span_days = 1.0
+    posts_per_day = count / span_days
+    avg_words = (total_words / count) if count else 0
+    daily_words = posts_per_day * avg_words
+
+    def mins(words: float) -> int:
+        return max(1, round(words / READING_WORDS_PER_MINUTE)) if words else 0
+
+    return {
+        "count": count,
+        "posts_per_day": posts_per_day,
+        "avg_words": avg_words,
+        "read_daily_min": mins(daily_words),
+        "read_weekly_min": mins(daily_words * 7),
+        "read_monthly_min": mins(daily_words * 30),
+    }
+
+
+def _recommend_period(posts_per_day: float) -> tuple[str, str]:
+    if posts_per_day >= 5:
+        return (
+            "ежедневный (в отдельное время)",
+            "Канал очень активный — лучше отдельный ежедневный дайджест в своё время, "
+            "иначе общая утренняя сводка будет слишком большой.",
+        )
+    if posts_per_day >= 1:
+        return (
+            "ежедневный или еженедельный",
+            "Канал умеренно активный — подойдёт ежедневный или еженедельный дайджест в общей сводке.",
+        )
+    return (
+        "еженедельный или ежемесячный",
+        "Канал постит редко — достаточно еженедельного или ежемесячного дайджеста.",
+    )
+
+
+def build_ai_channels_keyboard(channels) -> InlineKeyboardMarkup:
+    rows = []
+    for idx, (username, title) in enumerate(channels):
+        display = (title or username or "Канал")[:24]
+        rows.append([InlineKeyboardButton(text=f"📰 {display}", callback_data=f"aich_{idx}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="digest_settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_ai_channel_menu(idx: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🧮 Подстройка дайджеста", callback_data=f"aiadj_{idx}")],
+            [InlineKeyboardButton(text="📝 Саммари по каналу", callback_data=f"aisum_{idx}")],
+            [InlineKeyboardButton(text="⬅️ К списку каналов", callback_data="digest_ai")],
+        ]
+    )
+
+
+def build_ai_back_keyboard(idx: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"aich_{idx}")],
+            [InlineKeyboardButton(text="⚙️ Все подписки", callback_data="digest_settings")],
+        ]
+    )
+
+
+async def _resolve_ai_channel(callback: CallbackQuery, state: FSMContext, prefix: str):
+    idx = parse_callback_int_suffix(callback.data, prefix)
+    data = await state.get_data()
+    channels = data.get("ai_channels", [])
+    if idx is None or idx >= len(channels):
+        await callback.answer("❌ Канал не найден. Открой меню анализа заново.", show_alert=True)
+        return None, None, None
+    username, title = channels[idx]
+    return idx, username, title
+
+
+@dp.callback_query(F.data == "digest_ai")
+async def open_ai_menu(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    subs = get_user_subscriptions(user_id)
+    if not subs:
+        await callback.answer("Сначала подпишись хотя бы на один канал.", show_alert=True)
+        return
+    channels = [(s[1], s[2]) for s in subs]
+    await state.update_data(ai_channels=channels)
+    note = (
+        ""
+        if ai_assistant.is_enabled()
+        else "\n\n⚠️ ИИ-саммари недоступно (не задан DEEPSEEK_API_KEY). Подстройка дайджеста работает и без ИИ."
+    )
+    text = "🧠 <b>Анализ каналов</b>\n\nВыбери канал — посчитаю частоту постинга, время чтения и дам рекомендацию по дайджесту." + note
+    await edit_or_answer(callback, text, reply_markup=build_ai_channels_keyboard(channels))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("aich_"))
+async def open_ai_channel(callback: CallbackQuery, state: FSMContext):
+    idx, username, title = await _resolve_ai_channel(callback, state, "aich_")
+    if username is None:
+        return
+    limit_note = ""
+    if ai_assistant.is_enabled() and AI_DAILY_LIMIT > 0:
+        used = get_ai_usage_today(callback.from_user.id, _ai_today_key())
+        limit_note = f"\n\n🤖 ИИ-запросов сегодня: {used}/{AI_DAILY_LIMIT}"
+    text = f"📊 <b>{html.escape(title or username)}</b>\n\nЧто сделать с этим каналом?{limit_note}"
+    await edit_or_answer(callback, text, reply_markup=build_ai_channel_menu(idx))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("aiadj_"))
+async def ai_adjust_digest(callback: CallbackQuery, state: FSMContext):
+    idx, username, title = await _resolve_ai_channel(callback, state, "aiadj_")
+    if username is None:
+        return
+    user_id = callback.from_user.id
+    await callback.answer("⏳ Анализирую канал...")
+
+    old_marker = serialize_datetime(utc_now() - timedelta(days=3650))
+    try:
+        async with create_telegram_http_session() as session:
+            posts = await get_latest_posts(username, old_marker, session=session)
+    except ChannelFetchError as exc:
+        await edit_or_answer(
+            callback,
+            f"⚠️ Не удалось прочитать канал: {html.escape(str(exc))}",
+            reply_markup=build_ai_back_keyboard(idx),
+        )
+        return
+
+    if not posts:
+        await edit_or_answer(
+            callback,
+            "На странице канала нет постов для анализа.",
+            reply_markup=build_ai_back_keyboard(idx),
+        )
+        return
+
+    stats = _compute_channel_stats(posts)
+    period_label, base_reco = _recommend_period(stats["posts_per_day"])
+    lines = [
+        "🧮 <b>Подстройка дайджеста</b>",
+        f"📰 {html.escape(title or username)}",
+        "",
+        f"Частота: ~{stats['posts_per_day']:.1f} постов/день (по {stats['count']} последним)",
+        f"Объём: ~{round(stats['avg_words'])} слов/пост",
+        "",
+        "⏱ Время чтения постов:",
+        f"• за день: ~{stats['read_daily_min']} мин",
+        f"• за неделю: ~{stats['read_weekly_min']} мин",
+        f"• за месяц: ~{stats['read_monthly_min']} мин",
+        "",
+        f"💡 Рекомендуемая периодичность: <b>{period_label}</b>",
+        base_reco,
+    ]
+
+    if ai_assistant.is_enabled() and not _ai_limit_reached(user_id):
+        sample = "\n---\n".join((p.get("text") or "")[:200] for p in posts[:8])
+        system_prompt = (
+            "Ты помощник по настройке Telegram-дайджестов. На основе статистики канала и примеров постов "
+            "дай короткую (2-3 предложения) рекомендацию на русском: какую периодичность дайджеста выбрать, "
+            "стоит ли выносить канал в отдельное время или оставить в общей сводке. Будь конкретен, без воды."
+        )
+        user_prompt = (
+            f"Канал: {title or username}\n"
+            f"Постов в день: ~{stats['posts_per_day']:.1f}\n"
+            f"Среднее слов в посте: ~{round(stats['avg_words'])}\n"
+            f"Примеры постов:\n{sample}"
+        )
+        llm = await ai_assistant.ask(system_prompt, user_prompt, max_tokens=300)
+        if llm:
+            increment_ai_usage(user_id, _ai_today_key())
+            lines += ["", f"🤖 <i>{html.escape(llm)}</i>"]
+
+    await edit_or_answer(callback, "\n".join(lines), reply_markup=build_ai_back_keyboard(idx))
+
+
+@dp.callback_query(F.data.startswith("aisum_"))
+async def ai_summary(callback: CallbackQuery, state: FSMContext):
+    idx, username, title = await _resolve_ai_channel(callback, state, "aisum_")
+    if username is None:
+        return
+    user_id = callback.from_user.id
+
+    if not ai_assistant.is_enabled():
+        await callback.answer("🤖 ИИ не настроен (нет DEEPSEEK_API_KEY).", show_alert=True)
+        return
+    if _ai_limit_reached(user_id):
+        await callback.answer(f"Лимит ИИ на сегодня исчерпан ({AI_DAILY_LIMIT}).", show_alert=True)
+        return
+
+    await callback.answer("⏳ Готовлю саммари...")
+    since = serialize_datetime(utc_now() - timedelta(days=30))
+    rows = get_digest_posts(user_id, since, channel_username=username)
+    texts = [r["post_text"] for r in rows if r["post_text"]]
+
+    if not texts:
+        old_marker = serialize_datetime(utc_now() - timedelta(days=3650))
+        try:
+            async with create_telegram_http_session() as session:
+                live = await get_latest_posts(username, old_marker, session=session)
+            texts = [p["text"] for p in live if p.get("text")]
+        except ChannelFetchError:
+            texts = []
+
+    if not texts:
+        await edit_or_answer(
+            callback,
+            "Пока нет постов для саммари этого канала.",
+            reply_markup=build_ai_back_keyboard(idx),
+        )
+        return
+
+    context = "\n---\n".join(texts[:60])[:8000]
+    system_prompt = (
+        "Ты делаешь краткое саммари постов Telegram-канала на русском. Выдели 4-7 главных тем/новостей "
+        "маркированным списком, кратко и по делу, без вступлений."
+    )
+    llm = await ai_assistant.ask(system_prompt, f"Канал: {title or username}\nПосты:\n{context}", max_tokens=800)
+    if not llm:
+        await edit_or_answer(
+            callback,
+            "🤖 Не удалось получить ответ ИИ. Попробуй позже.",
+            reply_markup=build_ai_back_keyboard(idx),
+        )
+        return
+
+    increment_ai_usage(user_id, _ai_today_key())
+    await edit_or_answer(
+        callback,
+        f"📝 <b>Саммари: {html.escape(title or username)}</b>\n\n{html.escape(llm)}",
+        reply_markup=build_ai_back_keyboard(idx),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Экспорт / импорт данных (Feature 8)
+# ---------------------------------------------------------------------------
+
+
+async def _send_export(user_id: int):
+    data = export_user_data(user_id)
+    payload = {
+        "app": "unagi-reminder-bot",
+        "version": EXPORT_VERSION,
+        "exported_at": serialize_datetime(utc_now()),
+        **data,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    filename = f"unagi_export_{user_id}_{local_now().strftime('%Y%m%d_%H%M')}.json"
+    caption = (
+        "📤 <b>Экспорт данных Unagi</b>\n"
+        f"• Подписки: {len(data['subscriptions'])}\n"
+        f"• Закладки: {len(data['bookmarks'])}\n"
+        f"• Напоминания: {len(data['reminders'])}\n\n"
+        "Чтобы восстановить — отправь команду /import и пришли этот файл."
+    )
+    await bot.send_document(
+        user_id,
+        BufferedInputFile(raw, filename=filename),
+        caption=caption,
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("export"))
+async def cmd_export(message: types.Message, state: FSMContext):
+    await state.clear()
+    await _send_export(message.chat.id)
+
+
+@dp.callback_query(F.data == "data_export")
+async def cb_export(callback: CallbackQuery):
+    await callback.answer("📤 Готовлю файл...")
+    await _send_export(callback.from_user.id)
+
+
+async def _prompt_import(user_id: int, state: FSMContext):
+    await state.set_state(ImportState.waiting_for_file)
+    await bot.send_message(
+        user_id,
+        "📥 Пришли JSON-файл, который ты ранее получил через /export.\n\n"
+        "Я добавлю подписки, закладки и будущие напоминания к текущим "
+        "(дубликаты подписок пропущу).",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="import_cancel")]]
+        ),
+    )
+
+
+@dp.message(Command("import"))
+async def cmd_import(message: types.Message, state: FSMContext):
+    await state.clear()
+    await _prompt_import(message.chat.id, state)
+
+
+@dp.callback_query(F.data == "data_import")
+async def cb_import(callback: CallbackQuery, state: FSMContext):
+    await _prompt_import(callback.from_user.id, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "import_cancel")
+async def cb_import_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await edit_or_answer(callback, "Импорт отменён.")
+    await callback.answer()
+
+
+def _import_user_payload(user_id: int, payload) -> str:
+    if not isinstance(payload, dict):
+        return "❌ Неверный формат файла."
+
+    subscriptions = payload.get("subscriptions") or []
+    bookmarks = payload.get("bookmarks") or []
+    reminders = payload.get("reminders") or []
+    digest_settings = payload.get("digest_settings") or []
+    now = local_now()
+    added_subs = added_bms = added_rems = 0
+
+    for setting in digest_settings[:10]:
+        period = setting.get("period")
+        if period not in ("daily", "weekly", "monthly"):
+            continue
+        try:
+            upsert_digest_settings(
+                user_id,
+                period,
+                send_hour=setting.get("send_hour"),
+                send_minute=setting.get("send_minute"),
+                weekday=setting.get("weekday"),
+                month_day=setting.get("month_day"),
+                monthly_mode=setting.get("monthly_mode"),
+            )
+        except Exception:
+            logger.exception("Import: failed to apply digest setting")
+
+    for sub in subscriptions[:MAX_IMPORT_SUBSCRIPTIONS]:
+        username = normalize_channel_username(sub.get("channel_username") or "")
+        if not username:
+            continue
+        period = sub.get("period") if sub.get("period") in ("daily", "weekly", "monthly") else "daily"
+        settings = resolve_digest_settings(user_id, period, now)
+        next_send = serialize_datetime(get_next_digest_time(period, now, settings))
+        try:
+            sub_id = add_subscription(
+                user_id,
+                username,
+                sub.get("channel_title") or username,
+                period,
+                serialize_datetime(utc_now()),
+                next_send,
+                tag=sub.get("tag"),
+            )
+            if sub.get("is_paused"):
+                set_subscription_paused(user_id, sub_id, True)
+            added_subs += 1
+        except Exception:
+            logger.exception("Import: failed to add subscription")
+
+    for bookmark in bookmarks[:MAX_IMPORT_BOOKMARKS]:
+        text = bookmark.get("full_text")
+        if not text:
+            continue
+        try:
+            add_saved_message(
+                user_id,
+                text,
+                bookmark.get("source_name") or "Импорт",
+                bookmark.get("tag") or "Импорт",
+                bookmark.get("saved_at") or serialize_datetime(utc_now()),
+            )
+            added_bms += 1
+        except Exception:
+            logger.exception("Import: failed to add bookmark")
+
+    for reminder in reminders[:MAX_IMPORT_REMINDERS]:
+        send_at = reminder.get("send_at")
+        if not send_at:
+            continue
+        try:
+            if parse_db_datetime(send_at) <= utc_now():
+                continue  # пропускаем напоминания из прошлого
+            add_message(
+                user_id,
+                None,
+                send_at,
+                reminder.get("text_preview") or "",
+                reminder.get("source_name") or "Импорт",
+            )
+            added_rems += 1
+        except Exception:
+            logger.exception("Import: failed to add reminder")
+
+    return (
+        "✅ <b>Импорт завершён</b>\n"
+        f"• Подписки: +{added_subs}\n"
+        f"• Закладки: +{added_bms}\n"
+        f"• Напоминания: +{added_rems}\n\n"
+        "Открой /list_digest, /saved или /list, чтобы проверить."
+    )
+
+
+@dp.message(ImportState.waiting_for_file, F.document)
+async def process_import_file(message: types.Message, state: FSMContext):
+    document = message.document
+    filename = (document.file_name or "").lower()
+    is_jsonish = filename.endswith(".json") or document.mime_type in (
+        "application/json",
+        "text/json",
+        "text/plain",
+    )
+    if not is_jsonish:
+        await message.answer("❌ Это не похоже на JSON-файл. Пришли .json из /export или нажми «Отмена».")
+        return
+    if document.file_size and document.file_size > MAX_IMPORT_FILE_BYTES:
+        await message.answer("❌ Файл слишком большой.")
+        return
+
+    await state.set_state(None)
+    buffer = io.BytesIO()
+    try:
+        await bot.download(document, destination=buffer)
+        payload = json.loads(buffer.getvalue().decode("utf-8"))
+    except Exception:
+        logger.exception("Import: failed to read file")
+        await message.answer("❌ Не удалось прочитать файл как JSON. Проверь, что это экспорт из /export.")
+        return
+
+    report = _import_user_payload(message.chat.id, payload)
+    await message.answer(report, parse_mode="HTML")
+
+
+@dp.message(ImportState.waiting_for_file)
+async def import_wrong_type(message: types.Message):
+    await message.answer("📎 Пришли именно файл .json (как документ), либо нажми «Отмена».")
 
 
 async def render_kb_tags_screen(chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext):
@@ -2416,21 +3310,20 @@ async def process_tag(message: types.Message, state: FSMContext):
 async def cmd_test_digest(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.chat.id
-    user_subs = get_user_subscriptions(user_id)
+    user_subs = [sub for sub in get_user_subscriptions(user_id) if not sub[5]]
 
     if not user_subs:
-        await message.answer("📭 У тебя нет активных подписок для парсинга.")
+        await message.answer("📭 У тебя нет активных подписок для парсинга (учитываются только не на паузе).")
         return
 
     await message.answer("⏳ Собираю единый дайджест за последние 24 часа...")
     now_tz = local_now()
     last_24h_str = serialize_datetime(now_tz - timedelta(days=1))
-    has_news = False
     semaphore = asyncio.Semaphore(DIGEST_FETCH_CONCURRENCY)
 
     async with create_telegram_http_session() as session:
         async def load_posts(subscription) -> tuple[int, str, str | None, str, list[dict]]:
-            sub_id, username, title, period, _ = subscription
+            sub_id, username, title, period = subscription[0], subscription[1], subscription[2], subscription[3]
             async with semaphore:
                 return sub_id, period, title, username, await get_latest_posts(username, last_24h_str, session=session)
 
@@ -2439,6 +3332,7 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
             return_exceptions=True,
         )
 
+    sections: list[dict] = []
     for result in results:
         if isinstance(result, BaseException):
             logger.error(
@@ -2447,25 +3341,19 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
             )
             continue
 
-        sub_id, period, title, _, posts = result
+        sub_id, period, title, username, posts = result
         if posts:
-            has_news = True
+            sections.append({"sub_id": sub_id, "period": period, "title": title or "Канал", "posts": posts})
+            try:
+                add_digest_posts(user_id, username, title, posts)
+            except Exception:
+                logger.exception("Не удалось сохранить посты в базу знаний (test_digest)")
 
-    if not has_news:
+    if not sections:
         await message.answer("📭 За последние 24 часа новых постов ни в одном из каналов не было.")
         return
 
-    digest_lines = ["📰 <b>Твоя тестовая утренняя газета</b> ☕️", ""]
-    for result in results:
-        if isinstance(result, BaseException):
-            continue
-        sub_id, period, title, _, posts = result
-        if posts:
-            append_digest_channel_lines(digest_lines, sub_id, period, title, posts)
-    digest_lines.append(
-        build_digest_action_link("⚙️ Настройки дайджеста", "ds")
-    )
-    await send_digest_chunks(user_id, digest_lines)
+    await deliver_digest(user_id, "Твоя тестовая утренняя газета", sections)
 
 
 @dp.message()
@@ -2535,7 +3423,7 @@ async def save_subscription(callback: CallbackQuery, state: FSMContext):
     settings = resolve_digest_settings(callback_message.chat.id, period, now)
     next_send = get_next_digest_time(period, now, settings)
     last_scraped = serialize_datetime(utc_now())
-    add_subscription(
+    sub_id = add_subscription(
         callback_message.chat.id,
         username,
         title,
@@ -2544,17 +3432,25 @@ async def save_subscription(callback: CallbackQuery, state: FSMContext):
         serialize_datetime(next_send),
     )
 
-    await callback.answer(
-        f"✅ Дайджест {title} оформлен!\nБудет приходить {format_digest_schedule(period, settings)}.",
-        show_alert=True,
-    )
+    await callback.answer("✅ Подписка оформлена!")
 
     try:
         if callback_message.reply_to_message:
             await bot.delete_message(callback_message.chat.id, callback_message.reply_to_message.message_id)
-        await callback_message.delete()
     except TelegramAPIError:
         pass
+
+    title_safe = html.escape(title) if title else "Канал"
+    confirmation = (
+        f"✅ <b>Дайджест оформлен:</b> {title_safe}\n"
+        f"Будет приходить {format_digest_schedule(period, settings)}.\n\n"
+        f"Можно сразу изменить периодичность или время:"
+    )
+    keyboard = build_post_subscribe_keyboard(sub_id, period)
+    try:
+        await callback_message.edit_text(confirmation, parse_mode="HTML", reply_markup=keyboard)
+    except TelegramAPIError:
+        await callback_message.answer(confirmation, parse_mode="HTML", reply_markup=keyboard)
 
     await state.clear()
 
@@ -2863,7 +3759,7 @@ async def check_digests():
                     users_subs.setdefault(sub[1], []).append(sub)
 
                 for user_id, subs in users_subs.items():
-                    digest_lines = ["📰 <b>Твоя утренняя газета</b> ☕️", ""]
+                    sections: list[dict] = []
                     has_news = False
                     user_has_temporary_failures = False
                     successful_subscriptions = []
@@ -2882,18 +3778,27 @@ async def check_digests():
                         successful_subscriptions.append((result["sub_id"], result["next_send_str"]))
                         if result["posts"]:
                             has_news = True
-                            append_digest_channel_lines(
-                                digest_lines,
-                                result["sub_id"],
-                                result["period"],
-                                result["title"],
-                                result["posts"],
+                            sections.append(
+                                {
+                                    "sub_id": result["sub_id"],
+                                    "period": result["period"],
+                                    "title": result["title"] or "Канал",
+                                    "posts": result["posts"],
+                                }
                             )
+                            try:
+                                add_digest_posts(
+                                    user_id,
+                                    result["username"],
+                                    result["title"],
+                                    result["posts"],
+                                )
+                            except Exception:
+                                logger.exception("Не удалось сохранить посты в базу знаний")
 
                     if has_news:
                         try:
-                            digest_lines.append(build_digest_action_link("⚙️ Настройки дайджеста", "ds"))
-                            await send_digest_chunks(user_id, digest_lines)
+                            await deliver_digest(user_id, "Твоя утренняя газета", sections)
                             for sub_id, next_send_str in successful_subscriptions:
                                 update_subscription_time(sub_id, now_str, next_send_str)
                         except TelegramAPIError as exc:
