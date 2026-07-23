@@ -19,3 +19,4 @@ python-dotenv==1.2.2
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 yarl==1.23.0
+Telethon==1.44.0

@@ -43,6 +43,7 @@ from data.database import (
     get_digest_posts,
     get_digest_settings,
     delete_subscription,
+    get_channel_posts_since,
     get_due_subscriptions,
     get_pending_messages,
     get_saved_message_by_id,
@@ -68,11 +69,14 @@ from data.database import (
     unsubscribe_all,
     update_subscriptions_next_send_at,
     update_subscription_time,
+    update_subscription_schedule,
+    upsert_channel_posts,
     upsert_digest_settings,
     utc_now,
     update_saved_message_tag,
 )
-from scraper import ChannelFetchError, REQUEST_TIMEOUT, get_latest_posts
+from scraper import ChannelFetchError, REQUEST_TIMEOUT
+from channel_source import HybridChannelSource
 import ai_assistant
 from telegraph_publisher import publish_digest
 
@@ -83,6 +87,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY") or os.getenv("PROXY_URL")
+channel_source = HybridChannelSource()
 
 if not BOT_TOKEN:
     raise ValueError("❌ Токен бота не найден! Проверьте файл .env")
@@ -118,6 +123,20 @@ def create_telegram_http_session() -> aiohttp.ClientSession:
             connector=ProxyConnector.from_url(TELEGRAM_PROXY),
         )
     return aiohttp.ClientSession(timeout=REQUEST_TIMEOUT)
+
+
+async def fetch_channel_posts(
+    channel_username: str,
+    last_scraped_at: str | None,
+    session: aiohttp.ClientSession,
+) -> list[dict]:
+    posts, source_name = await channel_source.fetch(
+        channel_username,
+        last_scraped_at,
+        web_session=session,
+    )
+    upsert_channel_posts(channel_username, posts, source_name)
+    return posts
 
 _QUICK_RESCHEDULE_ACTION: dict[str, str] = {
     "morning": "morning",
@@ -194,12 +213,29 @@ def resolve_digest_settings(user_id: int, period: str, now: datetime | None = No
     stored = get_digest_settings(user_id).get(period)
     if stored is None:
         return defaults
+    try:
+        send_hour = min(max(int(stored["send_hour"]), 0), 23)
+    except (TypeError, ValueError):
+        send_hour = int(defaults["send_hour"])
+    try:
+        send_minute = min(max(int(stored["send_minute"]), 0), 59)
+    except (TypeError, ValueError):
+        send_minute = int(defaults["send_minute"])
+    try:
+        weekday = min(max(int(stored["weekday"]), 0), 6)
+    except (TypeError, ValueError):
+        weekday = int(defaults["weekday"])
+    try:
+        month_day = min(max(int(stored["month_day"]), 1), 31)
+    except (TypeError, ValueError):
+        month_day = int(defaults["month_day"])
+    monthly_mode = stored["monthly_mode"] if stored["monthly_mode"] in {"date", "weekday"} else defaults["monthly_mode"]
     return {
-        "send_hour": stored["send_hour"] if stored["send_hour"] is not None else defaults["send_hour"],
-        "send_minute": stored["send_minute"] if stored["send_minute"] is not None else defaults["send_minute"],
-        "weekday": stored["weekday"] if stored["weekday"] is not None else defaults["weekday"],
-        "month_day": stored["month_day"] if stored["month_day"] is not None else defaults["month_day"],
-        "monthly_mode": stored["monthly_mode"] if stored["monthly_mode"] else defaults["monthly_mode"],
+        "send_hour": send_hour,
+        "send_minute": send_minute,
+        "weekday": weekday,
+        "month_day": month_day,
+        "monthly_mode": monthly_mode,
     }
 
 
@@ -888,15 +924,40 @@ async def fetch_subscription_posts(
     session: aiohttp.ClientSession,
     semaphore: asyncio.Semaphore,
     now_str: str,
+    prefetched_channels: dict[str, dict] | None = None,
 ):
-    sub_id, user_id, username, title, period, last_scraped, failure_count = sub
+    sub_id, user_id, username, title, period, last_scraped, failure_count, last_post_id = sub
     title_safe = html.escape(title) if title else "Канал"
-    settings = resolve_digest_settings(user_id, period)
-    next_send_str = serialize_datetime(get_next_digest_time(period, local_now(), settings))
 
     async with semaphore:
         try:
-            posts = await get_latest_posts(username, last_scraped, session=session)
+            settings = resolve_digest_settings(user_id, period)
+            next_send_str = serialize_datetime(get_next_digest_time(period, local_now(), settings))
+            prefetched = (prefetched_channels or {}).get(normalize_channel_username(username))
+            if prefetched is not None:
+                if prefetched.get("error") is not None:
+                    raise prefetched["error"]
+                fetched_posts = prefetched["posts"]
+                source_name = prefetched["source"]
+            else:
+                fetched_posts, source_name = await channel_source.fetch(
+                    username,
+                    last_scraped,
+                    web_session=session,
+                )
+                upsert_channel_posts(username, fetched_posts, source_name)
+            posts = get_channel_posts_since(username, last_scraped, last_post_id)
+            if fetched_posts and not posts:
+                # Compatibility for a malformed legacy link without a numeric post id.
+                posts = fetched_posts
+            delivered_marker = max(
+                (post["time"] for post in posts),
+                default=parse_db_datetime(last_scraped),
+            )
+            delivered_post_id = max(
+                (post["id"] for post in posts if post.get("id") is not None),
+                default=last_post_id,
+            )
             return {
                 "status": "ok",
                 "sub_id": sub_id,
@@ -906,10 +967,13 @@ async def fetch_subscription_posts(
                 "title_safe": title_safe,
                 "posts": posts,
                 "next_send_str": next_send_str,
+                "last_scraped_str": serialize_datetime(delivered_marker),
+                "last_post_id": delivered_post_id,
+                "source": source_name,
             }
         except ChannelFetchError as exc:
             new_failure_count = failure_count + 1
-            is_permanent = exc.permanent or new_failure_count >= MAX_DIGEST_RETRIES
+            is_permanent = exc.permanent
             mark_subscription_delivery_error(
                 sub_id,
                 str(exc),
@@ -931,6 +995,64 @@ async def fetch_subscription_posts(
                 "sub_id": sub_id,
                 "is_permanent": is_permanent,
             }
+        except Exception as exc:
+            new_failure_count = failure_count + 1
+            mark_subscription_delivery_error(
+                sub_id,
+                f"Внутренняя ошибка чтения: {exc}",
+                now_str,
+                new_failure_count,
+                False,
+            )
+            logger.exception(
+                "Неожиданная ошибка подписки %s (@%s); остальные дайджесты продолжат работу",
+                sub_id,
+                username,
+            )
+            return {
+                "status": "error",
+                "sub_id": sub_id,
+                "is_permanent": False,
+            }
+
+
+async def prefetch_due_channels(
+    due_subs: list,
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore,
+) -> dict[str, dict]:
+    oldest_markers: dict[str, str | None] = {}
+    for sub in due_subs:
+        username = normalize_channel_username(sub[2])
+        marker = sub[5]
+        current = oldest_markers.get(username)
+        if current is None or parse_db_datetime(marker) < parse_db_datetime(current):
+            oldest_markers[username] = marker
+
+    async def load(username: str, marker: str | None) -> tuple[str, dict]:
+        async with semaphore:
+            try:
+                posts, source_name = await channel_source.fetch(
+                    username,
+                    marker,
+                    web_session=session,
+                )
+                upsert_channel_posts(username, posts, source_name)
+                return username, {"posts": posts, "source": source_name, "error": None}
+            except ChannelFetchError as exc:
+                return username, {"posts": [], "source": None, "error": exc}
+            except Exception as exc:
+                logger.exception("Неожиданная ошибка общего ingestion канала @%s", username)
+                return username, {
+                    "posts": [],
+                    "source": None,
+                    "error": ChannelFetchError(f"Внутренняя ошибка ingestion @{username}: {exc}"),
+                }
+
+    results = await asyncio.gather(
+        *(load(username, marker) for username, marker in oldest_markers.items())
+    )
+    return dict(results)
 
 
 async def handle_digest_deep_link(message: types.Message, payload: str) -> bool:
@@ -2116,7 +2238,7 @@ async def cmd_check(message: types.Message, state: FSMContext):
             sub_id, username, title = sub[0], sub[1], sub[2]
             async with semaphore:
                 try:
-                    await get_latest_posts(username, old_marker, session=session)
+                    await fetch_channel_posts(username, old_marker, session)
                     return sub_id, username, title, True, None
                 except ChannelFetchError as exc:
                     return sub_id, username, title, False, str(exc)
@@ -2280,7 +2402,7 @@ async def ai_adjust_digest(callback: CallbackQuery, state: FSMContext):
     old_marker = serialize_datetime(utc_now() - timedelta(days=3650))
     try:
         async with create_telegram_http_session() as session:
-            posts = await get_latest_posts(username, old_marker, session=session)
+            posts = await fetch_channel_posts(username, old_marker, session)
     except ChannelFetchError as exc:
         await edit_or_answer(
             callback,
@@ -2359,7 +2481,7 @@ async def ai_summary(callback: CallbackQuery, state: FSMContext):
         old_marker = serialize_datetime(utc_now() - timedelta(days=3650))
         try:
             async with create_telegram_http_session() as session:
-                live = await get_latest_posts(username, old_marker, session=session)
+                live = await fetch_channel_posts(username, old_marker, session)
             texts = [p["text"] for p in live if p.get("text")]
         except ChannelFetchError:
             texts = []
@@ -3325,7 +3447,7 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
         async def load_posts(subscription) -> tuple[int, str, str | None, str, list[dict]]:
             sub_id, username, title, period = subscription[0], subscription[1], subscription[2], subscription[3]
             async with semaphore:
-                return sub_id, period, title, username, await get_latest_posts(username, last_24h_str, session=session)
+                return sub_id, period, title, username, await fetch_channel_posts(username, last_24h_str, session)
 
         results: list[tuple[int, str, str | None, str, list[dict]] | BaseException] = await asyncio.gather(
             *(load_posts(sub) for sub in user_subs),
@@ -3738,103 +3860,143 @@ async def check_messages():
         await asyncio.sleep(30)
 
 
+async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore) -> None:
+    now_str = serialize_datetime(utc_now())
+    due_subs = get_due_subscriptions(now_str)
+    if not due_subs:
+        logger.debug(
+            "⏭ Нет дайджестов для отправки. Следующая проверка через %d мин",
+            DIGEST_CHECK_INTERVAL_SECONDS // 60,
+        )
+        return
+
+    logger.info("🔄 Начинаю проверку %s дайджестов (next_send_at <= %s)", len(due_subs), now_str)
+    prefetched_channels = await prefetch_due_channels(due_subs, session, semaphore)
+    users_subs: dict[int, list] = {}
+    for sub in due_subs:
+        users_subs.setdefault(sub[1], []).append(sub)
+
+    for user_id, subs in users_subs.items():
+        try:
+            sections: list[dict] = []
+            user_has_temporary_failures = False
+            successful_subscriptions: list[dict] = []
+
+            results = await asyncio.gather(
+                *(
+                    fetch_subscription_posts(
+                        sub,
+                        session,
+                        semaphore,
+                        now_str,
+                        prefetched_channels,
+                    )
+                    for sub in subs
+                ),
+                return_exceptions=True,
+            )
+
+            for result in results:
+                if isinstance(result, BaseException):
+                    user_has_temporary_failures = True
+                    logger.error(
+                        "Изолирована необработанная ошибка чтения для пользователя %s",
+                        user_id,
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
+                    continue
+                if result["status"] == "error":
+                    if not result["is_permanent"]:
+                        user_has_temporary_failures = True
+                    continue
+
+                successful_subscriptions.append(result)
+                if result["posts"]:
+                    sections.append(
+                        {
+                            "sub_id": result["sub_id"],
+                            "period": result["period"],
+                            "title": result["title"] or "Канал",
+                            "posts": result["posts"],
+                        }
+                    )
+                    try:
+                        add_digest_posts(
+                            user_id,
+                            result["username"],
+                            result["title"],
+                            result["posts"],
+                        )
+                    except Exception:
+                        logger.exception("Не удалось сохранить посты в базу знаний")
+
+            if sections:
+                try:
+                    await deliver_digest(user_id, "Твоя утренняя газета", sections)
+                    for result in successful_subscriptions:
+                        if result["posts"]:
+                            update_subscription_time(
+                                result["sub_id"],
+                                result["last_scraped_str"],
+                                result["next_send_str"],
+                                result["last_post_id"],
+                            )
+                        else:
+                            update_subscription_schedule(
+                                result["sub_id"],
+                                result["next_send_str"],
+                                now_str,
+                            )
+                except TelegramAPIError as exc:
+                    is_permanent, error_text = classify_telegram_send_error(exc)
+                    for result in successful_subscriptions:
+                        original = next((item for item in subs if item[0] == result["sub_id"]), None)
+                        failure_count = original[6] if original else 0
+                        new_failure_count = failure_count + 1
+                        mark_subscription_delivery_error(
+                            result["sub_id"],
+                            error_text,
+                            now_str,
+                            new_failure_count,
+                            is_permanent or new_failure_count >= MAX_DIGEST_RETRIES,
+                        )
+                    logger.exception("Не удалось отправить дайджест пользователю %s", user_id)
+            else:
+                for result in successful_subscriptions:
+                    update_subscription_schedule(
+                        result["sub_id"],
+                        result["next_send_str"],
+                        now_str,
+                    )
+
+            if user_has_temporary_failures:
+                logger.info(
+                    "Для пользователя %s чтение части каналов будет повторено позже.",
+                    user_id,
+                )
+        except Exception:
+            logger.exception(
+                "Изолирована ошибка обработки дайджеста пользователя %s; продолжаю со следующим пользователем",
+                user_id,
+            )
+
+
 async def check_digests():
     semaphore = asyncio.Semaphore(DIGEST_FETCH_CONCURRENCY)
-    logger.info("📬 Сервис дайджестов запущен (проверка каждые %d сек / %d мин)", 
-                DIGEST_CHECK_INTERVAL_SECONDS, DIGEST_CHECK_INTERVAL_SECONDS // 60)
+    logger.info(
+        "📬 Сервис дайджестов запущен (проверка каждые %d сек / %d мин)",
+        DIGEST_CHECK_INTERVAL_SECONDS,
+        DIGEST_CHECK_INTERVAL_SECONDS // 60,
+    )
 
     async with create_telegram_http_session() as session:
         while True:
-            now_str = serialize_datetime(utc_now())
-            due_subs = get_due_subscriptions(now_str)
-            
-            if not due_subs:
-                logger.debug("⏭ Нет дайджестов для отправки. Следующая проверка через %d мин", 
-                             DIGEST_CHECK_INTERVAL_SECONDS // 60)
-            else:
-                logger.info("🔄 Начинаю проверку %s дайджестов (next_send_at <= %s)", len(due_subs), now_str)
-
-                users_subs = {}
-                for sub in due_subs:
-                    users_subs.setdefault(sub[1], []).append(sub)
-
-                for user_id, subs in users_subs.items():
-                    sections: list[dict] = []
-                    has_news = False
-                    user_has_temporary_failures = False
-                    successful_subscriptions = []
-
-                    results = await asyncio.gather(
-                        *(fetch_subscription_posts(sub, session, semaphore, now_str) for sub in subs),
-                        return_exceptions=False,
-                    )
-
-                    for result in results:
-                        if result["status"] == "error":
-                            if not result["is_permanent"]:
-                                user_has_temporary_failures = True
-                            continue
-
-                        successful_subscriptions.append((result["sub_id"], result["next_send_str"]))
-                        if result["posts"]:
-                            has_news = True
-                            sections.append(
-                                {
-                                    "sub_id": result["sub_id"],
-                                    "period": result["period"],
-                                    "title": result["title"] or "Канал",
-                                    "posts": result["posts"],
-                                }
-                            )
-                            try:
-                                add_digest_posts(
-                                    user_id,
-                                    result["username"],
-                                    result["title"],
-                                    result["posts"],
-                                )
-                            except Exception:
-                                logger.exception("Не удалось сохранить посты в базу знаний")
-
-                    if has_news:
-                        try:
-                            await deliver_digest(user_id, "Твоя утренняя газета", sections)
-                            for sub_id, next_send_str in successful_subscriptions:
-                                update_subscription_time(sub_id, now_str, next_send_str)
-                        except TelegramAPIError as exc:
-                            is_permanent, error_text = classify_telegram_send_error(exc)
-                            for sub_id, _ in successful_subscriptions:
-                                original = next((item for item in subs if item[0] == sub_id), None)
-                                failure_count = original[6] if original else 0
-                                new_failure_count = failure_count + 1
-                                mark_subscription_delivery_error(
-                                    sub_id,
-                                    error_text,
-                                    now_str,
-                                    new_failure_count,
-                                    is_permanent or new_failure_count >= MAX_DIGEST_RETRIES,
-                                )
-                            retries_exhausted = any(
-                                (next((item[6] for item in subs if item[0] == sub_id), 0) + 1) >= MAX_DIGEST_RETRIES
-                                for sub_id, _ in successful_subscriptions
-                            )
-                            logger.log(
-                                logging.ERROR if (is_permanent or retries_exhausted) else logging.WARNING,
-                                "Не удалось отправить дайджест пользователю %s. Статус: %s. Ошибка: %s",
-                                user_id,
-                                "permanent" if (is_permanent or retries_exhausted) else "temporary",
-                                error_text,
-                            )
-                    else:
-                        for sub_id, next_send_str in successful_subscriptions:
-                            update_subscription_time(sub_id, now_str, next_send_str)
-
-                    if user_has_temporary_failures:
-                        logger.info(
-                            "Для пользователя %s дайджест будет частично повторён позже из-за временных ошибок чтения каналов.",
-                            user_id,
-                        )
-
+            try:
+                await run_digest_cycle(session, semaphore)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Цикл дайджестов упал, но будет автоматически перезапущен")
             await asyncio.sleep(DIGEST_CHECK_INTERVAL_SECONDS)
 
 
@@ -3860,16 +4022,25 @@ async def main():
         me = await bot.get_me()
         BOT_USERNAME = (me.username or "").lstrip("@")
     await bot.delete_webhook(drop_pending_updates=True)
-    asyncio.create_task(check_messages())
-    asyncio.create_task(check_digests())
-    asyncio.create_task(cleanup_database())
+    await channel_source.start()
+    background_tasks = [
+        asyncio.create_task(check_messages(), name="reminder-scheduler"),
+        asyncio.create_task(check_digests(), name="digest-scheduler"),
+        asyncio.create_task(cleanup_database(), name="database-cleanup"),
+    ]
     logger.info("✅ Бот успешно запущен")
     logger.info("📋 Фоновые процессы:")
     logger.info("  • Напоминания: проверка каждые 30 сек")
     logger.info("  • Дайджесты: проверка каждые %d мин (оптимизировано с 1 мин)", DIGEST_CHECK_INTERVAL_SECONDS // 60)
     logger.info("  • Очистка БД: раз в %d часов", CLEANUP_INTERVAL_SECONDS // 3600)
     logger.info("🚀 Ожидаю входящих сообщений...")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        for task in background_tasks:
+            task.cancel()
+        await asyncio.gather(*background_tasks, return_exceptions=True)
+        await channel_source.close()
 
 
 if __name__ == "__main__":

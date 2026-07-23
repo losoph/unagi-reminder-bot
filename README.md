@@ -49,6 +49,23 @@ python main.py
 - `DEEPSEEK_MODEL` - модель DeepSeek (по умолчанию `deepseek-chat`)
 - `AI_DAILY_LIMIT` - лимит ИИ-запросов в сутки на пользователя (0 = без лимита)
 - `MAX_IMPORT_SUBSCRIPTIONS` / `MAX_IMPORT_BOOKMARKS` / `MAX_IMPORT_REMINDERS` / `MAX_IMPORT_FILE_BYTES` - лимиты импорта JSON
+- `CHANNEL_SOURCE` - источник контента: `auto` (по умолчанию), `mtproto` или `web`
+- `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` / `TELEGRAM_USER_SESSION` - реквизиты пользовательской MTProto-сессии; при их наличии каналы читаются нативно
+- `MTPROTO_WEB_FALLBACK` - разрешить fallback на веб-просмотр при ошибке MTProto
+- `MTPROTO_FETCH_LIMIT` - защитный лимит сообщений за одну синхронизацию канала
+
+Контент каждого канала загружается один раз за цикл и сохраняется в общей таблице
+`channel_posts`. Пользовательские курсоры двигаются только после успешной отправки
+дайджеста. Bot API по-прежнему используется только для интерфейса и доставки.
+
+Строку пользовательской session создавайте только в доверенном терминале:
+
+```bash
+python scripts/generate_mtproto_session.py
+```
+
+Полученное значение является секретом уровня аккаунта и должно храниться как
+`TELEGRAM_USER_SESSION`, а не в репозитории.
 
 ## Перспективные доработки
 
@@ -84,4 +101,3 @@ docker compose up --build -d
 ```
 
 В контейнере база по умолчанию хранится в `/app/storage/bot_data.db`, это значение уже задано в `.env.example`.
-

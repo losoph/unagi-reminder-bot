@@ -5,7 +5,18 @@ on:
     branches: [ "main" ]
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Build production image
+        run: docker build -t unagi-reminder-bot:test .
+      - name: Run digest regression tests
+        run: docker run --rm unagi-reminder-bot:test python -m unittest discover -s tests -v
+
   deploy:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Deploy via SSH
