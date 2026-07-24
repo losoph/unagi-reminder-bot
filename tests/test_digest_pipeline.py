@@ -124,6 +124,27 @@ class DigestCursorTests(unittest.TestCase):
         self.assertIsNotNone(sub)
         self.assertEqual(sub["digest_status"], "active")
 
+    def test_due_batch_limit_processes_oldest_first(self):
+        db = self.database
+        for username, next_send_at in (
+            ("newest", "2026-07-24 09:00:00"),
+            ("oldest", "2026-07-24 07:00:00"),
+            ("middle", "2026-07-24 08:00:00"),
+        ):
+            db.add_subscription(
+                100,
+                username,
+                username,
+                "daily",
+                "2026-07-23 07:00:00",
+                next_send_at,
+            )
+
+        now = "2026-07-24 10:00:00"
+        due = db.get_due_subscriptions(now, limit=2)
+        self.assertEqual(db.count_due_subscriptions(now), 3)
+        self.assertEqual([row["channel_username"] for row in due], ["oldest", "middle"])
+
 
 class FakeMessageClient:
     def __init__(self, messages):

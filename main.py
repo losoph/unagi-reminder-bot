@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -34,6 +35,7 @@ from data.database import (
     add_subscription,
     cleanup_old_records,
     clear_subscription_failure,
+    count_due_subscriptions,
     count_user_subscriptions,
     delete_message,
     delete_saved_message,
@@ -99,6 +101,8 @@ TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Moscow"))
 MAX_MESSAGE_RETRIES = 5
 MAX_DIGEST_RETRIES = 5
 DIGEST_FETCH_CONCURRENCY = 5
+DIGEST_DUE_BATCH_SIZE = max(1, int(os.getenv("DIGEST_DUE_BATCH_SIZE", "100")))
+DIGEST_BACKLOG_RETRY_SECONDS = max(1, int(os.getenv("DIGEST_BACKLOG_RETRY_SECONDS", "5")))
 DIGEST_CHECK_INTERVAL_SECONDS = int(os.getenv("DIGEST_CHECK_INTERVAL_SECONDS", 30 * 60))  # Можно переопределить через .env
 CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 # Дайджесты с таким числом постов и более публикуются в Telegraph одной ссылкой.
@@ -3860,18 +3864,39 @@ async def check_messages():
         await asyncio.sleep(30)
 
 
-async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore) -> None:
+async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore) -> int:
+    cycle_started_at = time.monotonic()
     now_str = serialize_datetime(utc_now())
-    due_subs = get_due_subscriptions(now_str)
+    due_total = count_due_subscriptions(now_str)
+    due_subs = get_due_subscriptions(now_str, DIGEST_DUE_BATCH_SIZE)
     if not due_subs:
-        logger.debug(
-            "⏭ Нет дайджестов для отправки. Следующая проверка через %d мин",
+        logger.info(
+            "digest_cycle due_total=0 processed=0 channels=0 fetched_posts=0 "
+            "delivered_users=0 delivered_posts=0 failures=0 duration_ms=%d next_check_min=%d",
+            round((time.monotonic() - cycle_started_at) * 1000),
             DIGEST_CHECK_INTERVAL_SECONDS // 60,
         )
-        return
+        return 0
 
-    logger.info("🔄 Начинаю проверку %s дайджестов (next_send_at <= %s)", len(due_subs), now_str)
+    logger.info(
+        "🔄 Начинаю проверку %s/%s due-дайджестов (batch_limit=%s, next_send_at <= %s)",
+        len(due_subs),
+        due_total,
+        DIGEST_DUE_BATCH_SIZE,
+        now_str,
+    )
     prefetched_channels = await prefetch_due_channels(due_subs, session, semaphore)
+    fetched_posts_count = sum(
+        len(result["posts"])
+        for result in prefetched_channels.values()
+        if result.get("error") is None
+    )
+    channel_failures_count = sum(
+        1 for result in prefetched_channels.values() if result.get("error") is not None
+    )
+    failures_count = 0
+    delivered_users_count = 0
+    delivered_posts_count = 0
     users_subs: dict[int, list] = {}
     for sub in due_subs:
         users_subs.setdefault(sub[1], []).append(sub)
@@ -3898,6 +3923,7 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
 
             for result in results:
                 if isinstance(result, BaseException):
+                    failures_count += 1
                     user_has_temporary_failures = True
                     logger.error(
                         "Изолирована необработанная ошибка чтения для пользователя %s",
@@ -3906,6 +3932,7 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
                     )
                     continue
                 if result["status"] == "error":
+                    failures_count += 1
                     if not result["is_permanent"]:
                         user_has_temporary_failures = True
                     continue
@@ -3933,6 +3960,8 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
             if sections:
                 try:
                     await deliver_digest(user_id, "Твоя утренняя газета", sections)
+                    delivered_users_count += 1
+                    delivered_posts_count += sum(len(section["posts"]) for section in sections)
                     for result in successful_subscriptions:
                         if result["posts"]:
                             update_subscription_time(
@@ -3948,6 +3977,7 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
                                 now_str,
                             )
                 except TelegramAPIError as exc:
+                    failures_count += len(successful_subscriptions)
                     is_permanent, error_text = classify_telegram_send_error(exc)
                     for result in successful_subscriptions:
                         original = next((item for item in subs if item[0] == result["sub_id"]), None)
@@ -3975,10 +4005,27 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
                     user_id,
                 )
         except Exception:
+            failures_count += len(subs)
             logger.exception(
                 "Изолирована ошибка обработки дайджеста пользователя %s; продолжаю со следующим пользователем",
                 user_id,
             )
+
+    logger.info(
+        "digest_cycle due_total=%s processed=%s backlog=%s channels=%s channel_failures=%s "
+        "fetched_posts=%s delivered_users=%s delivered_posts=%s subscription_failures=%s duration_ms=%s",
+        due_total,
+        len(due_subs),
+        max(due_total - len(due_subs), 0),
+        len(prefetched_channels),
+        channel_failures_count,
+        fetched_posts_count,
+        delivered_users_count,
+        delivered_posts_count,
+        failures_count,
+        round((time.monotonic() - cycle_started_at) * 1000),
+    )
+    return max(due_total - len(due_subs), 0)
 
 
 async def check_digests():
@@ -3992,12 +4039,15 @@ async def check_digests():
     async with create_telegram_http_session() as session:
         while True:
             try:
-                await run_digest_cycle(session, semaphore)
+                backlog = await run_digest_cycle(session, semaphore)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Цикл дайджестов упал, но будет автоматически перезапущен")
-            await asyncio.sleep(DIGEST_CHECK_INTERVAL_SECONDS)
+                backlog = 0
+            await asyncio.sleep(
+                DIGEST_BACKLOG_RETRY_SECONDS if backlog else DIGEST_CHECK_INTERVAL_SECONDS
+            )
 
 
 async def cleanup_database():

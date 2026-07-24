@@ -618,7 +618,21 @@ def add_subscription(user_id, channel_username, channel_title, period, last_scra
     return sub_id
 
 
-def get_due_subscriptions(current_time_str):
+def count_due_subscriptions(current_time_str) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT COUNT(*)
+            FROM subscriptions
+            WHERE next_send_at <= ? AND is_disabled = 0 AND is_paused = 0
+            ''',
+            (current_time_str,),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def get_due_subscriptions(current_time_str, limit: int | None = None):
+    limit = max(1, int(limit)) if limit is not None else -1
     with get_connection() as conn:
         rows = conn.execute(
             '''
@@ -626,8 +640,10 @@ def get_due_subscriptions(current_time_str):
                    last_post_id
             FROM subscriptions
             WHERE next_send_at <= ? AND is_disabled = 0 AND is_paused = 0
+            ORDER BY next_send_at, id
+            LIMIT ?
             ''',
-            (current_time_str,),
+            (current_time_str, limit),
         ).fetchall()
     return rows
 
