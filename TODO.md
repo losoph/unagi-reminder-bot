@@ -7,6 +7,103 @@
 ## Next
 
 - Добавить ручной maintenance-режим или админ-команду для `VACUUM` и сопутствующего обслуживания SQLite, но не запускать это в фоне, чтобы не тратить лишние CPU и диск на бесплатном плане Railway.
+- Подключить MTProto ingestion после того, как Telegram позволит создать API-приложение. До этого бот продолжает работать через защищённый Telegram Web fallback.
+
+### Отложенное подключение MTProto
+
+MTProto нужен только для более надёжного нативного чтения истории публичных
+каналов. Bot API не умеет получать историю произвольного канала. Без MTProto бот
+остаётся работоспособным: `CHANNEL_SOURCE=auto` автоматически использует
+Telegram Web, если MTProto-секреты не заданы.
+
+#### 1. Создать Telegram API-приложение
+
+1. Войти техническим сервисным аккаунтом на <https://my.telegram.org>.
+2. Открыть **API development tools**.
+3. Заполнить форму:
+   - **App title:** `Unagi Digest`;
+   - **Short name:** уникальное имя из 5–32 латинских букв и цифр, например
+     `unagidigest2607`;
+   - **URL:** `https://github.com/losoph/unagi-reminder-bot`;
+   - **Platform:** `Desktop`;
+   - **Description:** `Telegram client for collecting public channel posts and creating user digests`.
+4. Сохранить полученные `api_id` и `api_hash` в менеджере секретов. Не добавлять
+   их в Git и не присылать в чат или на скриншотах.
+
+Если форма показывает пустой `ERROR`: проверить полноценный `https://` URL,
+выбрать новое уникальное Short name, убрать нестандартные символы, попробовать
+приватное окно/другой IP и при необходимости повторить позже — Telegram может
+временно запрещать создание приложения без объяснения.
+
+#### 2. Один раз создать пользовательскую StringSession
+
+`api_id` и `api_hash` идентифицируют приложение, но сами по себе не авторизуют
+технический Telegram-аккаунт. `StringSession` — сохранённая авторизация этого
+аккаунта. Она позволяет серверу читать каналы после перезапуска без повторного
+ввода SMS-кода и 2FA.
+
+Session генерируется один раз в доверенном локальном терминале:
+
+```bash
+cd /Users/adm/Documents/unagi
+.venv/bin/python scripts/generate_mtproto_session.py
+```
+
+Здесь `.venv/bin/python` — путь к уже существующему Python-интерпретатору
+проекта, а `scripts/generate_mtproto_session.py` — запускаемый им скрипт.
+Команда не создаёт «пустой Python», новое окружение или новый Telegram-аккаунт.
+Скрипт попросит `api_id`, `api_hash`, номер технического аккаунта, одноразовый
+код Telegram и 2FA-пароль, а затем выведет `StringSession`.
+
+Если локального `.venv` ещё нет, сначала создать его и установить зависимости:
+
+```bash
+cd /Users/adm/Documents/unagi
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+Новую session нужно создавать только при отзыве/утере текущей session, смене
+технического аккаунта или принудительном завершении его Telegram-сессий.
+`StringSession` предоставляет доступ к аккаунту и является самым чувствительным
+из этих секретов.
+
+#### 3. Добавить секреты в `.env` production-сервера
+
+```bash
+ssh tender-ru
+cd ~/projects/unagi-reminder-bot
+nano .env
+```
+
+Добавить или обновить:
+
+```dotenv
+CHANNEL_SOURCE=auto
+TELEGRAM_API_ID=<api_id>
+TELEGRAM_API_HASH=<api_hash>
+TELEGRAM_USER_SESSION=<StringSession>
+MTPROTO_WEB_FALLBACK=true
+MTPROTO_FETCH_LIMIT=1000
+```
+
+Не использовать `echo ... >> .env` с секретами: они могут попасть в shell
+history. `.env` уже исключён из Git и не должен публиковаться в GitHub.
+
+#### 4. Перезапустить Docker и проверить MTProto
+
+```bash
+cd ~/projects/unagi-reminder-bot
+docker compose up -d --force-recreate bot
+docker compose ps
+docker compose logs --since 5m bot
+```
+
+В журнале должна появиться строка `Channel source: MTProto user ...`. Если
+авторизация не прошла, при `CHANNEL_SOURCE=auto` и
+`MTPROTO_WEB_FALLBACK=true` бот продолжит работать через Telegram Web.
+После проверки выполнить `/test_digest` в боте и убедиться, что в логах для
+каналов появляются строки `MTProto channel ... produced ... new posts`.
 
 ## Later
 
