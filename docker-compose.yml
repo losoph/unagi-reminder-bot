@@ -2,9 +2,21 @@ services:
   bot:
     build:
       context: .
+    container_name: unagi-bot
     restart: unless-stopped
     network_mode: host
     env_file:
       - .env
     volumes:
       - ./storage:/app/storage
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 1.5
+    # max-size/max-file: без лимита json-file-логи растут бесконечно и
+    # забивают диск (см. тот же паттерн в docker-compose.yml проекта tldw
+    # на этом сервере).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
