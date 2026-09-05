@@ -328,6 +328,19 @@ def init_db():
         )
         cursor.execute(
             '''
+            CREATE TABLE IF NOT EXISTS telegraph_digests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                title TEXT,
+                channel_count INTEGER,
+                post_count INTEGER,
+                created_at DATETIME NOT NULL
+            )
+            '''
+        )
+        cursor.execute(
+            '''
             CREATE TABLE IF NOT EXISTS digest_settings (
                 user_id INTEGER,
                 period TEXT,
@@ -391,6 +404,9 @@ def init_db():
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_channel_posts_channel_time ON channel_posts(channel_username, post_time)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_telegraph_digests_user_created ON telegraph_digests(user_id, created_at)"
         )
 
         _migrate_legacy_local_timestamps_to_utc(cursor)
@@ -994,6 +1010,19 @@ def add_digest_posts(user_id, channel_username, channel_title, posts):
             inserted += cursor.rowcount
         conn.commit()
     return inserted
+
+
+def add_telegraph_digest(user_id, url, title, channel_count, post_count):
+    """Record a published Telegraph digest link for later lookup/search."""
+    with get_connection() as conn:
+        conn.execute(
+            '''
+            INSERT INTO telegraph_digests (user_id, url, title, channel_count, post_count, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''',
+            (user_id, url, title, channel_count, post_count, serialize_datetime(utc_now())),
+        )
+        conn.commit()
 
 
 def get_digest_posts(user_id, since_str, channel_username=None):

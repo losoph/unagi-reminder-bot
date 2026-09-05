@@ -33,6 +33,7 @@ from data.database import (
     add_message,
     add_saved_message,
     add_subscription,
+    add_telegraph_digest,
     cleanup_old_records,
     clear_subscription_failure,
     count_due_subscriptions,
@@ -903,6 +904,7 @@ async def deliver_digest(user_id: int, title_plain: str, sections: list[dict]) -
     if total_posts >= DIGEST_TELEGRAPH_THRESHOLD:
         url = await publish_digest(title_plain, sections)
         if url:
+            add_telegraph_digest(user_id, url, title_plain, len(sections), total_posts)
             settings_link = build_digest_action_link("⚙️ Настройки дайджеста", "ds")
             text = (
                 f"📰 <b>{html.escape(title_plain)}</b> ☕️\n"
