@@ -238,6 +238,7 @@ def init_db():
             "ALTER TABLE scheduled_messages ADD COLUMN retry_count INTEGER DEFAULT 0",
             "ALTER TABLE scheduled_messages ADD COLUMN last_error TEXT",
             "ALTER TABLE scheduled_messages ADD COLUMN last_attempt_at DATETIME",
+            "ALTER TABLE scheduled_messages ADD COLUMN tag TEXT",
         ):
             try:
                 cursor.execute(statement)
@@ -448,17 +449,17 @@ def init_db():
         conn.commit()
 
 
-def add_message(user_id, message_id, send_at, text_preview="", source_name=""):
+def add_message(user_id, message_id, send_at, text_preview="", source_name="", tag=None):
     created_at = serialize_datetime(utc_now())
     with get_connection() as conn:
         conn.execute(
             '''
             INSERT INTO scheduled_messages (
-                user_id, message_id, send_at, created_at, text_preview, source_name, delivery_status
+                user_id, message_id, send_at, created_at, text_preview, source_name, tag, delivery_status
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
             ''',
-            (user_id, message_id, send_at, created_at, text_preview, source_name),
+            (user_id, message_id, send_at, created_at, text_preview, source_name, tag),
         )
         conn.commit()
 
@@ -513,7 +514,7 @@ def get_user_messages(user_id):
     with get_connection() as conn:
         rows = conn.execute(
             '''
-            SELECT id, send_at, text_preview, source_name
+            SELECT id, send_at, text_preview, source_name, tag, message_id
             FROM scheduled_messages
             WHERE user_id = ? AND is_sent = 0
             ORDER BY send_at
@@ -521,6 +522,43 @@ def get_user_messages(user_id):
             (user_id,),
         ).fetchall()
     return rows
+
+
+def get_reminder_by_id(user_id, msg_id):
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT id, send_at, text_preview, source_name, tag, message_id
+            FROM scheduled_messages
+            WHERE id = ? AND user_id = ? AND is_sent = 0
+            ''',
+            (msg_id, user_id),
+        ).fetchone()
+    return row
+
+
+def update_reminder_tag(user_id, msg_id, new_tag):
+    with get_connection() as conn:
+        conn.execute(
+            'UPDATE scheduled_messages SET tag = ? WHERE id = ? AND user_id = ? AND is_sent = 0',
+            (new_tag, msg_id, user_id),
+        )
+        conn.commit()
+
+
+def update_reminder_time(user_id, msg_id, send_at):
+    """Reschedule an existing pending reminder in place."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            '''
+            UPDATE scheduled_messages
+            SET send_at = ?, delivery_status = 'pending', retry_count = 0, last_error = NULL
+            WHERE id = ? AND user_id = ? AND is_sent = 0
+            ''',
+            (send_at, msg_id, user_id),
+        )
+        conn.commit()
+    return cur.rowcount
 
 
 def delete_message(user_id, msg_id):
@@ -1184,10 +1222,17 @@ def add_saved_message(user_id, full_text, source_name, tag, saved_at):
 
 
 def get_user_tags(user_id):
+    """Unified tag pool shared across bookmarks and reminders."""
     with get_connection() as conn:
         rows = conn.execute(
-            'SELECT DISTINCT tag FROM saved_messages WHERE user_id = ? ORDER BY tag COLLATE NOCASE',
-            (user_id,),
+            '''
+            SELECT tag FROM saved_messages WHERE user_id = ? AND tag IS NOT NULL AND tag != ''
+            UNION
+            SELECT tag FROM scheduled_messages
+            WHERE user_id = ? AND is_sent = 0 AND tag IS NOT NULL AND tag != ''
+            ORDER BY tag COLLATE NOCASE
+            ''',
+            (user_id, user_id),
         ).fetchall()
     return [row[0] for row in rows if row[0]]
 

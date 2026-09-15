@@ -49,6 +49,7 @@ from data.database import (
     get_channel_posts_since,
     get_due_subscriptions,
     get_pending_messages,
+    get_reminder_by_id,
     get_saved_message_by_id,
     get_scheduled_message_by_delivered_message_id,
     get_subscription_by_id,
@@ -73,6 +74,8 @@ from data.database import (
     update_subscriptions_next_send_at,
     update_subscription_time,
     update_subscription_schedule,
+    update_reminder_tag,
+    update_reminder_time,
     upsert_channel_posts,
     upsert_digest_settings,
     utc_now,
@@ -167,6 +170,7 @@ class ScheduleState(StatesGroup):
 class SaveState(StatesGroup):
     waiting_for_tag = State()
     waiting_for_new_tag = State()
+    waiting_for_reminder_tag = State()
 
 
 class SubTagState(StatesGroup):
@@ -1178,6 +1182,14 @@ async def render_screen(chat_id: int, screen: dict, target: types.Message | type
         await render_kb_detail_screen(chat_id, args.get("msg_id"), target, state)
     elif name == "kb_move":
         await render_kb_move_screen(chat_id, args.get("msg_id"), target, state)
+    elif name == "rem_tags":
+        await render_rem_tags_screen(chat_id, target, state)
+    elif name == "rem_list":
+        await render_rem_list_screen(chat_id, args.get("tag"), args.get("page", 1), target, state)
+    elif name == "rem_detail":
+        await render_rem_detail_screen(chat_id, args.get("msg_id"), target, state)
+    elif name == "rem_move":
+        await render_rem_move_screen(chat_id, args.get("msg_id"), target, state)
     elif name == "manual_date":
         markup = build_manual_date_keyboard()
         if isinstance(target, types.CallbackQuery):
@@ -1295,9 +1307,10 @@ async def cmd_help(message: types.Message, state: FSMContext):
         "/home — Сбросить текущее действие и вернуться в главное меню\n"
         "/back — Вернуться на один шаг назад во всех меню\n\n"
         "📅 <b>Напоминания (Задачи):</b>\n"
-        "/list — Посмотреть мои активные напоминания\n"
-        "💡 <i>Перешлите любое сообщение или напишите текст, чтобы запланировать его.</i>\n\n"
-        "✍️ <b>Команды управления (ответом на напоминание):</b>\n"
+        "/list — Список напоминаний с фильтром по тегам\n"
+        "💡 <i>Перешлите любое сообщение или напишите текст, чтобы запланировать его.</i>\n"
+        "💡 <i>В меню напоминания можно перенести время, сменить тег, перенести в закладки или удалить.</i>\n\n"
+        "✍️ <b>Быстрые команды (ответом на доставленное напоминание):</b>\n"
         "Ответьте на сообщение напоминания одной из команд:\n"
         "• <code>/morning</code> — перенести на завтра на утро\n"
         "• <code>/day</code> — перенести на завтра на день\n"
@@ -1654,37 +1667,273 @@ async def delete_sent_reminder(callback: CallbackQuery):
     await callback.answer("Удалено!")
 
 
+EMOJI_NUMS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+REMINDERS_PER_PAGE = 5
+
+
+def format_reminder_when(dt_obj: datetime, now: datetime | None = None) -> str:
+    """Human-friendly relative time, e.g. 'через 2 ч 30 мин', 'просрочено'."""
+    now = now or local_now()
+    secs = int((dt_obj - now).total_seconds())
+    if secs < 0:
+        return "просрочено"
+    mins = secs // 60
+    if mins < 1:
+        return "меньше минуты"
+    if mins < 60:
+        return f"через {mins} мин"
+    hours = mins // 60
+    if hours < 24:
+        rem_min = mins % 60
+        return f"через {hours} ч" + (f" {rem_min} мин" if rem_min else "")
+    days = hours // 24
+    rem_hours = hours % 24
+    return f"через {days} дн" + (f" {rem_hours} ч" if rem_hours else "")
+
+
+def _reminder_tag(row_tag: str | None) -> str:
+    return row_tag or "Без тега"
+
+
+async def render_rem_tags_screen(chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext):
+    await state.set_state(None)
+    reminders = get_user_messages(chat_id)
+    if not reminders:
+        text = "📭 У тебя нет активных напоминаний."
+        if isinstance(target, CallbackQuery):
+            await target.message.edit_text(text, parse_mode="HTML")
+            await target.answer()
+        else:
+            await target.answer(text, parse_mode="HTML")
+        return
+
+    grouped: dict[str, list] = {}
+    for row in reminders:
+        grouped.setdefault(_reminder_tag(row[4]), []).append(row)
+
+    sorted_tags = sorted(grouped.keys(), key=lambda t: t.lower())
+    await state.update_data(rem_tags_list=sorted_tags)
+
+    text = (
+        f"📂 <b>Напоминания по тегам</b> (всего: {len(reminders)})\n\n"
+        "Выбери тег для фильтра или покажи все:"
+    )
+
+    buttons = []
+    row = []
+    for idx, tag in enumerate(sorted_tags):
+        count = len(grouped[tag])
+        display_tag = tag[:15] + "..." if len(tag) > 18 else tag
+        row.append(InlineKeyboardButton(text=f"🏷 {display_tag} ({count})", callback_data=f"rem_tag_idx_{idx}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    buttons.append([InlineKeyboardButton(text="📅 Все напоминания", callback_data="rem_tag_all")])
+    buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="flow_home")])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        await target.answer()
+    else:
+        await target.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def render_rem_list_screen(chat_id: int, tag: str | None, page: int, target: types.Message | types.CallbackQuery, state: FSMContext):
+    await state.set_state(None)
+    await state.update_data(rem_current_tag=tag, rem_current_page=page)
+
+    reminders = get_user_messages(chat_id)  # ordered by send_at
+    if tag:
+        filtered = [r for r in reminders if _reminder_tag(r[4]) == tag]
+    else:
+        filtered = reminders
+
+    if not filtered:
+        text = "📭 В этом фильтре нет напоминаний."
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="flow_back")]]
+        )
+        if isinstance(target, CallbackQuery):
+            await target.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+            await target.answer()
+        else:
+            await target.answer(text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    total_items = len(filtered)
+    total_pages = (total_items + REMINDERS_PER_PAGE - 1) // REMINDERS_PER_PAGE
+    page = max(1, min(page, total_pages))
+    start_idx = (page - 1) * REMINDERS_PER_PAGE
+    page_items = filtered[start_idx:start_idx + REMINDERS_PER_PAGE]
+
+    await state.update_data(rem_page_ids=[r[0] for r in page_items])
+
+    header = f"🏷 #{tag}" if tag else "⏳ Все напоминания"
+    now = local_now()
+    text_lines = [f"<b>{header}</b> (стр. {page} из {total_pages})\n"]
+    for idx, row in enumerate(page_items):
+        _id, send_at, preview, source, row_tag, _msg_id = row
+        dt_obj = display_db_datetime(send_at)
+        when = format_reminder_when(dt_obj, now)
+        source_safe = html.escape(source) if source else "Неизвестно"
+        normalized = (preview or "").replace("\n", " ")
+        preview_txt = normalized[:37] + "..." if len(normalized) > 40 else normalized
+        preview_safe = html.escape(preview_txt) if preview_txt else "Без текста"
+        tag_chip = f" · 🏷 {html.escape(_reminder_tag(row_tag))}" if row_tag else ""
+        text_lines.append(
+            f"{EMOJI_NUMS[idx]} <b>{dt_obj.strftime('%d.%m в %H:%M')}</b> "
+            f"<i>({when})</i>{tag_chip}\n"
+            f"    👤 {source_safe}\n"
+            f"    <i>{preview_safe}</i>"
+        )
+        text_lines.append("")
+
+    select_row = [
+        InlineKeyboardButton(text=EMOJI_NUMS[idx], callback_data=f"rem_sel_idx_{idx}")
+        for idx in range(len(page_items))
+    ]
+
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data="rem_page_prev"))
+    else:
+        nav_row.append(InlineKeyboardButton(text=" ", callback_data="rem_ignore"))
+    nav_row.append(InlineKeyboardButton(text=f"Стр {page}/{total_pages}", callback_data="rem_ignore"))
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data="rem_page_next"))
+    else:
+        nav_row.append(InlineKeyboardButton(text=" ", callback_data="rem_ignore"))
+
+    filter_row = [InlineKeyboardButton(text="🏷 По тегам", callback_data="rem_view_tags")]
+    if tag:
+        filter_row.append(InlineKeyboardButton(text="📅 Все", callback_data="rem_tag_all"))
+    filter_row.append(InlineKeyboardButton(text="🏠 В начало", callback_data="flow_home"))
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[select_row, nav_row, filter_row])
+    text = "\n".join(text_lines)
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        await target.answer()
+    else:
+        await target.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def render_rem_detail_screen(chat_id: int, msg_id: int, target: types.Message | types.CallbackQuery, state: FSMContext):
+    await state.set_state(None)
+    await state.update_data(rem_detail_id=msg_id)
+
+    row = get_reminder_by_id(chat_id, msg_id)
+    if not row:
+        text = "❌ Напоминание не найдено."
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="flow_back")]]
+        )
+        if isinstance(target, CallbackQuery):
+            await target.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+            await target.answer()
+        else:
+            await target.answer(text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    _id, send_at, preview, source, row_tag, _msg_id = row
+    dt_obj = display_db_datetime(send_at)
+    when = format_reminder_when(dt_obj)
+    tag_safe = html.escape(row_tag) if row_tag else "Без тега"
+    source_safe = html.escape(source) if source else "Неизвестно"
+    full_text_safe = html.escape(preview) if preview else "Без текста"
+    max_len = 3000
+    if len(full_text_safe) > max_len:
+        full_text_safe = full_text_safe[:max_len] + "\n\n⚠️ <i>(Текст обрезан)</i>"
+
+    text = (
+        f"⏰ <b>Когда:</b> {dt_obj.strftime('%d.%m.%Y в %H:%M')} <i>({when})</i>\n"
+        f"🏷 <b>Тег:</b> #{tag_safe}\n"
+        f"👤 <b>Источник:</b> {source_safe}\n\n"
+        f"📝 <b>Текст:</b>\n{full_text_safe}"
+    )
+
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⏰ Перенести время", callback_data=f"rem_resched_init_{msg_id}")],
+            [
+                InlineKeyboardButton(text="🏷 Изменить тег", callback_data=f"rem_tag_init_{msg_id}"),
+                InlineKeyboardButton(text="📁 В закладки", callback_data=f"rem_tobk_{msg_id}"),
+            ],
+            [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"rem_del_{msg_id}")],
+            [
+                InlineKeyboardButton(text="🔙 Назад", callback_data="flow_back"),
+                InlineKeyboardButton(text="🏠 В начало", callback_data="flow_home"),
+            ],
+        ]
+    )
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        await target.answer()
+    else:
+        await target.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def render_rem_move_screen(chat_id: int, msg_id: int, target: types.Message | types.CallbackQuery, state: FSMContext):
+    await state.set_state(SaveState.waiting_for_reminder_tag)
+
+    row = get_reminder_by_id(chat_id, msg_id)
+    if not row:
+        text = "❌ Напоминание не найдено."
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="flow_back")]]
+        )
+        if isinstance(target, CallbackQuery):
+            await target.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+            await target.answer()
+        else:
+            await target.answer(text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    tag_safe = html.escape(row[4]) if row[4] else "Без тега"
+    text = (
+        f"🏷 <b>Изменение тега</b>\n\n"
+        f"Текущий тег: <b>#{tag_safe}</b>\n\n"
+        f"Выбери существующий тег ниже или пришли новый текстом:"
+    )
+
+    tags = get_user_tags(chat_id)
+    await state.update_data(rem_move_tags=tags, rem_detail_id=msg_id)
+
+    buttons = []
+    row_btns = []
+    for idx, t in enumerate(tags):
+        display_t = t[:15] + "..." if len(t) > 18 else t
+        row_btns.append(InlineKeyboardButton(text=f"📁 {display_t}", callback_data=f"rem_mv_idx_{idx}"))
+        if len(row_btns) == 2:
+            buttons.append(row_btns)
+            row_btns = []
+    if row_btns:
+        buttons.append(row_btns)
+
+    buttons.append([
+        InlineKeyboardButton(text="🔙 Назад", callback_data="flow_back"),
+        InlineKeyboardButton(text="🏠 В начало", callback_data="flow_home"),
+    ])
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        await target.answer()
+    else:
+        await target.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message, state: FSMContext):
     await state.clear()
-    user_id = message.chat.id
-    user_msgs = get_user_messages(user_id)
-
-    if not user_msgs:
+    if not get_user_messages(message.chat.id):
         await message.answer("📭 У тебя нет активных напоминаний.\n\nДля дайджестов используй /list_digest.")
         return
-
-    if user_msgs:
-        text_lines = ["⏳ <b>Твои разовые напоминания:</b>\n"]
-        buttons = []
-        for idx, msg in enumerate(user_msgs, 1):
-            db_id, send_at, preview, source = msg
-            dt_obj = display_db_datetime(send_at)
-            source_safe = html.escape(source) if source else "Неизвестно"
-            preview_safe = html.escape(preview) if preview else "Без текста"
-
-            text_lines.append(
-                f"{idx}. 📌 <b>{dt_obj.strftime('%d.%m в %H:%M')}</b> | От: {source_safe}\n"
-                f"<i>{preview_safe}</i>\n"
-            )
-            buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"cancel_{db_id}"))
-
-        kb_rows = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
-        await message.answer(
-            "\n".join(text_lines),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
-        )
+    await push_screen(state, "rem_list", tag=None, page=1)
+    await render_rem_list_screen(message.chat.id, None, 1, message, state)
 
 
 @dp.message(Command("list_digest"))
@@ -1698,48 +1947,201 @@ async def cmd_list_digest(message: types.Message, state: FSMContext):
     )
 
 
-@dp.callback_query(F.data.startswith("cancel_"))
-async def handle_cancel(callback: CallbackQuery):
-    callback_message = get_callback_message(callback)
-    if callback_message is None:
-        await callback.answer("❌ Сообщение недоступно.")
+@dp.callback_query(F.data == "rem_ignore")
+async def handle_rem_ignore(callback: CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "rem_view_tags")
+async def handle_rem_view_tags(callback: CallbackQuery, state: FSMContext):
+    await push_screen(state, "rem_tags")
+    await render_rem_tags_screen(callback.message.chat.id, callback, state)
+
+
+@dp.callback_query(F.data == "rem_tag_all")
+async def handle_rem_tag_all(callback: CallbackQuery, state: FSMContext):
+    await push_screen(state, "rem_list", tag=None, page=1)
+    await render_rem_list_screen(callback.message.chat.id, None, 1, callback, state)
+
+
+@dp.callback_query(F.data.startswith("rem_tag_idx_"))
+async def handle_rem_tag_selection(callback: CallbackQuery, state: FSMContext):
+    idx = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    tags_list = data.get("rem_tags_list", [])
+    if idx < len(tags_list):
+        tag = tags_list[idx]
+        await push_screen(state, "rem_list", tag=tag, page=1)
+        await render_rem_list_screen(callback.message.chat.id, tag, 1, callback, state)
+    else:
+        await callback.answer("❌ Ошибка выбора тега.")
+
+
+@dp.callback_query(F.data == "rem_page_prev")
+async def handle_rem_page_prev(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    tag = data.get("rem_current_tag")
+    page = max(1, (data.get("rem_current_page") or 1) - 1)
+    await render_rem_list_screen(callback.message.chat.id, tag, page, callback, state)
+
+
+@dp.callback_query(F.data == "rem_page_next")
+async def handle_rem_page_next(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    tag = data.get("rem_current_tag")
+    page = (data.get("rem_current_page") or 1) + 1
+    await render_rem_list_screen(callback.message.chat.id, tag, page, callback, state)
+
+
+@dp.callback_query(F.data.startswith("rem_sel_idx_"))
+async def handle_rem_select(callback: CallbackQuery, state: FSMContext):
+    idx = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    page_ids = data.get("rem_page_ids", [])
+    if idx >= len(page_ids):
+        await callback.answer("❌ Напоминание недоступно.")
+        return
+    msg_id = page_ids[idx]
+    await push_screen(state, "rem_detail", msg_id=msg_id)
+    await render_rem_detail_screen(callback.message.chat.id, msg_id, callback, state)
+
+
+@dp.callback_query(F.data.startswith("rem_del_"))
+async def handle_rem_delete(callback: CallbackQuery, state: FSMContext):
+    msg_id = int(callback.data.split("_")[-1])
+    delete_message(callback.message.chat.id, msg_id)
+    await callback.answer("✅ Напоминание удалено!")
+    await pop_screen(state)
+    prev = (await state.get_data()).get("screen_history", [])
+    if prev:
+        await render_screen(callback.message.chat.id, prev[-1], callback, state)
+    else:
+        await render_rem_list_screen(callback.message.chat.id, None, 1, callback, state)
+
+
+@dp.callback_query(F.data.startswith("rem_tag_init_"))
+async def handle_rem_tag_init(callback: CallbackQuery, state: FSMContext):
+    msg_id = int(callback.data.split("_")[-1])
+    await push_screen(state, "rem_move", msg_id=msg_id)
+    await render_rem_move_screen(callback.message.chat.id, msg_id, callback, state)
+
+
+@dp.callback_query(F.data.startswith("rem_mv_idx_"))
+async def handle_rem_move_tag_selection(callback: CallbackQuery, state: FSMContext):
+    idx = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    tags = data.get("rem_move_tags", [])
+    msg_id = data.get("rem_detail_id")
+    if idx >= len(tags) or not msg_id:
+        await callback.answer("❌ Ошибка выбора тега.")
+        return
+    update_reminder_tag(callback.message.chat.id, msg_id, tags[idx])
+    await callback.answer(f"✅ Тег: #{tags[idx]}")
+    await pop_screen(state)  # leave rem_move
+    await render_rem_detail_screen(callback.message.chat.id, msg_id, callback, state)
+
+
+@dp.message(SaveState.waiting_for_reminder_tag)
+async def process_reminder_tag(message: types.Message, state: FSMContext):
+    new_tag = (message.text or "").strip().lstrip("#").strip()
+    if not new_tag:
+        await message.answer("❌ Тег не должен быть пустым.", reply_markup=build_back_home_keyboard())
         return
 
-    db_id = parse_callback_int_suffix(callback.data, "cancel_")
-    if db_id is None:
+    data = await state.get_data()
+    msg_id = data.get("rem_detail_id")
+    if not msg_id:
+        await message.answer("❌ Ошибка: напоминание не найдено.", reply_markup=build_back_home_keyboard())
+        return
+
+    update_reminder_tag(message.chat.id, msg_id, new_tag)
+    await pop_screen(state)  # leave rem_move
+    confirm = await message.answer(f"✅ Тег: #{new_tag}")
+    await state.set_state(None)
+    await asyncio.sleep(2)
+    try:
+        await confirm.delete()
+        await message.delete()
+    except TelegramAPIError:
+        pass
+    await render_rem_detail_screen(message.chat.id, msg_id, message, state)
+
+
+@dp.callback_query(F.data.startswith("rem_tobk_"))
+async def handle_rem_to_bookmark(callback: CallbackQuery, state: FSMContext):
+    msg_id = int(callback.data.split("_")[-1])
+    row = get_reminder_by_id(callback.message.chat.id, msg_id)
+    if not row:
+        await callback.answer("❌ Напоминание не найдено.", show_alert=True)
+        return
+    _id, _send_at, preview, source, row_tag, _msg_id = row
+    add_saved_message(
+        callback.message.chat.id,
+        preview or "Без текста",
+        source or "Неизвестно",
+        row_tag or "Без тега",
+        serialize_datetime(utc_now()),
+    )
+    delete_message(callback.message.chat.id, msg_id)
+    await callback.answer("✅ Перенесено в закладки!")
+    await pop_screen(state)  # leave rem_detail
+    prev = (await state.get_data()).get("screen_history", [])
+    if prev:
+        await render_screen(callback.message.chat.id, prev[-1], callback, state)
+    else:
+        await render_rem_list_screen(callback.message.chat.id, None, 1, callback, state)
+
+
+@dp.callback_query(F.data.startswith("rem_resched_init_"))
+async def handle_rem_resched_init(callback: CallbackQuery, state: FSMContext):
+    msg_id = int(callback.data.rsplit("_", 1)[-1])
+    row = get_reminder_by_id(callback.message.chat.id, msg_id)
+    if not row:
+        await callback.answer("❌ Напоминание не найдено.", show_alert=True)
+        return
+    await state.update_data(
+        rem_reschedule_id=msg_id,
+        preview=row[2] or "",
+        source=row[3] or "",
+        prompt_msg_id=callback.message.message_id,
+    )
+    await callback.message.edit_text(
+        "⏰ <b>Перенос времени</b>\n\nВыбери новое время напоминания:",
+        parse_mode="HTML",
+        reply_markup=build_time_selection_keyboard(f"remresched_{msg_id}"),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("remresched_"))
+async def handle_rem_resched_choice(callback: CallbackQuery, state: FSMContext):
+    payload = parse_callback_strip_prefix(callback.data, "remresched_")
+    if payload is None:
+        await callback.answer("❌ Некорректные данные.")
+        return
+    try:
+        msg_id_str, action = payload.rsplit("_", 1)
+        msg_id = int(msg_id_str)
+    except ValueError:
         await callback.answer("❌ Некорректные данные.")
         return
 
-    delete_message(callback_message.chat.id, db_id)
-
-    user_msgs = get_user_messages(callback_message.chat.id)
-    if not user_msgs:
-        await callback_message.edit_text("📭 Все разовые напоминания отменены.")
+    if action == "custom":
+        await state.update_data(rem_reschedule_id=msg_id, prompt_msg_id=callback.message.message_id)
+        await push_screen(state, "manual_date")
+        await callback.message.edit_text("Выбери дату:", reply_markup=build_manual_date_keyboard())
+        await callback.answer()
         return
 
-    text_lines = ["⏳ <b>Твои разовые напоминания:</b>\n"]
-    buttons = []
-    for idx, msg in enumerate(user_msgs, 1):
-        item_id, send_at, preview, source = msg
-        dt_obj = display_db_datetime(send_at)
-        source_safe = html.escape(source) if source else "Неизвестно"
-        preview_safe = html.escape(preview) if preview else "Без текста"
-        text_lines.append(
-            f"{idx}. 📌 <b>{dt_obj.strftime('%d.%m в %H:%M')}</b> | От: {source_safe}\n"
-            f"<i>{preview_safe}</i>\n"
-        )
-        buttons.append(InlineKeyboardButton(text=f"❌ {idx}", callback_data=f"cancel_{item_id}"))
-
-    kb_rows = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
-    try:
-        await callback_message.edit_text(
-            "\n".join(text_lines),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
-        )
-    except TelegramAPIError:
-        pass
-    await callback.answer("Удалено!")
+    scheduled_time, label = get_quick_scheduled_time(action, local_now())
+    if scheduled_time is None:
+        await callback.answer("❌ Ошибка при планировании времени.")
+        return
+    update_reminder_time(callback.message.chat.id, msg_id, serialize_datetime(scheduled_time))
+    await callback.answer(f"✅ Перенесено на {scheduled_time.strftime('%d.%m %H:%M')}")
+    # rem_detail is already the top of history (the time picker replaced the message
+    # in place without pushing a screen), so just re-render it.
+    await render_rem_detail_screen(callback.message.chat.id, msg_id, callback, state)
 
 
 @dp.callback_query(F.data.startswith("unsub_"))
@@ -3131,14 +3533,15 @@ async def handle_bksched_init(callback: CallbackQuery, state: FSMContext):
     await state.update_data(
         is_bookmark_scheduling=True,
         bookmark_msg_id=msg_id,
+        bookmark_tag=tag,
         preview=full_text,
         source=source,
         prompt_msg_id=callback.message.message_id,
     )
-    
+
     markup = build_time_selection_keyboard(f"bksched_choice_{msg_id}")
     await callback.message.edit_text(
-        f"⏰ <b>Планирование напоминания из закладки</b>\n\nВыбери время отправки напоминания:",
+        f"⏰ <b>Перенос закладки в напоминание</b>\n\nВыбери время отправки напоминания:",
         parse_mode="HTML",
         reply_markup=markup
     )
@@ -3170,6 +3573,7 @@ async def handle_bksched_choice(callback: CallbackQuery, state: FSMContext):
         await state.update_data(
             is_bookmark_scheduling=True,
             bookmark_msg_id=msg_id,
+            bookmark_tag=tag,
             preview=full_text,
             source=source,
             prompt_msg_id=callback_message.message_id,
@@ -3181,36 +3585,35 @@ async def handle_bksched_choice(callback: CallbackQuery, state: FSMContext):
         )
         await callback.answer()
         return
-        
+
     now = local_now()
     scheduled_time, label = get_quick_scheduled_time(action, now)
     if scheduled_time:
+        # Move: create the reminder (keeping the tag) and drop the bookmark.
         add_message(
             callback_message.chat.id,
             None,
             serialize_datetime(scheduled_time),
             full_text,
             source,
+            tag,
         )
+        delete_saved_message(callback_message.chat.id, msg_id)
         confirm_msg = await bot.send_message(
             callback_message.chat.id,
-            f"✅ Напоминание запланировано на {scheduled_time.strftime('%d.%m.%Y %H:%M')}!"
+            f"✅ Перенесено в напоминания на {scheduled_time.strftime('%d.%m.%Y %H:%M')}!"
         )
         await state.clear()
-        
-        await state.update_data(kb_current_tag=current_tag, kb_current_page=current_page)
-        await push_screen(state, "kb_tags")
-        if current_tag:
-            await push_screen(state, "kb_list", tag=current_tag, page=current_page or 1)
-        await push_screen(state, "kb_detail", msg_id=msg_id)
-        
+        await push_screen(state, "rem_list", tag=None, page=1)
+
         await asyncio.sleep(2)
         try:
             await confirm_msg.delete()
         except TelegramAPIError:
             pass
-            
-        await render_screen(callback_message.chat.id, {"screen": "kb_detail", "args": {"msg_id": msg_id}}, callback_message, state)
+
+        await render_screen(callback_message.chat.id, {"screen": "rem_list", "args": {"tag": None, "page": 1}}, callback_message, state)
+    await callback.answer()
 
 
 async def complete_manual_schedule(
@@ -3234,15 +3637,53 @@ async def complete_manual_schedule(
 
     is_bksched = data.get("is_bookmark_scheduling")
     bookmark_msg_id = data.get("bookmark_msg_id")
+    bookmark_tag = data.get("bookmark_tag")
     current_tag = data.get("kb_current_tag")
     current_page = data.get("kb_current_page")
+
+    rem_reschedule_id = data.get("rem_reschedule_id")
+    rem_current_tag = data.get("rem_current_tag")
+    rem_current_page = data.get("rem_current_page")
+
+    # Reschedule an existing reminder in place (from its detail screen).
+    if rem_reschedule_id:
+        changed = update_reminder_time(
+            chat_id, rem_reschedule_id, serialize_datetime(scheduled_time)
+        )
+        if not changed:
+            await reply_target.answer("❌ Напоминание больше не найдено.")
+            await state.clear()
+            return
+        confirmation_text = f"✅ Перенесено на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}."
+
+        cleanup_ids = [cleanup_message_id, data.get("prompt_msg_id")]
+        for message_id in {mid for mid in cleanup_ids if mid}:
+            try:
+                await bot.delete_message(chat_id, message_id)
+            except TelegramAPIError:
+                pass
+
+        confirm_msg = await bot.send_message(chat_id, confirmation_text or "✅ Время перенесено.")
+        await state.clear()
+        await state.update_data(rem_current_tag=rem_current_tag, rem_current_page=rem_current_page)
+        await push_screen(state, "rem_list", tag=rem_current_tag, page=rem_current_page or 1)
+        await push_screen(state, "rem_detail", msg_id=rem_reschedule_id)
+        await asyncio.sleep(2)
+        try:
+            await confirm_msg.delete()
+        except TelegramAPIError:
+            pass
+        await render_screen(chat_id, {"screen": "rem_detail", "args": {"msg_id": rem_reschedule_id}}, reply_target, state)
+        return
 
     if msg_id:
         add_message(chat_id, msg_id, serialize_datetime(scheduled_time), preview, source)
         confirmation_text = f"✅ Принято! Запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}."
     elif is_bksched:
-        add_message(chat_id, None, serialize_datetime(scheduled_time), preview, source)
-        confirmation_text = f"✅ Напоминание запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}!"
+        add_message(chat_id, None, serialize_datetime(scheduled_time), preview, source, bookmark_tag)
+        if bookmark_msg_id:
+            delete_saved_message(chat_id, bookmark_msg_id)
+        confirmation_text = f"✅ Перенесено в напоминания на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}!"
     elif scheduled_db_id and source_message_id:
         replace_sent_reminder_with_pending(
             chat_id,
@@ -3277,18 +3718,15 @@ async def complete_manual_schedule(
     confirm_msg = await bot.send_message(chat_id, confirmation_text)
     await state.clear()
 
-    if is_bksched and bookmark_msg_id:
-        await state.update_data(kb_current_tag=current_tag, kb_current_page=current_page)
-        await push_screen(state, "kb_tags")
-        if current_tag:
-            await push_screen(state, "kb_list", tag=current_tag, page=current_page or 1)
-        await push_screen(state, "kb_detail", msg_id=bookmark_msg_id)
+    if is_bksched:
+        # The bookmark was moved into reminders — land on the reminders list.
+        await push_screen(state, "rem_list", tag=None, page=1)
         await asyncio.sleep(2)
         try:
             await confirm_msg.delete()
         except TelegramAPIError:
             pass
-        await render_screen(chat_id, {"screen": "kb_detail", "args": {"msg_id": bookmark_msg_id}}, reply_target, state)
+        await render_screen(chat_id, {"screen": "rem_list", "args": {"tag": None, "page": 1}}, reply_target, state)
         return
 
     await asyncio.sleep(3)
