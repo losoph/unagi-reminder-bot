@@ -1,0 +1,6 @@
+# Only error-class rules (pyflakes + syntax): undefined names, unused imports/variables.
+# Style is intentionally not enforced.
+extend-exclude = [".venv", "venv"]
+
+[lint]
+select = ["F", "E9"]
