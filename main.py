@@ -5,6 +5,8 @@ import io
 import json
 import logging
 import os
+import re
+import secrets
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -35,15 +37,19 @@ from data.database import (
     add_subscription,
     add_telegraph_digest,
     cleanup_old_records,
+    confirm_email_code,
     clear_subscription_failure,
     count_due_subscriptions,
     count_user_subscriptions,
     delete_message,
     delete_saved_message,
+    delete_user_email,
     export_user_data,
     get_ai_usage_today,
     get_digest_posts,
     get_digest_settings,
+    get_enabled_email,
+    get_user_email,
     delete_subscription,
     get_channel_posts_since,
     get_due_subscriptions,
@@ -66,7 +72,9 @@ from data.database import (
     parse_db_datetime,
     replace_sent_reminder_with_pending,
     serialize_datetime,
+    start_email_verification,
     set_all_subscriptions_paused,
+    set_email_enabled,
     set_subscription_paused,
     set_subscription_tag,
     unsubscribe_all,
@@ -80,10 +88,13 @@ from data.database import (
     utc_now,
     update_saved_message_tag,
 )
-from scraper import ChannelFetchError, REQUEST_TIMEOUT
+from scraper import ChannelFetchError, REQUEST_TIMEOUT, get_latest_posts
 from channel_source import HybridChannelSource
 import ai_assistant
-from telegraph_publisher import publish_digest
+import email_digest
+from channel_links import find_channel_username, is_private_invite
+from telegraph_publisher import describe_counts, publish_digest
+from time_parser import parse_reminder_time
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -178,6 +189,11 @@ class SubTagState(StatesGroup):
 
 class ImportState(StatesGroup):
     waiting_for_file = State()
+
+
+class EmailState(StatesGroup):
+    waiting_for_email = State()
+    waiting_for_code = State()
 
 
 def chunk_html_text(lines, max_length=4000):
@@ -413,6 +429,8 @@ def build_digest_settings_keyboard(user_subs) -> InlineKeyboardMarkup:
         if bulk_row:
             rows.append(bulk_row)
         rows.append([InlineKeyboardButton(text="🗑 Отписаться от всех", callback_data="dunsuball")])
+    if email_digest.is_enabled():
+        rows.append([InlineKeyboardButton(text="📧 Дайджест на почту", callback_data="email_menu")])
     rows.append([
         InlineKeyboardButton(text="📤 Экспорт", callback_data="data_export"),
         InlineKeyboardButton(text="📥 Импорт", callback_data="data_import"),
@@ -442,7 +460,7 @@ def render_digest_settings_text(user_id: int) -> str:
     if not user_subs:
         lines.append("<b>Подписки:</b> пока пусто.")
         lines.append("")
-        lines.append("💡 Перешли пост из открытого канала, чтобы подписаться.")
+        lines.append("💡 Перешли пост из открытого канала или пришли ссылку на него, чтобы подписаться.")
         return "\n".join(lines).strip()
 
     paused_count = sum(1 for s in user_subs if s[5])
@@ -652,20 +670,22 @@ def parse_callback_strip_prefix(data: str | None, prefix: str) -> str | None:
     return rest if rest else None
 
 
-def build_time_selection_keyboard(prefix: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🌅 Утро", callback_data=f"{prefix}_morning"),
-                InlineKeyboardButton(text="☀️ День", callback_data=f"{prefix}_day"),
-                InlineKeyboardButton(text="🌙 Вечер", callback_data=f"{prefix}_evening"),
-            ],
-            [
-                InlineKeyboardButton(text="⏱ На 3 часа", callback_data=f"{prefix}_now"),
-                InlineKeyboardButton(text="🗓 Выбрать", callback_data=f"{prefix}_custom"),
-            ],
-        ]
-    )
+def build_time_selection_keyboard(prefix: str, *, back_callback: str | None = None) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="🌅 Утро", callback_data=f"{prefix}_morning"),
+            InlineKeyboardButton(text="☀️ День", callback_data=f"{prefix}_day"),
+            InlineKeyboardButton(text="🌙 Вечер", callback_data=f"{prefix}_evening"),
+        ],
+        [
+            InlineKeyboardButton(text="⏱ 1 час", callback_data=f"{prefix}_hour"),
+            InlineKeyboardButton(text="⏱ 3 часа", callback_data=f"{prefix}_now"),
+            InlineKeyboardButton(text="🗓 Дата…", callback_data=f"{prefix}_custom"),
+        ],
+    ]
+    if back_callback:
+        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_manual_date_keyboard() -> InlineKeyboardMarkup:
@@ -755,26 +775,39 @@ def build_sent_reminder_actions_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+_DAY_PART_HOURS = {"morning": 9, "day": 14, "evening": 20}
+TIME_TEXT_EXAMPLES = "«завтра 11», «24/09 в 9», «через 2 дня»"
+
+
+def format_when(moment: datetime, now: datetime) -> str:
+    day = {0: "сегодня", 1: "завтра", 2: "послезавтра"}.get((moment.date() - now.date()).days)
+    return f"{day or moment.strftime('%d.%m')} в {moment.strftime('%H:%M')}"
+
+
 def get_quick_scheduled_time(action: str, now: datetime) -> tuple[datetime | None, str]:
-    if action == "morning":
-        return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0), "завтра на 09:00"
-
-    if action == "day":
-        scheduled_time = now.replace(hour=14, minute=0, second=0, microsecond=0)
-        if now.hour >= 14:
+    if action in _DAY_PART_HOURS:
+        # The nearest such moment: «Утро» at 02:00 means this morning, not tomorrow's.
+        scheduled_time = now.replace(hour=_DAY_PART_HOURS[action], minute=0, second=0, microsecond=0)
+        if scheduled_time <= now:
             scheduled_time += timedelta(days=1)
-        return scheduled_time, "на 14:00"
+        return scheduled_time, f"на {format_when(scheduled_time, now)}"
 
-    if action == "evening":
-        scheduled_time = now.replace(hour=20, minute=0, second=0, microsecond=0)
-        if now.hour >= 20:
-            scheduled_time += timedelta(days=1)
-        return scheduled_time, "на 20:00"
+    if action == "hour":
+        return now + timedelta(hours=1), "через час"
 
     if action == "now":
         return now + timedelta(hours=3), "через 3 часа"
 
     return None, ""
+
+
+def describe_quick_times(now: datetime) -> str:
+    """One line that tells what the day-part buttons resolve to right now."""
+    emojis = {"morning": "🌅", "day": "☀️", "evening": "🌙"}
+    return " · ".join(
+        f"{emojis[action]} {format_when(get_quick_scheduled_time(action, now)[0], now)}"
+        for action in _DAY_PART_HOURS
+    )
 
 
 def get_suggested_manual_time(now: datetime) -> datetime:
@@ -821,7 +854,14 @@ def build_scheduled_time_from_state(data: dict, *, hour: int, minute: int) -> da
 
 
 def has_schedule_context(data: dict) -> bool:
-    return bool(data.get("message_id") or (data.get("scheduled_db_id") and data.get("source_message_id")) or data.get("is_bookmark_scheduling"))
+    # Delivered text reminders (from bookmarks) have no source_message_id, so the
+    # scheduled row id alone is enough; reminders rescheduled from /list carry rem_reschedule_id.
+    return bool(
+        data.get("message_id")
+        or data.get("scheduled_db_id")
+        or data.get("is_bookmark_scheduling")
+        or data.get("rem_reschedule_id")
+    )
 
 
 def classify_telegram_send_error(error: TelegramAPIError) -> tuple[bool, str]:
@@ -904,6 +944,7 @@ async def deliver_digest(user_id: int, title_plain: str, sections: list[dict]) -
     if total_posts == 0:
         return False
 
+    url = None
     if total_posts >= DIGEST_TELEGRAPH_THRESHOLD:
         url = await publish_digest(title_plain, sections)
         if url:
@@ -911,7 +952,7 @@ async def deliver_digest(user_id: int, title_plain: str, sections: list[dict]) -
             settings_link = build_digest_action_link("⚙️ Настройки дайджеста", "ds")
             text = (
                 f"📰 <b>{html.escape(title_plain)}</b> ☕️\n"
-                f"{len(sections)} каналов · {total_posts} постов\n\n"
+                f"{describe_counts(len(sections), total_posts)}\n\n"
                 f"📖 <a href='{url}'>Открыть дайджест целиком</a>\n\n"
                 f"{settings_link}"
             )
@@ -921,11 +962,31 @@ async def deliver_digest(user_id: int, title_plain: str, sections: list[dict]) -
                 parse_mode="HTML",
                 link_preview_options=LinkPreviewOptions(is_disabled=False),
             )
-            return True
-        logger.warning("Telegraph publish failed for user %s, falling back to chunks", user_id)
+        else:
+            logger.warning("Telegraph publish failed for user %s, falling back to chunks", user_id)
 
-    await send_digest_chunks(user_id, render_digest_lines(title_plain, sections))
+    if not url:
+        await send_digest_chunks(user_id, render_digest_lines(title_plain, sections))
+    await send_digest_email(user_id, title_plain, sections, url)
     return True
+
+
+async def send_digest_email(user_id: int, title_plain: str, sections: list[dict], telegraph_url: str | None) -> None:
+    """Email copy of a digest that was already delivered in Telegram; never raises."""
+    if not email_digest.is_enabled():
+        return
+    try:
+        address = get_enabled_email(user_id)
+        if not address:
+            return
+        title = f"{title_plain} — {local_now().strftime('%d.%m.%Y')}"
+        manage_url = build_bot_deep_link("em_off")
+        html_body, text_body = email_digest.build_digest_email(
+            title, sections, telegraph_url=telegraph_url, manage_url=manage_url
+        )
+        await email_digest.send_email(address, title, text_body, html_body, unsubscribe_url=manage_url)
+    except Exception:
+        logger.exception("Email digest for user %s failed", user_id)
 
 
 async def fetch_subscription_posts(
@@ -1075,6 +1136,13 @@ async def handle_digest_deep_link(message: types.Message, payload: str) -> bool:
         )
         return True
 
+    if payload == "em_off":
+        if set_email_enabled(user_id, False):
+            await message.answer("📭 Письма с дайджестами отключены. Включить снова — /email.")
+        else:
+            await message.answer("Письма с дайджестами и так не приходят. Настроить — /email.")
+        return True
+
     if payload.startswith("du_"):
         sub_id = parse_callback_int_suffix(payload, "du_")
         if sub_id is None:
@@ -1139,10 +1207,11 @@ async def handle_digest_deep_link(message: types.Message, payload: str) -> bool:
 WELCOME_TEXT = (
     "Привет! Я готов.\n\n"
     "1️⃣ Перешли мне любое сообщение, чтобы отложить его или сохранить в базу знаний.\n"
-    "2️⃣ Перешли пост из открытого канала, чтобы подписаться на его дайджест.\n"
+    "2️⃣ Перешли пост из открытого канала или пришли ссылку на него (t.me/…, @ник), чтобы подписаться на дайджест.\n"
     "3️⃣ Напиши /list для задач, /list_digest для дайджестов или /saved для Избранного.\n"
-    "4️⃣ Для уже доставленного напоминания используй кнопки под ним или ответь командой: "
-    "/morning, /day, /evening, /later (/l), /at ДД.ММ.ГГГГ ЧЧ:ММ, /save (/s), /delete (/d)."
+    "4️⃣ Доставленное напоминание можно отложить кнопкой «⏰ Отложить» или ответить на него текстом: "
+    "«завтра 11», «24/09 в 9», «через 2 дня».\n"
+    "5️⃣ Дайджесты можно получать и на почту — /email."
 )
 
 
@@ -1285,14 +1354,12 @@ async def cmd_start(message: types.Message, state: FSMContext, command: CommandO
     await state.clear()
     if command.args and await handle_digest_deep_link(message, command.args.strip()):
         return
-    await message.answer(
-        "Привет! Я готов.\n\n"
-        "1️⃣ Перешли мне любое сообщение, чтобы отложить его или сохранить в базу знаний.\n"
-        "2️⃣ Перешли пост из открытого канала, чтобы подписаться на его дайджест.\n"
-        "3️⃣ Напиши /list для задач, /list_digest для дайджестов или /saved для Избранного.\n"
-        "4️⃣ Для уже доставленного напоминания используй кнопки под ним или ответь командой: "
-        "/morning, /day, /evening, /later (/l), /at ДД.ММ.ГГГГ ЧЧ:ММ, /save (/s), /delete (/d)."
-    )
+    markup = None
+    if email_digest.is_enabled():
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="📧 Дайджест на почту", callback_data="email_menu")]]
+        )
+    await message.answer(WELCOME_TEXT, reply_markup=markup)
 
 
 @dp.message(Command("help"))
@@ -1311,11 +1378,12 @@ async def cmd_help(message: types.Message, state: FSMContext):
         "💡 <i>В меню напоминания можно перенести время, сменить тег, перенести в закладки или удалить.</i>\n\n"
         "✍️ <b>Быстрые команды (ответом на доставленное напоминание):</b>\n"
         "Ответьте на сообщение напоминания одной из команд:\n"
-        "• <code>/morning</code> — перенести на завтра на утро\n"
-        "• <code>/day</code> — перенести на завтра на день\n"
-        "• <code>/evening</code> — перенести на завтра на вечер\n"
+        "• <code>/morning</code> — на ближайшее утро (09:00)\n"
+        "• <code>/day</code> — на ближайший день (14:00)\n"
+        "• <code>/evening</code> — на ближайший вечер (20:00)\n"
         "• <code>/later</code> (или <code>/l</code>) — отложить на 3 часа\n"
-        "• <code>/at ДД.ММ.ГГГГ ЧЧ:ММ</code> — отложить на точное время\n"
+        "• <code>/at 24.09 18:30</code> — отложить на точное время\n"
+        "• или просто ответьте текстом: <i>завтра 11</i>, <i>24/09 в 9</i>, <i>через 2 дня</i>, <i>в пятницу в 10</i>\n"
         "• <code>/save</code> (или <code>/s</code>) — сохранить в базу знаний\n"
         "• <code>/delete</code> (или <code>/d</code>) — удалить напоминание\n\n"
         "📁 <b>База знаний (Закладки):</b>\n"
@@ -1325,7 +1393,8 @@ async def cmd_help(message: types.Message, state: FSMContext):
         "/list_digest — Посмотреть и настроить мои подписки\n"
         "/test_digest — Мгновенно собрать дайджест по подпискам за 24ч\n"
         "/check — Проверить, что все каналы читаются\n"
-        "💡 <i>Перешлите пост из любого открытого канала, чтобы подписаться на него.</i>\n"
+        "/email — Получать копию дайджестов на почту\n"
+        "💡 <i>Перешлите пост из открытого канала или пришлите ссылку на него (t.me/канал, t.me/s/канал, @канал), чтобы подписаться.</i>\n"
         "💡 <i>В «Мои подписки» можно ставить каналы на паузу, раскладывать по папкам и спрашивать ИИ про частоту постинга и саммари.</i>\n"
         "ℹ️ <i>Большие дайджесты (4+ постов) приходят одной ссылкой на Telegraph.</i>\n\n"
         "💾 <b>Бэкап и перенос:</b>\n"
@@ -1344,6 +1413,7 @@ async def set_bot_commands(bot: Bot):
         types.BotCommand(command="saved", description="📁 База знаний (закладки)"),
         types.BotCommand(command="test_digest", description="⏳ Собрать дайджест за 24ч"),
         types.BotCommand(command="check", description="🔎 Проверить подписки"),
+        types.BotCommand(command="email", description="📧 Дайджест на почту"),
         types.BotCommand(command="export", description="📤 Экспорт данных (JSON)"),
         types.BotCommand(command="import", description="📥 Импорт данных (JSON)"),
         types.BotCommand(command="home", description="🏠 В главное меню"),
@@ -1385,21 +1455,13 @@ async def start_save_flow(
     await state.set_state(SaveState.waiting_for_tag)
 
 
-async def _reschedule_replied_reminder(
+async def _apply_replied_reschedule(
     message: types.Message,
-    quick_action: str,
-    success_answer: str,
+    scheduled_msg,
+    scheduled_time: datetime,
+    confirmation: str,
 ) -> None:
-    scheduled_msg = get_replied_sent_schedule(message)
-    if not scheduled_msg:
-        await message.answer("Ответь этой командой на доставленное напоминание от бота.")
-        return
-
     db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
-    scheduled_time, label = get_quick_scheduled_time(quick_action, local_now())
-    if scheduled_time is None:
-        await message.answer("❌ Ошибка при планировании времени.")
-        return
     try:
         replace_sent_reminder_with_pending(
             message.chat.id,
@@ -1419,7 +1481,42 @@ async def _reschedule_replied_reminder(
         await message.delete()
     except TelegramAPIError:
         pass
-    await message.answer(success_answer.format(label=label))
+    await message.answer(confirmation)
+
+
+async def _reschedule_replied_reminder(
+    message: types.Message,
+    quick_action: str,
+    success_answer: str,
+) -> None:
+    scheduled_msg = get_replied_sent_schedule(message)
+    if not scheduled_msg:
+        await message.answer("Ответь этой командой на доставленное напоминание от бота.")
+        return
+
+    scheduled_time, label = get_quick_scheduled_time(quick_action, local_now())
+    if scheduled_time is None:
+        await message.answer("❌ Ошибка при планировании времени.")
+        return
+    await _apply_replied_reschedule(message, scheduled_msg, scheduled_time, success_answer.format(label=label))
+
+
+async def reschedule_replied_by_text(message: types.Message, scheduled_msg, text: str) -> None:
+    """«завтра 11» / «24/09 в 9» / «через 2 дня» as a reply to a delivered reminder (or /at)."""
+    now = local_now()
+    scheduled_time = parse_reminder_time(text, now)
+    if scheduled_time is None:
+        await message.answer(
+            f"🤔 Не понял время. Примеры: {TIME_TEXT_EXAMPLES}, «в пятницу в 10», «18:30».\n"
+            "Или нажми «⏰ Отложить» под напоминанием."
+        )
+        return
+    if scheduled_time <= now:
+        await message.answer("❌ Это время уже прошло.")
+        return
+    await _apply_replied_reschedule(
+        message, scheduled_msg, scheduled_time, f"✅ Отложил на {format_when(scheduled_time, now)}."
+    )
 
 
 @dp.message(Command("morning", "day", "evening", "later", "l"))
@@ -1436,50 +1533,17 @@ async def cmd_quick_reschedule(message: types.Message, command: CommandObject):
 
 
 @dp.message(Command("at"))
-async def cmd_at(message: types.Message):
+async def cmd_at(message: types.Message, command: CommandObject):
     scheduled_msg = get_replied_sent_schedule(message)
     if not scheduled_msg:
         await message.answer("Ответь этой командой на доставленное напоминание от бота.")
         return
 
-    command_text = (message.text or "").strip()
-    parts = command_text.split(maxsplit=1)
-    arg = parts[1].strip() if len(parts) > 1 else ""
+    arg = (command.args or "").strip()
     if not arg:
-        await message.answer("Формат: /at ДД.ММ.ГГГГ ЧЧ:ММ")
+        await message.answer("Формат: /at 24.09 18:30, /at завтра 11 или /at через 2 дня")
         return
-
-    try:
-        scheduled_time = datetime.strptime(arg, "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
-    except ValueError:
-        await message.answer("❌ Неверный формат. Пример: /at 06.04.2026 18:30")
-        return
-
-    if scheduled_time < local_now():
-        await message.answer("❌ Эта дата уже в прошлом.")
-        return
-
-    db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
-    try:
-        replace_sent_reminder_with_pending(
-            message.chat.id,
-            db_id,
-            source_message_id,
-            serialize_datetime(scheduled_time),
-            preview or "",
-            source or "",
-        )
-    except Exception:
-        logger.exception("replace_sent_reminder_with_pending failed in cmd_at")
-        await message.answer(USER_FACING_ERROR)
-        return
-    try:
-        if message.reply_to_message is not None:
-            await message.reply_to_message.delete()
-        await message.delete()
-    except TelegramAPIError:
-        pass
-    await message.answer(f"✅ Отложил до {scheduled_time.strftime('%d.%m.%Y %H:%M')}.")
+    await reschedule_replied_by_text(message, scheduled_msg, arg)
 
 
 @dp.message(Command("save", "s"))
@@ -1536,11 +1600,15 @@ async def show_sent_reminder_time_actions(callback: CallbackQuery):
         await callback.answer("❌ Напоминание уже обработано.", show_alert=True)
         return
 
-    await callback_message.answer(
-        "Когда напомнить снова?",
-        reply_markup=build_time_selection_keyboard(f"senttime_{callback_message.message_id}"),
-    )
-    await callback.answer()
+    # Swap the buttons in place instead of posting a separate «when?» message.
+    prefix = f"senttime_{callback_message.message_id}"
+    try:
+        await callback_message.edit_reply_markup(
+            reply_markup=build_time_selection_keyboard(prefix, back_callback=f"{prefix}_back")
+        )
+    except TelegramBadRequest:
+        pass
+    await callback.answer(f"{describe_quick_times(local_now())}\nИли ответь текстом: {TIME_TEXT_EXAMPLES}")
 
 
 @dp.callback_query(F.data.startswith("senttime_"))
@@ -1562,6 +1630,14 @@ async def handle_sent_reminder_time_selection(callback: CallbackQuery, state: FS
         await callback.answer("❌ Некорректные данные.")
         return
 
+    if action == "back":
+        try:
+            await callback_message.edit_reply_markup(reply_markup=build_sent_reminder_actions_keyboard())
+        except TelegramBadRequest:
+            pass
+        await callback.answer()
+        return
+
     scheduled_msg = get_scheduled_message_by_delivered_message_id(
         callback_message.chat.id, delivered_message_id
     )
@@ -1573,19 +1649,26 @@ async def handle_sent_reminder_time_selection(callback: CallbackQuery, state: FS
     now = local_now()
 
     if action == "custom":
+        # Keep the reminder itself intact (it may be media) and ask in a separate message.
+        if callback_message.message_id == delivered_message_id:
+            try:
+                await callback_message.edit_reply_markup(reply_markup=build_sent_reminder_actions_keyboard())
+            except TelegramBadRequest:
+                pass
+            prompt = await callback_message.answer("Выбери дату:", reply_markup=build_manual_date_keyboard())
+        else:  # legacy separate «Когда напомнить снова?» message
+            prompt = callback_message
+            await prompt.edit_text("Выбери дату:", reply_markup=build_manual_date_keyboard())
+        await state.clear()
         await state.update_data(
             scheduled_db_id=db_id,
             source_message_id=source_message_id,
             preview=preview or "",
             source=source or "",
-            prompt_msg_id=callback_message.message_id,
+            prompt_msg_id=prompt.message_id,
             target_message_id=delivered_message_id,
-            command_message_id=callback_message.message_id,
         )
-        await callback_message.edit_text(
-            "Выбери дату:",
-            reply_markup=build_manual_date_keyboard(),
-        )
+        await push_screen(state, "manual_date")
         await callback.answer()
         return
 
@@ -1608,7 +1691,7 @@ async def handle_sent_reminder_time_selection(callback: CallbackQuery, state: FS
         await callback.answer(USER_FACING_ERROR, show_alert=True)
         return
 
-    for message_id in (delivered_message_id, callback_message.message_id):
+    for message_id in {delivered_message_id, callback_message.message_id}:
         try:
             await bot.delete_message(callback_message.chat.id, message_id)
         except TelegramAPIError:
@@ -2105,7 +2188,7 @@ async def handle_rem_resched_init(callback: CallbackQuery, state: FSMContext):
         prompt_msg_id=callback.message.message_id,
     )
     await callback.message.edit_text(
-        "⏰ <b>Перенос времени</b>\n\nВыбери новое время напоминания:",
+        f"⏰ <b>Перенос времени</b>\n\nВыбери новое время напоминания:\n{describe_quick_times(local_now())}",
         parse_mode="HTML",
         reply_markup=build_time_selection_keyboard(f"remresched_{msg_id}"),
     )
@@ -3540,7 +3623,7 @@ async def handle_bksched_init(callback: CallbackQuery, state: FSMContext):
 
     markup = build_time_selection_keyboard(f"bksched_choice_{msg_id}")
     await callback.message.edit_text(
-        "⏰ <b>Перенос закладки в напоминание</b>\n\nВыбери время отправки напоминания:",
+        f"⏰ <b>Перенос закладки в напоминание</b>\n\nВыбери время отправки напоминания:\n{describe_quick_times(local_now())}",
         parse_mode="HTML",
         reply_markup=markup
     )
@@ -3677,7 +3760,7 @@ async def complete_manual_schedule(
         if bookmark_msg_id:
             delete_saved_message(chat_id, bookmark_msg_id)
         confirmation_text = f"✅ Перенесено в напоминания на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}!"
-    elif scheduled_db_id and source_message_id:
+    elif scheduled_db_id:
         replace_sent_reminder_with_pending(
             chat_id,
             scheduled_db_id,
@@ -3731,15 +3814,9 @@ async def complete_manual_schedule(
 
 @dp.message(ScheduleState.waiting_for_datetime)
 async def process_custom_datetime(message: types.Message, state: FSMContext):
-    text = (message.text or "").strip()
-    if not text:
-        await message.answer("❌ Неверный формат. Пример: 15.03.2026 14:30")
-        return
-
-    try:
-        scheduled_time = datetime.strptime(text, "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
-    except ValueError:
-        await message.answer("❌ Неверный формат. Пример: 15.03.2026 14:30")
+    scheduled_time = parse_reminder_time(message.text or "", local_now())
+    if scheduled_time is None:
+        await message.answer(f"🤔 Не понял время. Примеры: {TIME_TEXT_EXAMPLES}, «15.03.2026 14:30».")
         return
 
     await complete_manual_schedule(
@@ -3915,28 +3992,225 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
     await deliver_digest(user_id, "Твоя тестовая утренняя газета", sections)
 
 
+EMAIL_CODE_TTL_MINUTES = 15
+EMAIL_CODE_RESEND_SECONDS = 60
+
+
+def build_email_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    back_row = [InlineKeyboardButton(text="⚙️ Настройки дайджеста", callback_data="digest_settings")]
+    title = "📧 <b>Дайджест на почту</b>\n\n"
+    if not email_digest.is_enabled():
+        return title + "Отправка писем пока не настроена на сервере.", InlineKeyboardMarkup(inline_keyboard=[back_row])
+
+    record = get_user_email(user_id)
+    if record and record.get("email"):
+        enabled = bool(record["is_enabled"])
+        status = "✅ включён — копия каждого дайджеста приходит на почту" if enabled else "⏸ выключен"
+        text = f"{title}Адрес: <b>{html.escape(record['email'])}</b>\nСтатус: {status}"
+        rows = [
+            [InlineKeyboardButton(text="⏸ Выключить" if enabled else "▶️ Включить", callback_data="email_toggle")],
+            [
+                InlineKeyboardButton(text="✏️ Сменить адрес", callback_data="email_set"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data="email_delete"),
+            ],
+            back_row,
+        ]
+    else:
+        text = (
+            f"{title}Дайджесты будут приходить и сюда, и копией на почту — с той же вёрсткой, что в Telegraph.\n"
+            "Укажи адрес, и я пришлю на него код подтверждения."
+        )
+        rows = [[InlineKeyboardButton(text="✏️ Указать адрес", callback_data="email_set")], back_row]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_email_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="email_menu")]])
+
+
+@dp.message(Command("email"))
+async def cmd_email(message: types.Message, state: FSMContext):
+    await state.clear()
+    text, markup = build_email_menu(message.chat.id)
+    await message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+@dp.callback_query(F.data == "email_menu")
+async def open_email_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, markup = build_email_menu(callback.from_user.id)
+    await edit_or_answer(callback, text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "email_toggle")
+async def toggle_email(callback: CallbackQuery):
+    record = get_user_email(callback.from_user.id)
+    if record and record.get("email"):
+        set_email_enabled(callback.from_user.id, not record["is_enabled"])
+    text, markup = build_email_menu(callback.from_user.id)
+    await edit_or_answer(callback, text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "email_delete")
+async def remove_email(callback: CallbackQuery):
+    delete_user_email(callback.from_user.id)
+    text, markup = build_email_menu(callback.from_user.id)
+    await edit_or_answer(callback, text, reply_markup=markup)
+    await callback.answer("Адрес удалён")
+
+
+@dp.callback_query(F.data == "email_set")
+async def ask_email_address(callback: CallbackQuery, state: FSMContext):
+    if not email_digest.is_enabled():
+        await callback.answer("Отправка писем не настроена.", show_alert=True)
+        return
+    await state.set_state(EmailState.waiting_for_email)
+    await edit_or_answer(
+        callback,
+        "📧 Пришли адрес почты одним сообщением, например <code>name@example.com</code>.",
+        reply_markup=build_email_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.message(EmailState.waiting_for_email)
+async def process_email_address(message: types.Message, state: FSMContext):
+    address = email_digest.normalize_email(message.text)
+    if not address:
+        await message.answer("❌ Не похоже на адрес почты. Пример: name@example.com", reply_markup=build_email_cancel_keyboard())
+        return
+
+    user_id = message.chat.id
+    now = utc_now()
+    record = get_user_email(user_id)
+    if record and record.get("code_sent_at"):
+        if parse_db_datetime(record["code_sent_at"]) > now - timedelta(seconds=EMAIL_CODE_RESEND_SECONDS):
+            await message.answer("⏳ Код только что отправлялся — подожди минуту и пришли адрес снова.")
+            return
+
+    code = f"{secrets.randbelow(10**6):06d}"
+    sent = await email_digest.send_email(
+        address,
+        f"Код подтверждения Unagi: {code}",
+        f"Код для подключения дайджестов Unagi к этой почте: {code}\n\n"
+        f"Он действует {EMAIL_CODE_TTL_MINUTES} минут. Если вы ничего не запрашивали, просто проигнорируйте письмо.",
+    )
+    if not sent:
+        await message.answer(
+            f"❌ Не удалось отправить письмо на {html.escape(address)}. Проверь адрес и попробуй ещё раз.",
+            reply_markup=build_email_cancel_keyboard(),
+        )
+        return
+
+    start_email_verification(
+        user_id,
+        address,
+        code,
+        serialize_datetime(now),
+        serialize_datetime(now + timedelta(minutes=EMAIL_CODE_TTL_MINUTES)),
+    )
+    await state.set_state(EmailState.waiting_for_code)
+    await message.answer(
+        f"✉️ Отправил код на <b>{html.escape(address)}</b>. Пришли его сюда — он действует "
+        f"{EMAIL_CODE_TTL_MINUTES} минут. Если письма нет, проверь «Спам».",
+        parse_mode="HTML",
+        reply_markup=build_email_cancel_keyboard(),
+    )
+
+
+@dp.message(EmailState.waiting_for_code)
+async def process_email_code(message: types.Message, state: FSMContext):
+    code = re.sub(r"\D", "", message.text or "")
+    result = confirm_email_code(message.chat.id, code, serialize_datetime(utc_now()))
+    if result == "invalid":
+        await message.answer("❌ Неверный код. Попробуй ещё раз.", reply_markup=build_email_cancel_keyboard())
+        return
+    await state.clear()
+    notices = {
+        "ok": "✅ Почта подтверждена — копии дайджестов будут приходить туда.",
+        "expired": "⌛ Код устарел — запроси новый.",
+        "too_many": "🚫 Слишком много попыток — запроси новый код.",
+    }
+    text, markup = build_email_menu(message.chat.id)
+    await message.answer(
+        f"{notices.get(result, 'Запроси код заново.')}\n\n{text}", parse_mode="HTML", reply_markup=markup
+    )
+
+
+async def resolve_public_channel(username: str) -> tuple[str, str] | None:
+    """Return (username, title) if @username is a public channel we can build digests from."""
+    try:
+        chat = await bot.get_chat(f"@{username}")
+    except TelegramAPIError:
+        chat = None
+    if chat is not None:
+        if chat.type != "channel" or not chat.username:
+            return None
+        return chat.username, chat.title or chat.username
+    # Bot API may not see some channels; the web preview is what digests read anyway.
+    try:
+        async with create_telegram_http_session() as session:
+            await get_latest_posts(username, serialize_datetime(utc_now()), session=session)
+    except ChannelFetchError:
+        return None
+    except Exception:
+        logger.warning("Web check for @%s failed", username, exc_info=True)
+        return None
+    return username, username
+
+
+def message_link_urls(message: types.Message) -> list[str]:
+    entities = (message.entities or []) + (message.caption_entities or [])
+    return [entity.url for entity in entities if entity.type == "text_link" and entity.url]
+
+
 @dp.message()
 async def catch_message(message: types.Message, state: FSMContext):
     await state.clear()
 
-    is_public_channel = False
+    # A text reply to a delivered reminder is a new time for it: «завтра 11», «через 2 дня».
+    if message.text and not message.text.startswith("/"):
+        scheduled_msg = get_replied_sent_schedule(message)
+        if scheduled_msg:
+            await reschedule_replied_by_text(message, scheduled_msg, message.text)
+            return
+
     channel_username = None
     channel_title = None
+    channel_note = ""
 
     if message.forward_origin and message.forward_origin.type == "channel":
         if getattr(message.forward_origin.chat, "username", None):
-            is_public_channel = True
             channel_username = message.forward_origin.chat.username
             channel_title = message.forward_origin.chat.title
+    else:
+        text = message.text or message.caption or ""
+        referenced = find_channel_username(text, extra_urls=message_link_urls(message))
+        if referenced:
+            resolved = await resolve_public_channel(referenced)
+            if resolved:
+                channel_username, channel_title = resolved
+            elif text.strip().startswith("@") or re.search(r"t\.me|telegram\.(?:me|dog)|tg://", text, re.I):
+                channel_note = f"\n\nℹ️ @{html.escape(referenced)} — не публичный канал или не найден, дайджест недоступен."
+        elif is_private_invite(text):
+            channel_note = "\n\nℹ️ Это приглашение в закрытый канал — дайджест работает только с публичными."
 
     kb = build_time_selection_keyboard("time").inline_keyboard
     kb.append([InlineKeyboardButton(text="📁 В закладки (База знаний)", callback_data="bookmark_setup")])
 
-    if is_public_channel:
-        kb.append([InlineKeyboardButton(text="📡 Собирать дайджест", callback_data="digest_setup")])
+    prompt = "Что мне сделать с этим сообщением?"
+    if channel_username:
+        kb.insert(0, [InlineKeyboardButton(text="📡 Собирать дайджест", callback_data="digest_setup")])
         await state.update_data(channel_username=channel_username, channel_title=channel_title)
+        prompt = f"📡 Канал <b>{html.escape(channel_title or channel_username)}</b> (@{html.escape(channel_username)})\nЧто сделать?"
 
-    await message.reply("Что мне сделать с этим сообщением?", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await message.reply(
+        f"{prompt}{channel_note}\n\n⏰ {describe_quick_times(local_now())}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+    )
 
 
 @dp.callback_query(F.data == "digest_setup")
@@ -4117,8 +4391,8 @@ async def handle_manual_date_selection(callback: CallbackQuery, state: FSMContex
         suggested_str = suggested_time.strftime("%d.%m.%Y %H:%M")
         await state.set_state(ScheduleState.waiting_for_datetime)
         await callback_message.edit_text(
-            "Напиши точную дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ\n\n"
-            "💡 *Лайфхак:* нажми на время ниже, чтобы скопировать его:\n\n"
+            f"Напиши, когда напомнить: {TIME_TEXT_EXAMPLES}, «в пятницу в 10» или точно — ДД.ММ.ГГГГ ЧЧ:ММ.\n\n"
+            "💡 Нажми на время ниже, чтобы скопировать его:\n\n"
             f"`{suggested_str}`",
             parse_mode="Markdown",
             reply_markup=build_back_home_keyboard(),
