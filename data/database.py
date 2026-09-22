@@ -354,6 +354,20 @@ def init_db():
             )
             '''
         )
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS user_emails (
+                user_id INTEGER PRIMARY KEY,
+                email TEXT,
+                is_enabled INTEGER DEFAULT 0,
+                pending_email TEXT,
+                verify_code TEXT,
+                code_sent_at DATETIME,
+                code_expires_at DATETIME,
+                code_attempts INTEGER DEFAULT 0
+            )
+            '''
+        )
 
         for statement in (
             "ALTER TABLE digest_settings ADD COLUMN send_hour INTEGER DEFAULT 7",
@@ -583,14 +597,16 @@ def replace_sent_reminder_with_pending(
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # Copy the tag from the delivered row so a reschedule keeps the folder.
             conn.execute(
                 """
                 INSERT INTO scheduled_messages (
-                    user_id, message_id, send_at, created_at, text_preview, source_name, delivery_status
+                    user_id, message_id, send_at, created_at, text_preview, source_name, tag, delivery_status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                SELECT ?, ?, ?, ?, ?, ?, tag, 'pending'
+                FROM scheduled_messages WHERE id = ? AND user_id = ?
                 """,
-                (user_id, message_id, send_at, created_at, text_preview, source_name),
+                (user_id, message_id, send_at, created_at, text_preview, source_name, old_db_id, user_id),
             )
             cur = conn.execute(
                 "DELETE FROM scheduled_messages WHERE id = ? AND user_id = ?",
@@ -1341,3 +1357,89 @@ def cleanup_old_records(now_str: str) -> dict[str, int]:
         "channel_posts_deleted": channel_posts_deleted,
         "ai_usage_deleted": ai_usage_deleted,
     }
+
+
+EMAIL_CODE_MAX_ATTEMPTS = 5
+
+
+def get_user_email(user_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM user_emails WHERE user_id = ?", (user_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_enabled_email(user_id: int) -> str | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT email FROM user_emails WHERE user_id = ? AND is_enabled = 1 AND email IS NOT NULL",
+            (user_id,),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def start_email_verification(user_id: int, email: str, code: str, sent_at: str, expires_at: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_emails (user_id, pending_email, verify_code, code_sent_at, code_expires_at, code_attempts)
+            VALUES (?, ?, ?, ?, ?, 0)
+            ON CONFLICT(user_id) DO UPDATE SET
+                pending_email = excluded.pending_email,
+                verify_code = excluded.verify_code,
+                code_sent_at = excluded.code_sent_at,
+                code_expires_at = excluded.code_expires_at,
+                code_attempts = 0
+            """,
+            (user_id, email, code, sent_at, expires_at),
+        )
+        conn.commit()
+
+
+def confirm_email_code(user_id: int, code: str, now_str: str) -> str:
+    """Return 'ok', 'invalid', 'expired', 'too_many' or 'none'. On 'ok' the address is enabled."""
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT pending_email, verify_code, code_expires_at, code_attempts FROM user_emails WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row or not row["pending_email"] or not row["verify_code"]:
+            conn.rollback()
+            return "none"
+        if row["code_attempts"] >= EMAIL_CODE_MAX_ATTEMPTS:
+            conn.rollback()
+            return "too_many"
+        if row["code_expires_at"] < now_str:
+            conn.rollback()
+            return "expired"
+        if code.strip() != row["verify_code"]:
+            conn.execute("UPDATE user_emails SET code_attempts = code_attempts + 1 WHERE user_id = ?", (user_id,))
+            conn.commit()
+            return "invalid"
+        conn.execute(
+            """
+            UPDATE user_emails
+            SET email = pending_email, is_enabled = 1, pending_email = NULL,
+                verify_code = NULL, code_expires_at = NULL, code_attempts = 0
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
+        conn.commit()
+        return "ok"
+
+
+def set_email_enabled(user_id: int, enabled: bool) -> bool:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE user_emails SET is_enabled = ? WHERE user_id = ? AND email IS NOT NULL",
+            (1 if enabled else 0, user_id),
+        )
+        conn.commit()
+    return cur.rowcount == 1
+
+
+def delete_user_email(user_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM user_emails WHERE user_id = ?", (user_id,))
+        conn.commit()

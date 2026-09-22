@@ -55,6 +55,20 @@ async def _get_token(session: aiohttp.ClientSession) -> str:
     return token
 
 
+def plural_ru(count: int, one: str, few: str, many: str) -> str:
+    """plural_ru(2, "канал", "канала", "каналов") -> "2 канала"."""
+    tail = count % 100
+    if 11 <= tail <= 14:
+        form = many
+    else:
+        form = {1: one, 2: few, 3: few, 4: few}.get(count % 10, many)
+    return f"{count} {form}"
+
+
+def describe_counts(channels: int, posts: int) -> str:
+    return f"{plural_ru(channels, 'канал', 'канала', 'каналов')} · {plural_ru(posts, 'пост', 'поста', 'постов')}"
+
+
 def _build_summary(sections: list[dict]) -> list:
     """A short 'what's inside' block at the top: channels, per-channel post counts, read time."""
     total_posts = sum(len(section.get("posts", [])) for section in sections)
@@ -64,7 +78,7 @@ def _build_summary(sections: list[dict]) -> list:
         for post in section.get("posts", [])
     )
     minutes = max(1, round(total_words / _READING_WPM))
-    summary_line = f"{len(sections)} каналов · {total_posts} постов · ~{minutes} мин чтения"
+    summary_line = f"{describe_counts(len(sections), total_posts)} · ~{minutes} мин чтения"
     items = [
         {"tag": "li", "children": [f"{section.get('title') or 'Канал'} — {len(section.get('posts', []))}"]}
         for section in sections
@@ -93,7 +107,7 @@ def _build_post_node(post: dict) -> dict:
     return {"tag": "p", "children": children or [" "]}
 
 
-def _build_content(sections: list[dict]) -> list:
+def build_content(sections: list[dict]) -> list:
     """Convert digest sections into Telegraph Node objects (plain text, no HTML)."""
     nodes: list = _build_summary(sections)
     for section in sections:
@@ -126,7 +140,7 @@ async def publish_digest(
         session = aiohttp.ClientSession(timeout=REQUEST_TIMEOUT)
     try:
         token = await _get_token(session)
-        content = _truncate_to_limit(_build_content(sections))
+        content = _truncate_to_limit(build_content(sections))
         payload = {
             "access_token": token,
             "title": (title or "Дайджест")[:256],
