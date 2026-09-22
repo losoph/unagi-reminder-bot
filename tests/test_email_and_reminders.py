@@ -182,12 +182,13 @@ class EmailVerificationTests(DatabaseTestCase):
     def confirm(self, code, minutes=1):
         return database.confirm_email_code(1, code, database.serialize_datetime(self.NOW + timedelta(minutes=minutes)))
 
-    def test_happy_path_enables_address(self):
+    def test_happy_path_confirms_address(self):
         self.start()
-        self.assertIsNone(database.get_enabled_email(1))
+        self.assertEqual(database.get_email_delivery(1), (None, set()))
         self.assertEqual(self.confirm("000000"), "invalid")
         self.assertEqual(self.confirm(" 123456 "), "ok")
-        self.assertEqual(database.get_enabled_email(1), "a@example.com")
+        # Confirming does not move any digest away from Telegram by itself.
+        self.assertEqual(database.get_email_delivery(1), ("a@example.com", set()))
         self.assertEqual(self.confirm("123456"), "none")
 
     def test_expired_and_attempt_limit(self):
@@ -197,22 +198,86 @@ class EmailVerificationTests(DatabaseTestCase):
             self.assertEqual(self.confirm("999999"), "invalid")
         self.assertEqual(self.confirm("123456"), "too_many")
 
-    def test_changing_address_keeps_old_until_confirmed(self):
+    def test_changing_address_keeps_old_and_periods_until_confirmed(self):
         self.start()
         self.confirm("123456")
+        database.set_email_period(1, "daily", True)
         self.start(email="b@example.com", code="654321")
-        self.assertEqual(database.get_enabled_email(1), "a@example.com")
+        self.assertEqual(database.get_email_delivery(1), ("a@example.com", {"daily"}))
         self.assertEqual(self.confirm("654321"), "ok")
-        self.assertEqual(database.get_enabled_email(1), "b@example.com")
+        self.assertEqual(database.get_email_delivery(1), ("b@example.com", {"daily"}))
 
-    def test_toggle_and_delete(self):
-        self.assertFalse(database.set_email_enabled(1, True))  # nothing confirmed yet
+    def test_period_toggles_clear_and_delete(self):
+        self.assertFalse(database.set_email_period(1, "daily", True))  # nothing confirmed yet
         self.start()
         self.confirm("123456")
-        self.assertTrue(database.set_email_enabled(1, False))
-        self.assertIsNone(database.get_enabled_email(1))
+        database.set_email_period(1, "daily", True)
+        database.set_email_period(1, "monthly", True)
+        database.set_email_period(1, "daily", False)
+        self.assertEqual(database.get_email_delivery(1), ("a@example.com", {"monthly"}))
+        self.assertTrue(database.clear_email_periods(1))
+        self.assertFalse(database.clear_email_periods(1))
+        self.assertEqual(database.get_email_delivery(1), ("a@example.com", set()))
         database.delete_user_email(1)
         self.assertIsNone(database.get_user_email(1))
+
+    def test_legacy_table_gets_period_column(self):
+        with database.get_connection() as conn:
+            conn.execute("DROP TABLE user_emails")
+            conn.execute("CREATE TABLE user_emails (user_id INTEGER PRIMARY KEY, email TEXT, is_enabled INTEGER)")
+            conn.execute("INSERT INTO user_emails (user_id, email, is_enabled) VALUES (1, 'a@example.com', 1)")
+            conn.commit()
+        database.init_db()
+        self.assertEqual(database.get_email_delivery(1), ("a@example.com", set()))
+
+
+class DigestRoutingTests(unittest.TestCase):
+    """Each period goes either to email or to Telegram; a failed email falls back to Telegram."""
+
+    SECTIONS = [
+        {"period": "daily", "title": "D", "posts": [{"text": "d", "link": "https://t.me/d/1"}]},
+        {"period": "weekly", "title": "W", "posts": [{"text": "w", "link": "https://t.me/w/1"}]},
+        {"period": "monthly", "title": "M", "posts": []},
+    ]
+
+    def run_delivery(self, email_periods, email_ok=True):
+        email = mock.AsyncMock(return_value=email_ok)
+        telegram = mock.AsyncMock()
+        with mock.patch.object(main, "get_email_delivery_periods", return_value=("a@example.com", email_periods)), \
+                mock.patch.object(main, "send_digest_email", email), \
+                mock.patch.object(main, "send_telegram_digest", telegram):
+            delivered = asyncio.run(main.deliver_digest(1, "Газета", [dict(s) for s in self.SECTIONS]))
+        return delivered, email, telegram
+
+    @staticmethod
+    def titles(sections):
+        return [s["title"] for s in sections]
+
+    def test_no_email_everything_to_telegram(self):
+        delivered, email, telegram = self.run_delivery(set())
+        self.assertTrue(delivered)
+        email.assert_not_called()
+        self.assertEqual(self.titles(telegram.call_args.args[2]), ["D", "W"])
+
+    def test_email_period_is_not_sent_to_telegram(self):
+        _, email, telegram = self.run_delivery({"daily"})
+        self.assertEqual(self.titles(email.call_args.args[2]), ["D"])
+        self.assertEqual(self.titles(telegram.call_args.args[2]), ["W"])
+
+    def test_all_email_sends_nothing_to_telegram(self):
+        _, email, telegram = self.run_delivery({"daily", "weekly"})
+        self.assertEqual(self.titles(email.call_args.args[2]), ["D", "W"])
+        telegram.assert_not_called()
+
+    def test_failed_email_falls_back_to_telegram_with_note(self):
+        _, _, telegram = self.run_delivery({"daily"}, email_ok=False)
+        self.assertEqual(self.titles(telegram.call_args.args[2]), ["W", "D"])
+        self.assertIn("почту", telegram.call_args.args[3])
+
+    def test_empty_digest_is_not_delivered(self):
+        with mock.patch.object(main, "get_email_delivery_periods") as periods:
+            self.assertFalse(asyncio.run(main.deliver_digest(1, "Газета", [self.SECTIONS[2]])))
+        periods.assert_not_called()
 
 
 class RescheduleKeepsTagTests(DatabaseTestCase):

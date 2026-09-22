@@ -9,6 +9,15 @@ services:
       - .env
     volumes:
       - ./storage:/app/storage
+      # SMTP для email-дайджестов — тот же msmtp-конфиг, что у серверных алертов.
+      # Только чтение; create_host_path: false — без файла контейнер не стартует,
+      # вместо того чтобы молча создать на хосте пустую директорию.
+      - type: bind
+        source: /root/.msmtprc
+        target: /run/secrets/msmtprc
+        read_only: true
+        bind:
+          create_host_path: false
     mem_limit: 512m
     memswap_limit: 512m
     cpus: 1.5

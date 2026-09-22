@@ -1,4 +1,4 @@
-"""Email copies of digests, sent through the same SMTP account as the server alerts.
+"""Email delivery of digests through the same SMTP account as the server alerts.
 
 SMTP settings come from SMTP_* environment variables; optionally an msmtp config
 (the one the alert scripts use) mounted at MSMTPRC_PATH supplies the defaults.
@@ -166,9 +166,9 @@ def build_digest_email(
     top = ""
     if telegraph_url:
         top = f'<p style="{_TAG_STYLES["p"]}">📖 {_link(telegraph_url, "Открыть в Telegraph")}</p>'
-    footer = "Это копия дайджеста из Telegram-бота Unagi."
+    footer = "Дайджест из Telegram-бота Unagi."
     if manage_url:
-        footer += f" {_link(manage_url, 'Отключить письма')}"
+        footer += f" {_link(manage_url, 'Получать в Telegram вместо почты')}"
     html_body = (
         "<!doctype html>"
         '<html lang="ru"><head><meta charset="utf-8">'
@@ -195,7 +195,7 @@ def build_digest_email(
                 lines.append(f"  {post['link']}")
         lines.append("")
     if manage_url:
-        lines.append(f"Отключить письма: {manage_url}")
+        lines.append(f"Получать в Telegram вместо почты: {manage_url}")
     return html_body, "\n".join(lines)
 
 
