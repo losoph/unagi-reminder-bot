@@ -359,7 +359,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS user_emails (
                 user_id INTEGER PRIMARY KEY,
                 email TEXT,
-                is_enabled INTEGER DEFAULT 0,
+                email_periods TEXT DEFAULT '',
                 pending_email TEXT,
                 verify_code TEXT,
                 code_sent_at DATETIME,
@@ -368,6 +368,11 @@ def init_db():
             )
             '''
         )
+        # Early 2026-09-22 builds had a global is_enabled flag; delivery is now per period.
+        try:
+            cursor.execute("ALTER TABLE user_emails ADD COLUMN email_periods TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
 
         for statement in (
             "ALTER TABLE digest_settings ADD COLUMN send_hour INTEGER DEFAULT 7",
@@ -1368,13 +1373,40 @@ def get_user_email(user_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def get_enabled_email(user_id: int) -> str | None:
+def get_email_delivery(user_id: int) -> tuple[str | None, set[str]]:
+    """Confirmed address and the digest periods delivered by email instead of Telegram."""
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT email FROM user_emails WHERE user_id = ? AND is_enabled = 1 AND email IS NOT NULL",
-            (user_id,),
+            "SELECT email, email_periods FROM user_emails WHERE user_id = ?", (user_id,)
         ).fetchone()
-    return row[0] if row else None
+    if not row or not row["email"]:
+        return None, set()
+    return row["email"], {p for p in (row["email_periods"] or "").split(",") if p}
+
+
+def set_email_period(user_id: int, period: str, enabled: bool) -> bool:
+    email, periods = get_email_delivery(user_id)
+    if not email:
+        return False
+    periods = (periods | {period}) if enabled else (periods - {period})
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE user_emails SET email_periods = ? WHERE user_id = ?",
+            (",".join(sorted(periods)), user_id),
+        )
+        conn.commit()
+    return True
+
+
+def clear_email_periods(user_id: int) -> bool:
+    """Send every digest type back to Telegram. Returns True if something was switched."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE user_emails SET email_periods = '' WHERE user_id = ? AND COALESCE(email_periods, '') != ''",
+            (user_id,),
+        )
+        conn.commit()
+    return cur.rowcount == 1
 
 
 def start_email_verification(user_id: int, email: str, code: str, sent_at: str, expires_at: str) -> None:
@@ -1419,7 +1451,7 @@ def confirm_email_code(user_id: int, code: str, now_str: str) -> str:
         conn.execute(
             """
             UPDATE user_emails
-            SET email = pending_email, is_enabled = 1, pending_email = NULL,
+            SET email = pending_email, pending_email = NULL,
                 verify_code = NULL, code_expires_at = NULL, code_attempts = 0
             WHERE user_id = ?
             """,
@@ -1427,16 +1459,6 @@ def confirm_email_code(user_id: int, code: str, now_str: str) -> str:
         )
         conn.commit()
         return "ok"
-
-
-def set_email_enabled(user_id: int, enabled: bool) -> bool:
-    with get_connection() as conn:
-        cur = conn.execute(
-            "UPDATE user_emails SET is_enabled = ? WHERE user_id = ? AND email IS NOT NULL",
-            (1 if enabled else 0, user_id),
-        )
-        conn.commit()
-    return cur.rowcount == 1
 
 
 def delete_user_email(user_id: int) -> None:

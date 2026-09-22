@@ -37,6 +37,7 @@ from data.database import (
     add_subscription,
     add_telegraph_digest,
     cleanup_old_records,
+    clear_email_periods,
     confirm_email_code,
     clear_subscription_failure,
     count_due_subscriptions,
@@ -48,7 +49,7 @@ from data.database import (
     get_ai_usage_today,
     get_digest_posts,
     get_digest_settings,
-    get_enabled_email,
+    get_email_delivery,
     get_user_email,
     delete_subscription,
     get_channel_posts_since,
@@ -74,7 +75,7 @@ from data.database import (
     serialize_datetime,
     start_email_verification,
     set_all_subscriptions_paused,
-    set_email_enabled,
+    set_email_period,
     set_subscription_paused,
     set_subscription_tag,
     unsubscribe_all,
@@ -166,6 +167,7 @@ _QUICK_RESCHEDULE_ACTION: dict[str, str] = {
 
 _PERIOD_RU = {"daily": "каждый день", "weekly": "раз в неделю", "monthly": "раз в месяц"}
 _PERIOD_TITLES = {"daily": "Ежедневный", "weekly": "Еженедельный", "monthly": "Ежемесячный"}
+_PERIOD_PLURAL = {"daily": "ежедневные", "weekly": "еженедельные", "monthly": "ежемесячные"}
 _WEEKDAY_NOM_RU = {0: "понедельник", 1: "вторник", 2: "среда", 3: "четверг", 4: "пятница", 5: "суббота", 6: "воскресенье"}
 _WEEKDAY_ACC_RU = {0: "понедельник", 1: "вторник", 2: "среду", 3: "четверг", 4: "пятницу", 5: "субботу", 6: "воскресенье"}
 _WEEKDAY_SHORT_RU = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
@@ -450,10 +452,12 @@ def render_digest_settings_text(user_id: int) -> str:
 
     lines = ["⚙️ <b>Настройки дайджеста</b>", ""]
     lines.append("<b>Расписание:</b>")
+    _, email_periods = get_email_delivery_periods(user_id)
     for period in ("daily", "weekly", "monthly"):
         settings = resolve_digest_settings(user_id, period)
+        where = " · 📧 на почту" if period in email_periods else ""
         lines.append(
-            f"• <b>{_PERIOD_TITLES[period]}</b>: {format_digest_schedule(period, settings)}"
+            f"• <b>{_PERIOD_TITLES[period]}</b>: {format_digest_schedule(period, settings)}{where}"
         )
     lines.append("")
 
@@ -937,14 +941,40 @@ def render_digest_lines(title_plain: str, sections: list[dict]) -> list[str]:
     return lines
 
 
+def get_email_delivery_periods(user_id: int) -> tuple[str | None, set[str]]:
+    """Digest periods that go to email *instead of* Telegram (empty when email is unavailable)."""
+    if not email_digest.is_enabled():
+        return None, set()
+    return get_email_delivery(user_id)
+
+
 async def deliver_digest(user_id: int, title_plain: str, sections: list[dict]) -> bool:
-    """Send a digest, switching to Telegraph for large ones. Returns True if delivered."""
+    """Send a digest: each period goes either to email or to Telegram, never both.
+
+    Returns True if delivered. A failed email falls back to Telegram, so posts are never lost.
+    """
     sections = [s for s in sections if s["posts"]]
-    total_posts = sum(len(s["posts"]) for s in sections)
-    if total_posts == 0:
+    if not sections:
         return False
 
-    url = None
+    address, email_periods = get_email_delivery_periods(user_id)
+    email_sections = [s for s in sections if s.get("period") in email_periods]
+    telegram_sections = [s for s in sections if s.get("period") not in email_periods]
+    note = ""
+    if email_sections and not await send_digest_email(address, title_plain, email_sections):
+        telegram_sections += email_sections
+        note = "📧 Не удалось отправить дайджест на почту — присылаю сюда."
+    if telegram_sections:
+        await send_telegram_digest(user_id, title_plain, telegram_sections, note)
+    return True
+
+
+async def send_telegram_digest(user_id: int, title_plain: str, sections: list[dict], note: str = "") -> None:
+    """Telegram delivery, switching to Telegraph for large digests."""
+    total_posts = sum(len(s["posts"]) for s in sections)
+    if note:
+        await bot.send_message(user_id, note)
+
     if total_posts >= DIGEST_TELEGRAPH_THRESHOLD:
         url = await publish_digest(title_plain, sections)
         if url:
@@ -962,31 +992,22 @@ async def deliver_digest(user_id: int, title_plain: str, sections: list[dict]) -
                 parse_mode="HTML",
                 link_preview_options=LinkPreviewOptions(is_disabled=False),
             )
-        else:
-            logger.warning("Telegraph publish failed for user %s, falling back to chunks", user_id)
-
-    if not url:
-        await send_digest_chunks(user_id, render_digest_lines(title_plain, sections))
-    await send_digest_email(user_id, title_plain, sections, url)
-    return True
-
-
-async def send_digest_email(user_id: int, title_plain: str, sections: list[dict], telegraph_url: str | None) -> None:
-    """Email copy of a digest that was already delivered in Telegram; never raises."""
-    if not email_digest.is_enabled():
-        return
-    try:
-        address = get_enabled_email(user_id)
-        if not address:
             return
+        logger.warning("Telegraph publish failed for user %s, falling back to chunks", user_id)
+
+    await send_digest_chunks(user_id, render_digest_lines(title_plain, sections))
+
+
+async def send_digest_email(address: str, title_plain: str, sections: list[dict]) -> bool:
+    """Email delivery of a digest; never raises."""
+    try:
         title = f"{title_plain} — {local_now().strftime('%d.%m.%Y')}"
         manage_url = build_bot_deep_link("em_off")
-        html_body, text_body = email_digest.build_digest_email(
-            title, sections, telegraph_url=telegraph_url, manage_url=manage_url
-        )
-        await email_digest.send_email(address, title, text_body, html_body, unsubscribe_url=manage_url)
+        html_body, text_body = email_digest.build_digest_email(title, sections, manage_url=manage_url)
+        return await email_digest.send_email(address, title, text_body, html_body, unsubscribe_url=manage_url)
     except Exception:
-        logger.exception("Email digest for user %s failed", user_id)
+        logger.exception("Email digest to %s failed", address.split("@", 1)[-1])
+        return False
 
 
 async def fetch_subscription_posts(
@@ -1137,8 +1158,8 @@ async def handle_digest_deep_link(message: types.Message, payload: str) -> bool:
         return True
 
     if payload == "em_off":
-        if set_email_enabled(user_id, False):
-            await message.answer("📭 Письма с дайджестами отключены. Включить снова — /email.")
+        if clear_email_periods(user_id):
+            await message.answer("📭 Письма с дайджестами отключены — все дайджесты снова приходят сюда, в Telegram. Вернуть почту — /email.")
         else:
             await message.answer("Письма с дайджестами и так не приходят. Настроить — /email.")
         return True
@@ -1211,7 +1232,7 @@ WELCOME_TEXT = (
     "3️⃣ Напиши /list для задач, /list_digest для дайджестов или /saved для Избранного.\n"
     "4️⃣ Доставленное напоминание можно отложить кнопкой «⏰ Отложить» или ответить на него текстом: "
     "«завтра 11», «24/09 в 9», «через 2 дня».\n"
-    "5️⃣ Дайджесты можно получать и на почту — /email."
+    "5️⃣ Дайджесты можно получать на почту вместо Telegram — /email."
 )
 
 
@@ -1393,7 +1414,7 @@ async def cmd_help(message: types.Message, state: FSMContext):
         "/list_digest — Посмотреть и настроить мои подписки\n"
         "/test_digest — Мгновенно собрать дайджест по подпискам за 24ч\n"
         "/check — Проверить, что все каналы читаются\n"
-        "/email — Получать копию дайджестов на почту\n"
+        "/email — Получать дайджесты на почту вместо Telegram (по типам)\n"
         "💡 <i>Перешлите пост из открытого канала или пришлите ссылку на него (t.me/канал, t.me/s/канал, @канал), чтобы подписаться.</i>\n"
         "💡 <i>В «Мои подписки» можно ставить каналы на паузу, раскладывать по папкам и спрашивать ИИ про частоту постинга и саммари.</i>\n"
         "ℹ️ <i>Большие дайджесты (4+ постов) приходят одной ссылкой на Telegraph.</i>\n\n"
@@ -4002,13 +4023,23 @@ def build_email_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     if not email_digest.is_enabled():
         return title + "Отправка писем пока не настроена на сервере.", InlineKeyboardMarkup(inline_keyboard=[back_row])
 
-    record = get_user_email(user_id)
-    if record and record.get("email"):
-        enabled = bool(record["is_enabled"])
-        status = "✅ включён — копия каждого дайджеста приходит на почту" if enabled else "⏸ выключен"
-        text = f"{title}Адрес: <b>{html.escape(record['email'])}</b>\nСтатус: {status}"
+    address, email_periods = get_email_delivery(user_id)
+    if address:
+        text = (
+            f"{title}Адрес: <b>{html.escape(address)}</b>\n\n"
+            "Каждый тип дайджеста приходит <b>либо сюда, либо на почту</b> — не в оба места. "
+            "Нажми на тип, чтобы переключить:"
+        )
         rows = [
-            [InlineKeyboardButton(text="⏸ Выключить" if enabled else "▶️ Включить", callback_data="email_toggle")],
+            [
+                InlineKeyboardButton(
+                    text=f"{_PERIOD_TITLES[period]}: {'📧 Почта' if period in email_periods else '💬 Telegram'}",
+                    callback_data=f"email_period_{period}",
+                )
+            ]
+            for period in _PERIOD_TITLES
+        ]
+        rows += [
             [
                 InlineKeyboardButton(text="✏️ Сменить адрес", callback_data="email_set"),
                 InlineKeyboardButton(text="🗑 Удалить", callback_data="email_delete"),
@@ -4017,7 +4048,9 @@ def build_email_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         ]
     else:
         text = (
-            f"{title}Дайджесты будут приходить и сюда, и копией на почту — с той же вёрсткой, что в Telegraph.\n"
+            f"{title}Дайджесты можно получать на почту — с той же вёрсткой, что в Telegraph. "
+            "Выбранные типы (ежедневный, еженедельный, ежемесячный) будут приходить только на почту, "
+            "остальные — как раньше, сюда.\n\n"
             "Укажи адрес, и я пришлю на него код подтверждения."
         )
         rows = [[InlineKeyboardButton(text="✏️ Указать адрес", callback_data="email_set")], back_row]
@@ -4043,22 +4076,41 @@ async def open_email_menu(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.callback_query(F.data == "email_toggle")
-async def toggle_email(callback: CallbackQuery):
-    record = get_user_email(callback.from_user.id)
-    if record and record.get("email"):
-        set_email_enabled(callback.from_user.id, not record["is_enabled"])
-    text, markup = build_email_menu(callback.from_user.id)
+@dp.callback_query(F.data.startswith("email_period_"))
+async def toggle_email_period(callback: CallbackQuery):
+    period = parse_callback_strip_prefix(callback.data, "email_period_")
+    if period not in _PERIOD_TITLES:
+        await callback.answer("❌ Некорректные данные.")
+        return
+    user_id = callback.from_user.id
+    address, email_periods = get_email_delivery(user_id)
+    if not address:
+        await callback.answer("Сначала подтверди адрес почты.", show_alert=True)
+        return
+    to_email = period not in email_periods
+    set_email_period(user_id, period, to_email)
+    name = _PERIOD_PLURAL[period]
+    warning = (
+        f"📧 Теперь {name} дайджесты приходят только на почту {address}.\n\n"
+        "⚠️ В Telegram они больше приходить не будут."
+        if to_email
+        else f"💬 Теперь {name} дайджесты приходят сюда, в Telegram.\n\n⚠️ Письма по ним отключены."
+    )
+    text, markup = build_email_menu(user_id)
     await edit_or_answer(callback, text, reply_markup=markup)
-    await callback.answer()
+    await callback.answer(warning, show_alert=True)
 
 
 @dp.callback_query(F.data == "email_delete")
 async def remove_email(callback: CallbackQuery):
+    _, email_periods = get_email_delivery(callback.from_user.id)
     delete_user_email(callback.from_user.id)
     text, markup = build_email_menu(callback.from_user.id)
     await edit_or_answer(callback, text, reply_markup=markup)
-    await callback.answer("Адрес удалён")
+    if email_periods:
+        await callback.answer("Адрес удалён. ⚠️ Все дайджесты снова приходят в Telegram.", show_alert=True)
+    else:
+        await callback.answer("Адрес удалён")
 
 
 @dp.callback_query(F.data == "email_set")
@@ -4129,7 +4181,7 @@ async def process_email_code(message: types.Message, state: FSMContext):
         return
     await state.clear()
     notices = {
-        "ok": "✅ Почта подтверждена — копии дайджестов будут приходить туда.",
+        "ok": "✅ Почта подтверждена. Выбери ниже, какие дайджесты получать на почту вместо Telegram.",
         "expired": "⌛ Код устарел — запроси новый.",
         "too_many": "🚫 Слишком много попыток — запроси новый код.",
     }
