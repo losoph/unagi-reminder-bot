@@ -10,9 +10,11 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+      - name: Lint (pyflakes errors only)
+        run: pipx run ruff==0.16.8 check .
       - name: Build production image
         run: docker build -t unagi-reminder-bot:test .
-      - name: Run digest regression tests
+      - name: Run regression tests
         run: docker run --rm unagi-reminder-bot:test python -m unittest discover -s tests -v
 
   deploy:

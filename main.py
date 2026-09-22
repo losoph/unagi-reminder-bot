@@ -42,7 +42,6 @@ from data.database import (
     delete_saved_message,
     export_user_data,
     get_ai_usage_today,
-    get_digest_post_channels,
     get_digest_posts,
     get_digest_settings,
     delete_subscription,
@@ -3541,7 +3540,7 @@ async def handle_bksched_init(callback: CallbackQuery, state: FSMContext):
 
     markup = build_time_selection_keyboard(f"bksched_choice_{msg_id}")
     await callback.message.edit_text(
-        f"⏰ <b>Перенос закладки в напоминание</b>\n\nВыбери время отправки напоминания:",
+        "⏰ <b>Перенос закладки в напоминание</b>\n\nВыбери время отправки напоминания:",
         parse_mode="HTML",
         reply_markup=markup
     )
@@ -3558,11 +3557,7 @@ async def handle_bksched_choice(callback: CallbackQuery, state: FSMContext):
     if callback_message is None:
         await callback.answer("❌ Сообщение недоступно.")
         return
-        
-    data = await state.get_data()
-    current_tag = data.get("kb_current_tag")
-    current_page = data.get("kb_current_page")
-    
+
     msg_data = get_saved_message_by_id(callback_message.chat.id, msg_id)
     if not msg_data:
         await callback.answer("❌ Закладка не найдена.")
@@ -3638,8 +3633,6 @@ async def complete_manual_schedule(
     is_bksched = data.get("is_bookmark_scheduling")
     bookmark_msg_id = data.get("bookmark_msg_id")
     bookmark_tag = data.get("bookmark_tag")
-    current_tag = data.get("kb_current_tag")
-    current_page = data.get("kb_current_page")
 
     rem_reschedule_id = data.get("rem_reschedule_id")
     rem_current_tag = data.get("rem_current_tag")
@@ -4493,9 +4486,13 @@ async def check_digests():
 async def cleanup_database():
     while True:
         now_str = serialize_datetime(utc_now())
-        cleanup_stats = cleanup_old_records(now_str)
-        if any(cleanup_stats.values()):
-            logger.info("Очистка SQLite завершена: %s", cleanup_stats)
+        try:
+            # Bulk DELETEs over the history tables — keep them off the event loop.
+            cleanup_stats = await asyncio.to_thread(cleanup_old_records, now_str)
+            if any(cleanup_stats.values()):
+                logger.info("Очистка SQLite завершена: %s", cleanup_stats)
+        except Exception:
+            logger.exception("Очистка SQLite упала, повторю в следующем цикле")
         await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
 
 
