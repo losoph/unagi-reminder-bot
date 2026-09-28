@@ -94,6 +94,7 @@ from channel_source import HybridChannelSource
 import ai_assistant
 import email_digest
 from channel_links import find_channel_username, is_private_invite
+from ranking import prioritize_channel_posts
 from telegraph_publisher import describe_counts, publish_digest
 from time_parser import parse_reminder_time
 
@@ -1085,8 +1086,6 @@ async def fetch_subscription_posts(
                 )
                 delivered_marker = parse_db_datetime(last_scraped)
                 delivered_post_id = last_post_id
-
-            from ranking import prioritize_channel_posts
 
             selected_posts, omitted_count = prioritize_channel_posts(username, posts)
             return {
@@ -4042,8 +4041,6 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
 
         sub_id, period, title, username, posts = result
         if posts:
-            from ranking import prioritize_channel_posts
-
             selected_posts, omitted_count = prioritize_channel_posts(username, posts)
             if selected_posts:
                 sections.append(
