@@ -915,12 +915,27 @@ def format_post_preview(text: str, max_chars: int = TELEGRAM_PREVIEW_CHARS) -> s
     return cleaned
 
 
-def append_digest_channel_lines(lines: list[str], sub_id: int, period: str, channel_title: str | None, posts: list[dict]):
+def append_digest_channel_lines(
+    lines: list[str],
+    sub_id: int,
+    period: str,
+    channel_title: str | None,
+    posts: list[dict],
+    omitted_count: int = 0,
+    channel_username: str | None = None,
+):
     unsubscribe_link = build_digest_action_link("Отписаться", f"du_{sub_id}")
     lines.append(f"📌 <b>{html.escape(channel_title) if channel_title else 'Канал'}</b>  {unsubscribe_link}")
     for post in posts:
         text_safe = html.escape(format_post_preview(post.get("text") or ""))
         lines.append(f"🔹 <i>{text_safe}</i> <a href='{post['link']}'>[Читать]</a>\n")
+
+    if omitted_count > 0 and channel_username:
+        from telegraph_publisher import plural_ru
+
+        clean_user = channel_username.lstrip("@")
+        post_str = plural_ru(omitted_count, "пост", "поста", "постов")
+        lines.append(f"▫️ <a href='https://t.me/{clean_user}'>ещё {post_str} в канале</a>\n")
 
     move_links = []
     for target_period in ("daily", "weekly", "monthly"):
@@ -945,6 +960,8 @@ def render_digest_lines(title_plain: str, sections: list[dict]) -> list[str]:
             section["period"],
             section["title"],
             section["posts"],
+            omitted_count=section.get("omitted_count", 0),
+            channel_username=section.get("username") or section.get("channel_username"),
         )
     lines.append(build_digest_action_link("⚙️ Настройки дайджеста", "ds"))
     return lines
@@ -1058,6 +1075,9 @@ async def fetch_subscription_posts(
                 (post["id"] for post in posts if post.get("id") is not None),
                 default=last_post_id,
             )
+            from ranking import prioritize_channel_posts
+
+            selected_posts, omitted_count = prioritize_channel_posts(username, posts)
             return {
                 "status": "ok",
                 "sub_id": sub_id,
@@ -1065,7 +1085,8 @@ async def fetch_subscription_posts(
                 "username": username,
                 "title": title,
                 "title_safe": title_safe,
-                "posts": posts,
+                "posts": selected_posts,
+                "omitted_count": omitted_count,
                 "next_send_str": next_send_str,
                 "last_scraped_str": serialize_datetime(delivered_marker),
                 "last_post_id": delivered_post_id,
@@ -4009,7 +4030,20 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
 
         sub_id, period, title, username, posts = result
         if posts:
-            sections.append({"sub_id": sub_id, "period": period, "title": title or "Канал", "posts": posts})
+            from ranking import prioritize_channel_posts
+
+            selected_posts, omitted_count = prioritize_channel_posts(username, posts)
+            if selected_posts:
+                sections.append(
+                    {
+                        "sub_id": sub_id,
+                        "period": period,
+                        "title": title or "Канал",
+                        "username": username,
+                        "posts": selected_posts,
+                        "omitted_count": omitted_count,
+                    }
+                )
             try:
                 add_digest_posts(user_id, username, title, posts)
             except Exception:

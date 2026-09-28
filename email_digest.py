@@ -193,6 +193,13 @@ def build_digest_email(
             lines.append(f"- {(post.get('text') or '').strip()}")
             if post.get("link"):
                 lines.append(f"  {post['link']}")
+        omitted_count = section.get("omitted_count", 0)
+        ch_user = (section.get("username") or section.get("channel_username") or "").lstrip("@")
+        if omitted_count > 0 and ch_user:
+            from telegraph_publisher import plural_ru
+
+            post_str = plural_ru(omitted_count, "пост", "поста", "постов")
+            lines.append(f"- ещё {post_str}: https://t.me/{ch_user}")
         lines.append("")
     if manage_url:
         lines.append(f"Получать в Telegram вместо почты: {manage_url}")

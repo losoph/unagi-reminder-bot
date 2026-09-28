@@ -121,6 +121,17 @@ def build_content(sections: list[dict]) -> list:
         nodes.append({"tag": "h4", "children": [str(title)]})
         for post in section.get("posts", []):
             nodes.append(_build_post_node(post))
+        omitted_count = section.get("omitted_count", 0)
+        ch_user = (section.get("username") or section.get("channel_username") or "").lstrip("@")
+        if omitted_count > 0 and ch_user:
+            post_str = plural_ru(omitted_count, "пост", "поста", "постов")
+            ch_url = f"https://t.me/{ch_user}"
+            nodes.append({
+                "tag": "p",
+                "children": [
+                    {"tag": "a", "attrs": {"href": ch_url}, "children": [f"▫️ ещё {post_str} в канале"]}
+                ],
+            })
         nodes.append({"tag": "hr"})
     return nodes
 
