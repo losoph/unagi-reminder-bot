@@ -308,6 +308,23 @@ class MtprotoSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(posts[0]["text"]), 3000)
         self.assertEqual(posts[0]["text"], full_text)
 
+    async def test_channel_source_retains_full_post_text(self):
+        source = HybridChannelSource()
+        full_text = "C" * 3000
+        source._client = FakeMessageClient(
+            [
+                SimpleNamespace(
+                    id=44,
+                    date=datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc),
+                    message=full_text,
+                ),
+            ]
+        )
+        posts, origin = await source.fetch("example", "2026-07-24 09:00:00", web_session=None)
+        self.assertEqual(origin, "mtproto")
+        self.assertEqual(len(posts[0]["text"]), 3000)
+        self.assertEqual(posts[0]["text"], full_text)
+
     async def test_mtproto_skips_posts_without_text(self):
         source = HybridChannelSource()
         source._client = FakeMessageClient(
