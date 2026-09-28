@@ -122,6 +122,8 @@ DIGEST_CHECK_INTERVAL_SECONDS = int(os.getenv("DIGEST_CHECK_INTERVAL_SECONDS", 3
 CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 # Дайджесты с таким числом постов и более публикуются в Telegraph одной ссылкой.
 DIGEST_TELEGRAPH_THRESHOLD = int(os.getenv("DIGEST_TELEGRAPH_THRESHOLD", "4"))
+# Максимальная длина превью поста в Telegram-сообщении дайджеста.
+TELEGRAM_PREVIEW_CHARS = int(os.getenv("TELEGRAM_PREVIEW_CHARS", "300"))
 # Лимиты на импорт, чтобы один файл не положил бота.
 MAX_IMPORT_SUBSCRIPTIONS = int(os.getenv("MAX_IMPORT_SUBSCRIPTIONS", "300"))
 MAX_IMPORT_BOOKMARKS = int(os.getenv("MAX_IMPORT_BOOKMARKS", "1000"))
@@ -906,11 +908,18 @@ def build_digest_action_link(label: str, payload: str) -> str:
     return f"{label} ({fallback_text})"
 
 
+def format_post_preview(text: str, max_chars: int = TELEGRAM_PREVIEW_CHARS) -> str:
+    cleaned = (text or "").strip()
+    if max_chars and len(cleaned) > max_chars:
+        return cleaned[: max_chars - 3] + "..."
+    return cleaned
+
+
 def append_digest_channel_lines(lines: list[str], sub_id: int, period: str, channel_title: str | None, posts: list[dict]):
     unsubscribe_link = build_digest_action_link("Отписаться", f"du_{sub_id}")
     lines.append(f"📌 <b>{html.escape(channel_title) if channel_title else 'Канал'}</b>  {unsubscribe_link}")
     for post in posts:
-        text_safe = html.escape(post["text"])
+        text_safe = html.escape(format_post_preview(post.get("text") or ""))
         lines.append(f"🔹 <i>{text_safe}</i> <a href='{post['link']}'>[Читать]</a>\n")
 
     move_links = []

@@ -94,8 +94,6 @@ class HybridChannelSource:
                     reached_marker = True
                     break
                 text = (message.message or "Медиа-файл или сообщение без текста").strip()
-                if len(text) > 300:
-                    text = text[:297] + "..."
                 posts.append(
                     {
                         "id": message.id,

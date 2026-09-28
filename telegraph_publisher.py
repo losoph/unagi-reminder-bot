@@ -15,6 +15,8 @@ _ENV_TOKEN = os.getenv("TELEGRAPH_TOKEN")
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20)
 # Telegraph hard-limits a page to ~64 KB of content nodes.
 _MAX_CONTENT_BYTES = 60_000
+# Maximum characters for a single post on a Telegraph page.
+TELEGRAPH_POST_CHARS = int(os.getenv("TELEGRAPH_POST_CHARS", "1500"))
 # Average adult silent-reading speed, words/minute — used only for the digest's
 # rough "~N мин" estimate at the top.
 _READING_WPM = 200
@@ -90,8 +92,12 @@ def _build_summary(sections: list[dict]) -> list:
     ]
 
 
-def _build_post_node(post: dict) -> dict:
+def _build_post_node(post: dict, max_chars: int | None = None) -> dict:
+    if max_chars is None:
+        max_chars = TELEGRAPH_POST_CHARS
     text = (post.get("text") or "").strip()
+    if max_chars and len(text) > max_chars:
+        text = text[: max_chars - 3] + "..."
     children: list = []
     if text:
         first, rest = _split_first_sentence(text)
@@ -119,12 +125,72 @@ def build_content(sections: list[dict]) -> list:
     return nodes
 
 
-def _truncate_to_limit(content: list) -> list:
-    """Drop trailing nodes until the JSON payload fits Telegraph's size limit."""
-    while content and len(json.dumps(content, ensure_ascii=False).encode("utf-8")) > _MAX_CONTENT_BYTES:
+def _is_post_node(node: dict) -> bool:
+    if not isinstance(node, dict) or node.get("tag") != "p":
+        return False
+    children = node.get("children", [])
+    for child in children:
+        if child == "🔹 ":
+            return True
+        if isinstance(child, dict) and child.get("tag") == "a" and child.get("children") == ["Читать"]:
+            return True
+    return False
+
+
+def _build_truncation_notice(omitted_count: int) -> dict:
+    post_str = plural_ru(omitted_count, "пост не вошёл", "поста не вошли", "постов не вошли")
+    return {
+        "tag": "p",
+        "children": [
+            {
+                "tag": "b",
+                "children": [f"⚠️ Выпуск усечён: ещё {omitted_count} {post_str} из-за лимита размера страницы."],
+            }
+        ],
+    }
+
+
+def _content_bytes(content: list) -> int:
+    return len(json.dumps(content, ensure_ascii=False).encode("utf-8"))
+
+
+def _truncate_to_limit(content: list, max_bytes: int = _MAX_CONTENT_BYTES) -> list:
+    """Drop trailing nodes until the JSON payload fits Telegraph's size limit,
+
+    adding an explicit notice and warning if posts had to be omitted.
+    """
+    if _content_bytes(content) <= max_bytes:
+        return content
+
+    omitted_posts = 0
+    while content:
+        notice = _build_truncation_notice(omitted_posts + 1)
+        if _content_bytes(content + [notice]) <= max_bytes:
+            break
+        node = content.pop()
+        if _is_post_node(node):
+            omitted_posts += 1
+
+    # Remove trailing empty channel headers or hr
+    while content and content[-1].get("tag") in ("h4", "hr"):
         content.pop()
-    if not content:
+
+    if omitted_posts > 0:
+        notice = _build_truncation_notice(omitted_posts)
+        while content and _content_bytes(content + [notice]) > max_bytes:
+            node = content.pop()
+            if _is_post_node(node):
+                omitted_posts += 1
+                notice = _build_truncation_notice(omitted_posts)
+        content.append(notice)
+        logger.warning(
+            "Telegraph content truncated to %d bytes: %d posts omitted",
+            max_bytes,
+            omitted_posts,
+        )
+    elif not content:
         content = [{"tag": "p", "children": ["Дайджест слишком большой для предпросмотра."]}]
+
     return content
 
 

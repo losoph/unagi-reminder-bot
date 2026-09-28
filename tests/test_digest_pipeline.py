@@ -4,6 +4,9 @@ import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+# main.py builds the Bot at import time and refuses to start without a token.
+os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN_FOR_UNIT_TESTS")
+
 from channel_source import HybridChannelSource
 from scraper import ChannelFetchError, _parse_channel_html
 
@@ -44,6 +47,16 @@ class ScraperValidationTests(unittest.TestCase):
             datetime(2026, 7, 24, 9, 0, tzinfo=timezone.utc),
         )
         self.assertEqual(posts, [])
+
+    def test_scraper_retains_full_post_text(self):
+        full_text = "A" * 3000
+        posts = _parse_channel_html(
+            message_html(42, "2026-07-24T10:00:00+00:00", text=full_text),
+            "example",
+            datetime(2026, 7, 24, 9, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(len(posts[0]["text"]), 3000)
+        self.assertEqual(posts[0]["text"], full_text)
 
 
 class DigestCursorTests(unittest.TestCase):
@@ -101,6 +114,25 @@ class DigestCursorTests(unittest.TestCase):
         )
         posts = db.get_channel_posts_since("example", None, last_post_id=41)
         self.assertEqual([post["id"] for post in posts], [42])
+
+    def test_database_stores_and_returns_full_post_text(self):
+        db = self.database
+        full_text = "C" * 3000
+        db.upsert_channel_posts(
+            "Example",
+            [
+                {
+                    "id": 100,
+                    "time": datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc),
+                    "text": full_text,
+                    "link": "https://t.me/example/100",
+                }
+            ],
+            "mtproto",
+        )
+        posts = db.get_channel_posts_since("example", None, last_post_id=99)
+        self.assertEqual(len(posts[0]["text"]), 3000)
+        self.assertEqual(posts[0]["text"], full_text)
 
     def test_init_reactivates_legacy_network_failures(self):
         db = self.database
@@ -174,6 +206,75 @@ class MtprotoSourceTests(unittest.IsolatedAsyncioTestCase):
         )
         posts = await source._fetch_mtproto("example", "2026-07-24 09:00:00")
         self.assertEqual([post["id"] for post in posts], [42])
+
+    async def test_mtproto_retains_full_post_text(self):
+        source = HybridChannelSource()
+        full_text = "B" * 3000
+        source._client = FakeMessageClient(
+            [
+                SimpleNamespace(
+                    id=43,
+                    date=datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc),
+                    message=full_text,
+                ),
+            ]
+        )
+        posts = await source._fetch_mtproto("example", "2026-07-24 09:00:00")
+        self.assertEqual(len(posts[0]["text"]), 3000)
+        self.assertEqual(posts[0]["text"], full_text)
+
+
+class DigestRenderingTests(unittest.TestCase):
+    def test_telegram_preview_truncates_long_post(self):
+        import main
+
+        full_text = "D" * 3000
+        posts = [{"id": 1, "text": full_text, "link": "https://t.me/example/1"}]
+        lines = []
+        main.append_digest_channel_lines(lines, 1, "daily", "Channel", posts)
+        rendered = "\n".join(lines)
+        expected_preview = "D" * 297 + "..."
+        self.assertIn(expected_preview, rendered)
+        self.assertNotIn(full_text, rendered)
+        self.assertEqual(len(main.format_post_preview(full_text)), 300)
+
+    def test_telegraph_build_post_node_truncates_to_telegraph_post_chars(self):
+        from telegraph_publisher import TELEGRAPH_POST_CHARS, _build_post_node
+
+        full_text = "E" * 3000
+        post = {"id": 1, "text": full_text, "link": "https://t.me/example/1"}
+        node = _build_post_node(post)
+        node_text = "".join(
+            c if isinstance(c, str) else (c.get("children", [""])[0] if isinstance(c.get("children"), list) else "")
+            for c in node.get("children", [])
+        )
+        self.assertNotIn(full_text, node_text)
+        self.assertIn("...", node_text)
+        self.assertLessEqual(len(node_text), TELEGRAPH_POST_CHARS + 50)
+
+    def test_telegraph_truncate_to_limit_emits_warning_and_notice(self):
+        import logging
+        from telegraph_publisher import _truncate_to_limit, build_content
+
+        sections = [
+            {
+                "title": f"Channel {i}",
+                "posts": [
+                    {"id": j, "text": f"Post {j} " + "X" * 1000, "link": f"https://t.me/ch{i}/{j}"}
+                    for j in range(10)
+                ],
+            }
+            for i in range(5)
+        ]
+        content = build_content(sections)
+        with self.assertLogs("telegraph_publisher", level=logging.WARNING) as log:
+            truncated = _truncate_to_limit(content, max_bytes=20000)
+
+        self.assertTrue(any("posts omitted" in record.getMessage() for record in log.records))
+        last_node = truncated[-1]
+        self.assertEqual(last_node.get("tag"), "p")
+        notice_text = str(last_node)
+        self.assertIn("Выпуск усечён", notice_text)
 
 
 if __name__ == "__main__":
