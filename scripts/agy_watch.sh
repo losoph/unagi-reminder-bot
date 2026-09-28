@@ -25,11 +25,16 @@ _need_jq() { command -v jq >/dev/null || { echo "нужен jq"; exit 1; }; }
 
 case "${1:-steps}" in
   run|cont)
-    prompt="${2:?нужен промпт}"
-    args=(-p "$prompt" --output-format stream-json)
-    [ "$1" = "cont" ] && args=(-c "${args[@]}")
-    # agy — алиас с прокси, поэтому через интерактивный zsh
-    zsh -ic "agy ${args[*]@Q}" 2>&1 | tee -a "$LOG" >/dev/null
+    # Промпт передаётся ФАЙЛОМ: подстановку делает сам zsh, поэтому любой
+    # многострочный текст с кавычками и не-ASCII проходит без искажений.
+    # agy — это алиас, задающий прокси, поэтому нужен интерактивный zsh (-i);
+    # креды прокси остаются в личном ~/.zshrc и в репозиторий не попадают.
+    AGY_TASK_FILE="${2:?нужен путь к файлу с промптом}"
+    [ -r "$AGY_TASK_FILE" ] || { echo "файл не читается: $AGY_TASK_FILE"; exit 1; }
+    export AGY_TASK_FILE
+    flag=""; [ "$1" = "cont" ] && flag="-c"
+    zsh -ic "agy $flag -p \"\$(cat \"\$AGY_TASK_FILE\")\" --output-format stream-json" \
+      2>&1 | tee -a "$LOG" >/dev/null
     echo "прогон записан в $LOG"
     "$0" result
     ;;
