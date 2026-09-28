@@ -5,7 +5,7 @@ import re
 
 import aiohttp
 
-from data.database import get_app_meta, set_app_meta
+from data.database import delete_app_meta, get_app_meta, set_app_meta
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +39,7 @@ def _split_first_sentence(text: str) -> tuple[str, str]:
     return text[:end].strip(), text[end:].strip()
 
 
-async def _get_token(session: aiohttp.ClientSession) -> str:
-    if _ENV_TOKEN:
-        return _ENV_TOKEN
-    token = get_app_meta(_TOKEN_META_KEY)
-    if token:
-        return token
+async def _create_token(session: aiohttp.ClientSession) -> str:
     async with session.post(
         f"{TELEGRAPH_API}/createAccount",
         data={"short_name": "UnagiDigest", "author_name": "Unagi"},
@@ -55,6 +50,16 @@ async def _get_token(session: aiohttp.ClientSession) -> str:
     token = data["result"]["access_token"]
     set_app_meta(_TOKEN_META_KEY, token)
     return token
+
+
+async def _get_token(session: aiohttp.ClientSession) -> str:
+    global _ENV_TOKEN
+    if _ENV_TOKEN:
+        return _ENV_TOKEN
+    token = get_app_meta(_TOKEN_META_KEY)
+    if token:
+        return token
+    return await _create_token(session)
 
 
 def plural_ru(count: int, one: str, few: str, many: str) -> str:
@@ -212,6 +217,7 @@ async def publish_digest(
     session: aiohttp.ClientSession | None = None,
 ) -> str | None:
     """Publish a digest to telegra.ph and return the page URL (or None on failure)."""
+    global _ENV_TOKEN
     own_session = session is None
     if own_session:
         session = aiohttp.ClientSession(timeout=REQUEST_TIMEOUT)
@@ -227,6 +233,23 @@ async def publish_digest(
         async with session.post(f"{TELEGRAPH_API}/createPage", data=payload) as response:
             data = await response.json()
         if not data.get("ok"):
+            error_msg = str(data.get("error", ""))
+            if "ACCESS_TOKEN_INVALID" in error_msg.upper():
+                logger.warning(
+                    "Telegraph access token is invalid (%s); deleting from app_meta, creating new token and retrying",
+                    error_msg,
+                )
+                delete_app_meta(_TOKEN_META_KEY)
+                _ENV_TOKEN = None
+                new_token = await _create_token(session)
+                retry_payload = {**payload, "access_token": new_token}
+                async with session.post(f"{TELEGRAPH_API}/createPage", data=retry_payload) as retry_response:
+                    retry_data = await retry_response.json()
+                if not retry_data.get("ok"):
+                    logger.error("Telegraph createPage retry failed: %s", retry_data)
+                    return None
+                return retry_data["result"]["url"]
+
             logger.error("Telegraph createPage failed: %s", data)
             return None
         return data["result"]["url"]

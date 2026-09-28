@@ -533,5 +533,113 @@ class WebFallbackPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delivered_post_id, last_post_id)
 
 
+class FakeJsonResponse:
+    def __init__(self, data, status=200):
+        self._data = data
+        self.status = status
+
+    async def json(self):
+        return self._data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
+class FakeTelegraphSession:
+    def __init__(self, post_handler):
+        self.post_handler = post_handler
+        self.calls = []
+
+    def post(self, url, data=None):
+        self.calls.append((url, data))
+        return self.post_handler(url, data)
+
+
+class TelegraphPublisherTokenRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        from data import database
+
+        self.database = database
+        self.original_db_path = database.DB_PATH
+        database.DB_PATH = os.path.join(self.temp_dir.name, "telegraph_test.db")
+        database.init_db()
+
+    def tearDown(self):
+        self.database.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+
+    def test_delete_app_meta(self):
+        self.database.set_app_meta("test_key", "val123")
+        self.assertEqual(self.database.get_app_meta("test_key"), "val123")
+        self.database.delete_app_meta("test_key")
+        self.assertIsNone(self.database.get_app_meta("test_key"))
+
+    async def test_telegraph_token_invalid_recovery_and_retry(self):
+        import logging
+        from telegraph_publisher import _TOKEN_META_KEY, publish_digest
+
+        self.database.set_app_meta(_TOKEN_META_KEY, "expired_token_123")
+
+        call_log = []
+
+        def handler(url, data):
+            call_log.append((url, dict(data) if isinstance(data, dict) else data))
+            if url.endswith("/createPage"):
+                if data.get("access_token") == "expired_token_123":
+                    return FakeJsonResponse({"ok": False, "error": "ACCESS_TOKEN_INVALID"})
+                elif data.get("access_token") == "fresh_token_456":
+                    return FakeJsonResponse({"ok": True, "result": {"url": "https://telegra.ph/digest-success"}})
+            elif url.endswith("/createAccount"):
+                return FakeJsonResponse({"ok": True, "result": {"access_token": "fresh_token_456"}})
+            return FakeJsonResponse({"ok": False, "error": "unknown"})
+
+        fake_session = FakeTelegraphSession(handler)
+        sections = [{"title": "News", "posts": [{"id": 1, "text": "Post 1", "link": "https://t.me/c/1"}]}]
+
+        with self.assertLogs("telegraph_publisher", level=logging.WARNING) as log:
+            url = await publish_digest("Test Digest", sections, session=fake_session)
+
+        self.assertEqual(url, "https://telegra.ph/digest-success")
+
+        warnings = [r for r in log.records if r.levelno == logging.WARNING]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("ACCESS_TOKEN_INVALID", warnings[0].getMessage())
+
+        errors = [r for r in log.records if r.levelno >= logging.ERROR]
+        self.assertEqual(len(errors), 0)
+
+        self.assertEqual(self.database.get_app_meta(_TOKEN_META_KEY), "fresh_token_456")
+
+        self.assertEqual(len(call_log), 3)
+        self.assertTrue(call_log[0][0].endswith("/createPage"))
+        self.assertEqual(call_log[0][1]["access_token"], "expired_token_123")
+        self.assertTrue(call_log[1][0].endswith("/createAccount"))
+        self.assertTrue(call_log[2][0].endswith("/createPage"))
+        self.assertEqual(call_log[2][1]["access_token"], "fresh_token_456")
+
+    async def test_telegraph_token_invalid_recovery_fails_gracefully(self):
+        from telegraph_publisher import _TOKEN_META_KEY, publish_digest
+
+        self.database.set_app_meta(_TOKEN_META_KEY, "expired_token_123")
+
+        def handler(url, data):
+            if url.endswith("/createPage"):
+                return FakeJsonResponse({"ok": False, "error": "ACCESS_TOKEN_INVALID"})
+            elif url.endswith("/createAccount"):
+                return FakeJsonResponse({"ok": True, "result": {"access_token": "fresh_token_456"}})
+            return FakeJsonResponse({"ok": False, "error": "unknown"})
+
+        fake_session = FakeTelegraphSession(handler)
+        sections = [{"title": "News", "posts": [{"id": 1, "text": "Post 1"}]}]
+
+        url = await publish_digest("Test Digest", sections, session=fake_session)
+        self.assertIsNone(url)
+        self.assertEqual(len(fake_session.calls), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

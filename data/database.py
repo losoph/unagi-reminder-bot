@@ -1312,6 +1312,12 @@ def set_app_meta(key: str, value: str) -> None:
         conn.commit()
 
 
+def delete_app_meta(key: str) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM app_meta WHERE key = ?", (key,))
+        conn.commit()
+
+
 def add_saved_message(user_id, full_text, source_name, tag, saved_at):
     with get_connection() as conn:
         conn.execute(
