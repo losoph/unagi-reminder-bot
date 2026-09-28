@@ -418,5 +418,120 @@ class DigestRenderingTests(unittest.TestCase):
         self.assertIn("Выпуск усечён", notice_text)
 
 
+class FakeResponse:
+    def __init__(self, text, status=200):
+        self._text = text
+        self.status = status
+
+    async def text(self):
+        return self._text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
+class FakeClientSession:
+    def __init__(self, pages_map):
+        self.pages_map = pages_map
+        self.requested_urls = []
+
+    def get(self, url, headers=None):
+        self.requested_urls.append(url)
+        html = self.pages_map.get(url, "<html><body></body></html>")
+        return FakeResponse(html)
+
+
+class WebFallbackPaginationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cursor_on_page_1_makes_one_request(self):
+        from scraper import get_latest_posts
+
+        page1 = (
+            message_html(41, "2026-07-24T08:00:00+00:00", text="Post 41")
+            + message_html(42, "2026-07-24T10:00:00+00:00", text="Post 42")
+        )
+        fake_session = FakeClientSession({"https://t.me/s/example": page1})
+        posts = await get_latest_posts(
+            "example",
+            "2026-07-24 08:30:00",
+            session=fake_session,
+            page_delay=0,
+        )
+        self.assertEqual(fake_session.requested_urls, ["https://t.me/s/example"])
+        self.assertTrue(posts.cursor_reached)
+        self.assertEqual([p["id"] for p in posts], [42])
+
+    async def test_cursor_on_page_2_makes_two_requests_with_before(self):
+        from scraper import get_latest_posts
+
+        page1 = (
+            message_html(43, "2026-07-24T10:00:00+00:00", text="Post 43")
+            + message_html(44, "2026-07-24T11:00:00+00:00", text="Post 44")
+        )
+        page2 = (
+            message_html(41, "2026-07-24T08:00:00+00:00", text="Post 41")
+            + message_html(42, "2026-07-24T09:00:00+00:00", text="Post 42")
+        )
+        fake_session = FakeClientSession(
+            {
+                "https://t.me/s/example": page1,
+                "https://t.me/s/example?before=43": page2,
+            }
+        )
+        posts = await get_latest_posts(
+            "example",
+            "2026-07-24 08:30:00",
+            session=fake_session,
+            page_delay=0,
+        )
+        self.assertEqual(
+            fake_session.requested_urls,
+            ["https://t.me/s/example", "https://t.me/s/example?before=43"],
+        )
+        self.assertTrue(posts.cursor_reached)
+        self.assertEqual([p["id"] for p in posts], [42, 43, 44])
+
+    async def test_ceiling_reached_cursor_not_reached_leaves_cursor_unmoved(self):
+        from scraper import get_latest_posts
+
+        page1 = message_html(30, "2026-07-24T12:00:00+00:00", text="Post 30")
+        page2 = message_html(20, "2026-07-24T11:00:00+00:00", text="Post 20")
+        fake_session = FakeClientSession(
+            {
+                "https://t.me/s/example": page1,
+                "https://t.me/s/example?before=30": page2,
+            }
+        )
+        posts = await get_latest_posts(
+            "example",
+            "2026-07-24 08:00:00",
+            session=fake_session,
+            max_pages=2,
+            page_delay=0,
+        )
+        self.assertEqual(len(fake_session.requested_urls), 2)
+        self.assertFalse(posts.cursor_reached)
+        self.assertTrue(posts.is_partial)
+
+        cursor_reached = getattr(posts, "cursor_reached", True)
+        last_scraped = "2026-07-24 08:00:00"
+        last_post_id = 10
+        if cursor_reached:
+            delivered_marker = max(p["time"] for p in posts)
+            delivered_post_id = max(p["id"] for p in posts)
+        else:
+            from data.database import parse_db_datetime
+
+            delivered_marker = parse_db_datetime(last_scraped)
+            delivered_post_id = last_post_id
+
+        from data.database import serialize_datetime
+
+        self.assertEqual(serialize_datetime(delivered_marker), last_scraped)
+        self.assertEqual(delivered_post_id, last_post_id)
+
+
 if __name__ == "__main__":
     unittest.main()

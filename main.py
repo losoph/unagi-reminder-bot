@@ -1067,14 +1067,25 @@ async def fetch_subscription_posts(
             if fetched_posts and not posts:
                 # Compatibility for a malformed legacy link without a numeric post id.
                 posts = fetched_posts
-            delivered_marker = max(
-                (post["time"] for post in posts),
-                default=parse_db_datetime(last_scraped),
-            )
-            delivered_post_id = max(
-                (post["id"] for post in posts if post.get("id") is not None),
-                default=last_post_id,
-            )
+            cursor_reached = getattr(fetched_posts, "cursor_reached", True)
+            if cursor_reached:
+                delivered_marker = max(
+                    (post["time"] for post in posts),
+                    default=parse_db_datetime(last_scraped),
+                )
+                delivered_post_id = max(
+                    (post["id"] for post in posts if post.get("id") is not None),
+                    default=last_post_id,
+                )
+            else:
+                logger.warning(
+                    "Cursor not reached for @%s (page limit reached); leaving cursor at %s",
+                    username,
+                    last_scraped,
+                )
+                delivered_marker = parse_db_datetime(last_scraped)
+                delivered_post_id = last_post_id
+
             from ranking import prioritize_channel_posts
 
             selected_posts, omitted_count = prioritize_channel_posts(username, posts)
@@ -1087,6 +1098,7 @@ async def fetch_subscription_posts(
                 "title_safe": title_safe,
                 "posts": selected_posts,
                 "omitted_count": omitted_count,
+                "is_partial": not cursor_reached,
                 "next_send_str": next_send_str,
                 "last_scraped_str": serialize_datetime(delivered_marker),
                 "last_post_id": delivered_post_id,
