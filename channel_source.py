@@ -93,7 +93,9 @@ class HybridChannelSource:
                 if post_time <= marker:
                     reached_marker = True
                     break
-                text = (message.message or "Медиа-файл или сообщение без текста").strip()
+                text = (message.message or "").strip()
+                if not text:
+                    continue
                 posts.append(
                     {
                         "id": message.id,

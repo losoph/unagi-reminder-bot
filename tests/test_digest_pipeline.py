@@ -11,10 +11,11 @@ from channel_source import HybridChannelSource
 from scraper import ChannelFetchError, _parse_channel_html
 
 
-def message_html(post_id: int, timestamp: str, text: str = "Post") -> str:
+def message_html(post_id: int, timestamp: str, text: str | None = "Post") -> str:
+    text_block = f'<div class="tgme_widget_message_text">{text}</div>' if text is not None else ""
     return f"""
     <div class="tgme_widget_message">
-      <div class="tgme_widget_message_text">{text}</div>
+      {text_block}
       <a class="tgme_widget_message_date" href="https://t.me/example/{post_id}">
         <time class="time" datetime="{timestamp}">10:00</time>
       </a>
@@ -57,6 +58,20 @@ class ScraperValidationTests(unittest.TestCase):
         )
         self.assertEqual(len(posts[0]["text"]), 3000)
         self.assertEqual(posts[0]["text"], full_text)
+
+    def test_scraper_skips_posts_without_text(self):
+        html = (
+            message_html(10, "2026-07-24T10:00:00+00:00", text=None)
+            + message_html(11, "2026-07-24T10:01:00+00:00", text="   ")
+            + message_html(12, "2026-07-24T10:02:00+00:00", text="Real post with text")
+        )
+        posts = _parse_channel_html(
+            html,
+            "example",
+            datetime(2026, 7, 24, 9, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual([p["id"] for p in posts], [12])
+        self.assertEqual(posts[0]["text"], "Real post with text")
 
 
 class DigestCursorTests(unittest.TestCase):
@@ -133,6 +148,31 @@ class DigestCursorTests(unittest.TestCase):
         posts = db.get_channel_posts_since("example", None, last_post_id=99)
         self.assertEqual(len(posts[0]["text"]), 3000)
         self.assertEqual(posts[0]["text"], full_text)
+
+    def test_pipeline_skips_media_posts_without_caption_in_channel_posts(self):
+        import asyncio
+
+        db = self.database
+        source = HybridChannelSource()
+        source._client = FakeMessageClient(
+            [
+                SimpleNamespace(
+                    id=201,
+                    date=datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc),
+                    message=None,  # media without caption
+                ),
+                SimpleNamespace(
+                    id=202,
+                    date=datetime(2026, 7, 24, 10, 1, tzinfo=timezone.utc),
+                    message="Media with caption",
+                ),
+            ]
+        )
+        posts = asyncio.run(source._fetch_mtproto("example", "2026-07-24 09:00:00"))
+        db.upsert_channel_posts("example", posts, "mtproto")
+        saved = db.get_channel_posts_since("example", None, last_post_id=200)
+        self.assertEqual([p["id"] for p in saved], [202])
+        self.assertEqual(saved[0]["text"], "Media with caption")
 
     def test_init_reactivates_legacy_network_failures(self):
         db = self.database
@@ -222,6 +262,31 @@ class MtprotoSourceTests(unittest.IsolatedAsyncioTestCase):
         posts = await source._fetch_mtproto("example", "2026-07-24 09:00:00")
         self.assertEqual(len(posts[0]["text"]), 3000)
         self.assertEqual(posts[0]["text"], full_text)
+
+    async def test_mtproto_skips_posts_without_text(self):
+        source = HybridChannelSource()
+        source._client = FakeMessageClient(
+            [
+                SimpleNamespace(
+                    id=50,
+                    date=datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc),
+                    message=None,
+                ),
+                SimpleNamespace(
+                    id=51,
+                    date=datetime(2026, 7, 24, 10, 1, tzinfo=timezone.utc),
+                    message="   \n  ",
+                ),
+                SimpleNamespace(
+                    id=52,
+                    date=datetime(2026, 7, 24, 10, 2, tzinfo=timezone.utc),
+                    message="Caption on photo",
+                ),
+            ]
+        )
+        posts = await source._fetch_mtproto("example", "2026-07-24 09:00:00")
+        self.assertEqual([p["id"] for p in posts], [52])
+        self.assertEqual(posts[0]["text"], "Caption on photo")
 
 
 class DigestRenderingTests(unittest.TestCase):

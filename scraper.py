@@ -75,7 +75,9 @@ def _parse_channel_html(html_text: str, clean_username: str, last_scraped_at: da
             continue
 
         text_elem = msg.find("div", class_="tgme_widget_message_text")
-        text = text_elem.get_text(separator=" ", strip=True) if text_elem else "Медиа-файл или сообщение без текста"
+        text = text_elem.get_text(separator=" ", strip=True) if text_elem else ""
+        if not text:
+            continue
 
         link = f"https://t.me/{clean_username}"
         link_elem = msg.find("a", class_="tgme_widget_message_date")
