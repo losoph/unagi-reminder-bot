@@ -313,7 +313,22 @@ def init_db():
                 post_time DATETIME NOT NULL,
                 source TEXT NOT NULL,
                 created_at DATETIME NOT NULL,
+                views INTEGER,
+                reactions_total INTEGER,
+                reactions_json TEXT,
+                forwards INTEGER,
+                replies INTEGER,
+                metrics_at DATETIME,
                 PRIMARY KEY (channel_username, post_id)
+            )
+            '''
+        )
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS channels (
+                channel_username TEXT PRIMARY KEY,
+                subscribers_count INTEGER,
+                subscribers_updated_at DATETIME
             )
             '''
         )
@@ -380,6 +395,12 @@ def init_db():
             "ALTER TABLE digest_settings ADD COLUMN weekday INTEGER",
             "ALTER TABLE digest_settings ADD COLUMN month_day INTEGER",
             "ALTER TABLE digest_settings ADD COLUMN monthly_mode TEXT DEFAULT 'date'",
+            "ALTER TABLE channel_posts ADD COLUMN views INTEGER",
+            "ALTER TABLE channel_posts ADD COLUMN reactions_total INTEGER",
+            "ALTER TABLE channel_posts ADD COLUMN reactions_json TEXT",
+            "ALTER TABLE channel_posts ADD COLUMN forwards INTEGER",
+            "ALTER TABLE channel_posts ADD COLUMN replies INTEGER",
+            "ALTER TABLE channel_posts ADD COLUMN metrics_at DATETIME",
         ):
             try:
                 cursor.execute(statement)
@@ -753,6 +774,46 @@ def update_subscription_schedule(sub_id, next_send_at, attempted_at):
         conn.commit()
 
 
+def update_channel_subscribers(channel_username: str, count: int | None) -> None:
+    normalized = normalize_channel_username(channel_username)
+    now_str = serialize_datetime(utc_now())
+    with get_connection() as conn:
+        conn.execute(
+            '''
+            INSERT INTO channels (channel_username, subscribers_count, subscribers_updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(channel_username) DO UPDATE SET
+                subscribers_count = excluded.subscribers_count,
+                subscribers_updated_at = excluded.subscribers_updated_at
+            ''',
+            (normalized, count, now_str),
+        )
+        conn.commit()
+
+
+def get_channel_subscribers(channel_username: str) -> int | None:
+    normalized = normalize_channel_username(channel_username)
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT subscribers_count FROM channels WHERE channel_username = ?",
+            (normalized,),
+        ).fetchone()
+        return row["subscribers_count"] if row else None
+
+
+def needs_channel_subscribers_update(channel_username: str, ttl_hours: int = 24) -> bool:
+    normalized = normalize_channel_username(channel_username)
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT subscribers_updated_at FROM channels WHERE channel_username = ?",
+            (normalized,),
+        ).fetchone()
+        if not row or not row["subscribers_updated_at"]:
+            return True
+        updated_at = parse_db_datetime(row["subscribers_updated_at"])
+        return (utc_now() - updated_at).total_seconds() > ttl_hours * 3600
+
+
 def upsert_channel_posts(channel_username: str, posts: list[dict], source: str) -> int:
     normalized_username = normalize_channel_username(channel_username)
     created_at = serialize_datetime(utc_now())
@@ -765,6 +826,12 @@ def upsert_channel_posts(channel_username: str, posts: list[dict], source: str) 
             serialize_datetime(post["time"]),
             source,
             created_at,
+            post.get("views"),
+            post.get("reactions_total"),
+            post.get("reactions_json"),
+            post.get("forwards"),
+            post.get("replies"),
+            serialize_datetime(post["metrics_at"]) if post.get("metrics_at") else None,
         )
         for post in posts
         if post.get("id") is not None
@@ -776,14 +843,21 @@ def upsert_channel_posts(channel_username: str, posts: list[dict], source: str) 
         conn.executemany(
             '''
             INSERT INTO channel_posts (
-                channel_username, post_id, post_text, post_link, post_time, source, created_at
+                channel_username, post_id, post_text, post_link, post_time, source, created_at,
+                views, reactions_total, reactions_json, forwards, replies, metrics_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_username, post_id) DO UPDATE SET
                 post_text = excluded.post_text,
                 post_link = excluded.post_link,
                 post_time = excluded.post_time,
-                source = excluded.source
+                source = excluded.source,
+                views = CASE WHEN excluded.metrics_at IS NOT NULL THEN excluded.views ELSE channel_posts.views END,
+                reactions_total = CASE WHEN excluded.metrics_at IS NOT NULL THEN excluded.reactions_total ELSE channel_posts.reactions_total END,
+                reactions_json = CASE WHEN excluded.metrics_at IS NOT NULL THEN excluded.reactions_json ELSE channel_posts.reactions_json END,
+                forwards = CASE WHEN excluded.metrics_at IS NOT NULL THEN excluded.forwards ELSE channel_posts.forwards END,
+                replies = CASE WHEN excluded.metrics_at IS NOT NULL THEN excluded.replies ELSE channel_posts.replies END,
+                metrics_at = CASE WHEN excluded.metrics_at IS NOT NULL THEN excluded.metrics_at ELSE channel_posts.metrics_at END
             ''',
             rows,
         )
@@ -802,7 +876,8 @@ def get_channel_posts_since(
         if last_post_id is not None:
             rows = conn.execute(
                 '''
-                SELECT post_id, post_text, post_link, post_time
+                SELECT post_id, post_text, post_link, post_time,
+                       views, reactions_total, reactions_json, forwards, replies, metrics_at
                 FROM channel_posts
                 WHERE channel_username = ? AND post_id > ?
                 ORDER BY post_id
@@ -813,7 +888,8 @@ def get_channel_posts_since(
             marker = last_scraped_at or serialize_datetime(datetime.min.replace(tzinfo=UTC))
             rows = conn.execute(
                 '''
-                SELECT post_id, post_text, post_link, post_time
+                SELECT post_id, post_text, post_link, post_time,
+                       views, reactions_total, reactions_json, forwards, replies, metrics_at
                 FROM channel_posts
                 WHERE channel_username = ? AND post_time > ?
                 ORDER BY post_id
@@ -826,6 +902,12 @@ def get_channel_posts_since(
             "text": row["post_text"],
             "link": row["post_link"],
             "time": parse_db_datetime(row["post_time"]),
+            "views": row["views"],
+            "reactions_total": row["reactions_total"],
+            "reactions_json": row["reactions_json"],
+            "forwards": row["forwards"],
+            "replies": row["replies"],
+            "metrics_at": parse_db_datetime(row["metrics_at"]) if row["metrics_at"] else None,
         }
         for row in rows
     ]

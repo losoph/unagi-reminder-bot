@@ -1,6 +1,7 @@
+import json
 import logging
 import os
-from datetime import timezone
+from datetime import datetime, timezone
 
 import aiohttp
 
@@ -70,6 +71,36 @@ class HybridChannelSource:
             await self._client.disconnect()
             self._client = None
 
+    @staticmethod
+    def _extract_reactions(message) -> tuple[int | None, str | None]:
+        reactions = getattr(message, "reactions", None)
+        if not reactions:
+            return None, None
+        results = getattr(reactions, "results", None)
+        if not results:
+            return None, None
+        total = 0
+        items = []
+        for r in results:
+            count = getattr(r, "count", 0)
+            total += count
+            reaction_obj = getattr(r, "reaction", None)
+            emoji = getattr(reaction_obj, "emoticon", str(reaction_obj)) if reaction_obj else "?"
+            items.append({"emoji": emoji, "count": count})
+        return total, json.dumps(items, ensure_ascii=False)
+
+    async def _fetch_subscribers_count(self, clean_username: str) -> int | None:
+        if not callable(self._client):
+            return None
+        try:
+            from telethon.tl.functions.channels import GetFullChannelRequest
+
+            full = await self._client(GetFullChannelRequest(clean_username))
+            full_chat = getattr(full, "full_chat", None)
+            return getattr(full_chat, "participants_count", None)
+        except Exception:
+            return None
+
     async def _fetch_mtproto(self, channel_username: str, last_scraped_at_str: str | None) -> list[dict]:
         if self._client is None:
             raise ChannelFetchError("MTProto client is not connected", permanent=False)
@@ -81,6 +112,17 @@ class HybridChannelSource:
         inspected = 0
         reached_marker = False
         clean_username = channel_username.lstrip("@")
+
+        # Update subscribers count if needed (not more often than once every 24h)
+        try:
+            from data.database import needs_channel_subscribers_update, update_channel_subscribers
+
+            if needs_channel_subscribers_update(clean_username):
+                count = await self._fetch_subscribers_count(clean_username)
+                if count is not None:
+                    update_channel_subscribers(clean_username, count)
+        except Exception:
+            logger.debug("Failed to update subscriber count for @%s", clean_username, exc_info=True)
 
         try:
             async for message in self._client.iter_messages(clean_username, limit=self.fetch_limit):
@@ -96,12 +138,26 @@ class HybridChannelSource:
                 text = (message.message or "").strip()
                 if not text:
                     continue
+
+                views = getattr(message, "views", None)
+                forwards = getattr(message, "forwards", None)
+                replies_obj = getattr(message, "replies", None)
+                replies = getattr(replies_obj, "replies", None) if replies_obj else None
+                reactions_total, reactions_json = self._extract_reactions(message)
+                metrics_at = datetime.now(timezone.utc)
+
                 posts.append(
                     {
                         "id": message.id,
                         "time": post_time,
                         "text": text,
                         "link": f"https://t.me/{clean_username}/{message.id}",
+                        "views": views,
+                        "reactions_total": reactions_total,
+                        "reactions_json": reactions_json,
+                        "forwards": forwards,
+                        "replies": replies,
+                        "metrics_at": metrics_at,
                     }
                 )
         except Exception as exc:

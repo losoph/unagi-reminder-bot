@@ -174,6 +174,51 @@ class DigestCursorTests(unittest.TestCase):
         self.assertEqual([p["id"] for p in saved], [202])
         self.assertEqual(saved[0]["text"], "Media with caption")
 
+    def test_database_metric_columns_and_idempotent_update(self):
+        db = self.database
+        now = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
+        post = {
+            "id": 501,
+            "time": now,
+            "text": "Post with metrics",
+            "link": "https://t.me/example/501",
+            "views": 100,
+            "reactions_total": 7,
+            "reactions_json": '[{"emoji": "👍", "count": 3}, {"emoji": "🔥", "count": 4}]',
+            "forwards": None,
+            "replies": None,
+            "metrics_at": now,
+        }
+        db.upsert_channel_posts("example", [post], "mtproto")
+        saved = db.get_channel_posts_since("example", None, last_post_id=500)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["views"], 100)
+        self.assertEqual(saved[0]["reactions_total"], 7)
+        self.assertIsNone(saved[0]["forwards"])
+        self.assertIsNone(saved[0]["replies"])
+        self.assertIsNotNone(saved[0]["metrics_at"])
+
+        later = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+        post_updated = dict(post)
+        post_updated["views"] = 150
+        post_updated["reactions_total"] = 12
+        post_updated["forwards"] = 10
+        post_updated["metrics_at"] = later
+        db.upsert_channel_posts("example", [post_updated], "mtproto")
+        saved_updated = db.get_channel_posts_since("example", None, last_post_id=500)
+        self.assertEqual(saved_updated[0]["views"], 150)
+        self.assertEqual(saved_updated[0]["reactions_total"], 12)
+        self.assertEqual(saved_updated[0]["forwards"], 10)
+        self.assertEqual(saved_updated[0]["metrics_at"], later)
+
+    def test_channel_subscribers_storage_and_ttl(self):
+        db = self.database
+        channel = "test_subscribers_channel"
+        self.assertTrue(db.needs_channel_subscribers_update(channel))
+        db.update_channel_subscribers(channel, 12500)
+        self.assertEqual(db.get_channel_subscribers(channel), 12500)
+        self.assertFalse(db.needs_channel_subscribers_update(channel))
+
     def test_init_reactivates_legacy_network_failures(self):
         db = self.database
         sub_id = db.add_subscription(
@@ -287,6 +332,37 @@ class MtprotoSourceTests(unittest.IsolatedAsyncioTestCase):
         posts = await source._fetch_mtproto("example", "2026-07-24 09:00:00")
         self.assertEqual([p["id"] for p in posts], [52])
         self.assertEqual(posts[0]["text"], "Caption on photo")
+
+    async def test_mtproto_collects_engagement_metrics(self):
+        source = HybridChannelSource()
+        reactions_mock = SimpleNamespace(
+            results=[
+                SimpleNamespace(reaction="👍", count=3),
+                SimpleNamespace(reaction="🔥", count=4),
+            ]
+        )
+        source._client = FakeMessageClient(
+            [
+                SimpleNamespace(
+                    id=77,
+                    date=datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc),
+                    message="Metric post",
+                    views=100,
+                    forwards=5,
+                    replies=SimpleNamespace(replies=2),
+                    reactions=reactions_mock,
+                ),
+            ]
+        )
+        posts = await source._fetch_mtproto("example", "2026-07-24 09:00:00")
+        self.assertEqual(len(posts), 1)
+        post = posts[0]
+        self.assertEqual(post["views"], 100)
+        self.assertEqual(post["forwards"], 5)
+        self.assertEqual(post["replies"], 2)
+        self.assertEqual(post["reactions_total"], 7)
+        self.assertIn('"count": 3', post["reactions_json"])
+        self.assertIsNotNone(post["metrics_at"])
 
 
 class DigestRenderingTests(unittest.TestCase):
