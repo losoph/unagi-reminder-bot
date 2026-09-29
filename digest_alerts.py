@@ -4,15 +4,18 @@ import os
 from datetime import datetime
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from data.database import (
+    get_digest_alert,
     get_failed_digest_executions_pending_alert,
+    get_user_alert_settings,
     has_digest_alert_been_sent,
     is_user_alerting_active,
     parse_db_datetime,
     record_digest_alert_sent,
+    record_user_alert_dispatched,
     serialize_datetime,
     set_user_alerts_enabled,
     utc_now,
@@ -22,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 DIGEST_ALERT_GRACE_PERIOD_SECONDS = max(60, int(os.getenv("DIGEST_ALERT_GRACE_PERIOD_SECONDS", "3600")))
 MAX_DIGEST_RETRIES = max(1, int(os.getenv("MAX_DIGEST_RETRIES", "5")))
+ALERT_BASE_COOLDOWN_SECONDS = max(60, int(os.getenv("ALERT_BASE_COOLDOWN_SECONDS", "14400")))
+ALERT_MAX_COOLDOWN_SECONDS = max(60, int(os.getenv("ALERT_MAX_COOLDOWN_SECONDS", "86400")))
 
 PERIOD_TITLES: dict[str, str] = {
     "daily": "утренний дайджест",
@@ -34,6 +39,41 @@ PERIOD_NAMES: dict[str, str] = {
     "weekly": "Еженедельный",
     "monthly": "Ежемесячный",
 }
+
+
+def calculate_alert_cooldown(
+    consecutive_failures: int,
+    base_cooldown: int = ALERT_BASE_COOLDOWN_SECONDS,
+    max_cooldown: int = ALERT_MAX_COOLDOWN_SECONDS,
+) -> int:
+    if consecutive_failures <= 0:
+        return 0
+    exponent = max(0, consecutive_failures - 1)
+    cooldown = base_cooldown * (2 ** min(exponent, 10))
+    return min(cooldown, max_cooldown)
+
+
+def is_alert_allowed_by_cooldown(
+    user_id: int,
+    now: datetime | None = None,
+    base_cooldown: int = ALERT_BASE_COOLDOWN_SECONDS,
+    max_cooldown: int = ALERT_MAX_COOLDOWN_SECONDS,
+) -> bool:
+    if now is None:
+        now = utc_now()
+    settings = get_user_alert_settings(user_id)
+    last_sent_str = settings.get("last_alert_sent_at")
+    if not last_sent_str:
+        return True
+
+    consecutive = settings.get("consecutive_failures", 0)
+    cooldown_seconds = calculate_alert_cooldown(consecutive, base_cooldown, max_cooldown)
+    try:
+        last_sent = parse_db_datetime(last_sent_str)
+        elapsed = (now - last_sent).total_seconds()
+        return elapsed >= cooldown_seconds
+    except Exception:
+        return True
 
 
 def format_missed_digest_alert(
@@ -102,6 +142,8 @@ def should_send_digest_failure_alert(
     execution: dict,
     now: datetime | None = None,
     grace_period_seconds: int | None = None,
+    base_cooldown: int | None = None,
+    max_cooldown: int | None = None,
 ) -> bool:
     status = execution.get("status")
     # Semantic frame: 'empty', 'delivered', 'partial' must never trigger missed digest alert
@@ -136,6 +178,11 @@ def should_send_digest_failure_alert(
     except Exception:
         pass
 
+    b_cd = base_cooldown if base_cooldown is not None else ALERT_BASE_COOLDOWN_SECONDS
+    m_cd = max_cooldown if max_cooldown is not None else ALERT_MAX_COOLDOWN_SECONDS
+    if not is_alert_allowed_by_cooldown(user_id, now=now, base_cooldown=b_cd, max_cooldown=m_cd):
+        return False
+
     return True
 
 
@@ -144,6 +191,8 @@ async def send_digest_failure_alert(
     execution: dict,
     reply_markup=None,
     now: datetime | None = None,
+    base_cooldown: int | None = None,
+    max_cooldown: int | None = None,
 ) -> bool:
     user_id = execution.get("user_id")
     period = execution.get("period", "")
@@ -155,11 +204,12 @@ async def send_digest_failure_alert(
     if not is_user_alerting_active(user_id, now=now):
         return False
 
-    if has_digest_alert_been_sent(user_id, period, scheduled_at, "failure"):
-        return False
-
     if execution.get("status") in ("empty", "delivered", "partial"):
         return False
+
+    existing_alert = get_digest_alert(user_id, period, scheduled_at, "failure")
+    now_val = now or utc_now()
+    sent_at_str = serialize_datetime(now_val)
 
     text = format_missed_digest_alert(
         period=period,
@@ -173,8 +223,45 @@ async def send_digest_failure_alert(
     if reply_markup is None:
         reply_markup = build_digest_alert_keyboard(execution.get("id"))
 
-    now_val = now or utc_now()
-    sent_at_str = serialize_datetime(now_val)
+    # If alert was already sent for this edition: update existing message if message_id is available
+    if existing_alert:
+        msg_id = existing_alert.get("message_id")
+        existing_error = existing_alert.get("error_text")
+        if not msg_id or (error_message or "").strip() == (existing_error or "").strip():
+            return False
+        try:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=msg_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+            record_digest_alert_sent(
+                user_id=user_id,
+                period=period,
+                scheduled_at=scheduled_at,
+                alert_type="failure",
+                sent_at=sent_at_str,
+                message_id=msg_id,
+                error_text=error_message,
+            )
+            logger.info("Обновлён существующий алерт: user=%s, period=%s, msg_id=%s", user_id, period, msg_id)
+            return True
+        except TelegramForbiddenError:
+            logger.warning("Пользователь %s заблокировал бота при обновлении алерта; отключаю алерты", user_id)
+            set_user_alerts_enabled(user_id, False)
+            return False
+        except (TelegramBadRequest, TelegramAPIError) as exc:
+            logger.debug("Не удалось обновить алерт %s для пользователя %s: %s", msg_id, user_id, exc)
+            return False
+
+    # Check cooldown before sending a new alert message
+    b_cd = base_cooldown if base_cooldown is not None else ALERT_BASE_COOLDOWN_SECONDS
+    m_cd = max_cooldown if max_cooldown is not None else ALERT_MAX_COOLDOWN_SECONDS
+    if not is_alert_allowed_by_cooldown(user_id, now=now_val, base_cooldown=b_cd, max_cooldown=m_cd):
+        logger.info("Отправка нового алерта пользователю %s отложена по anti-spam cooldown", user_id)
+        return False
 
     try:
         sent_msg = await bot.send_message(
@@ -193,6 +280,7 @@ async def send_digest_failure_alert(
             message_id=msg_id,
             error_text=error_message,
         )
+        record_user_alert_dispatched(user_id, sent_at_str)
         logger.info(
             "Отправлен пользовательский алерт о пропущенном дайджесте: user=%s, period=%s, sched=%s",
             user_id,

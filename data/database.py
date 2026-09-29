@@ -411,6 +411,8 @@ def init_db():
                 user_id INTEGER PRIMARY KEY,
                 alerts_enabled INTEGER NOT NULL DEFAULT 1,
                 alerts_paused_until DATETIME,
+                last_alert_sent_at DATETIME,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
                 created_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL
             )
@@ -452,6 +454,8 @@ def init_db():
             "ALTER TABLE channel_posts ADD COLUMN metrics_at DATETIME",
             "ALTER TABLE channels ADD COLUMN last_scanned_at DATETIME",
             "ALTER TABLE channels ADD COLUMN last_scanned_post_id INTEGER",
+            "ALTER TABLE user_alert_settings ADD COLUMN last_alert_sent_at DATETIME",
+            "ALTER TABLE user_alert_settings ADD COLUMN consecutive_failures INTEGER DEFAULT 0",
         ):
             try:
                 cursor.execute(statement)
@@ -1729,7 +1733,7 @@ def get_user_alert_settings(user_id: int) -> dict:
     with get_connection() as conn:
         row = conn.execute(
             '''
-            SELECT user_id, alerts_enabled, alerts_paused_until
+            SELECT user_id, alerts_enabled, alerts_paused_until, last_alert_sent_at, consecutive_failures
             FROM user_alert_settings
             WHERE user_id = ?
             ''',
@@ -1740,12 +1744,49 @@ def get_user_alert_settings(user_id: int) -> dict:
                 "user_id": user_id,
                 "alerts_enabled": True,
                 "alerts_paused_until": None,
+                "last_alert_sent_at": None,
+                "consecutive_failures": 0,
             }
         return {
             "user_id": row["user_id"],
             "alerts_enabled": bool(row["alerts_enabled"]),
             "alerts_paused_until": row["alerts_paused_until"],
+            "last_alert_sent_at": row["last_alert_sent_at"],
+            "consecutive_failures": row["consecutive_failures"] or 0,
         }
+
+
+def record_user_alert_dispatched(user_id: int, sent_at: str | None = None) -> None:
+    now_str = serialize_datetime(utc_now())
+    sent_at_val = sent_at or now_str
+    with get_connection() as conn:
+        conn.execute(
+            '''
+            INSERT INTO user_alert_settings (
+                user_id, alerts_enabled, last_alert_sent_at, consecutive_failures, created_at, updated_at
+            ) VALUES (?, 1, ?, 1, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                last_alert_sent_at = excluded.last_alert_sent_at,
+                consecutive_failures = COALESCE(user_alert_settings.consecutive_failures, 0) + 1,
+                updated_at = excluded.updated_at
+            ''',
+            (user_id, sent_at_val, now_str, now_str),
+        )
+        conn.commit()
+
+
+def reset_user_alert_consecutive_failures(user_id: int) -> None:
+    now_str = serialize_datetime(utc_now())
+    with get_connection() as conn:
+        conn.execute(
+            '''
+            UPDATE user_alert_settings
+            SET consecutive_failures = 0, updated_at = ?
+            WHERE user_id = ?
+            ''',
+            (now_str, user_id),
+        )
+        conn.commit()
 
 
 def set_user_alerts_enabled(user_id: int, enabled: bool) -> None:
@@ -1794,6 +1835,19 @@ def is_user_alerting_active(user_id: int, now: datetime | None = None) -> bool:
         if paused_until > now:
             return False
     return True
+
+
+def get_digest_alert(user_id: int, period: str, scheduled_at: str, alert_type: str = "failure") -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT id, user_id, period, scheduled_at, alert_type, sent_at, message_id, error_text, created_at
+            FROM digest_alerts
+            WHERE user_id = ? AND period = ? AND scheduled_at = ? AND alert_type = ?
+            ''',
+            (user_id, period, scheduled_at, alert_type),
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def record_digest_alert_sent(

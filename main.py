@@ -79,6 +79,7 @@ from data.database import (
     record_digest_execution_finish,
     record_digest_execution_start,
     replace_sent_reminder_with_pending,
+    reset_user_alert_consecutive_failures,
     retry_digest_execution,
     serialize_datetime,
     start_email_verification,
@@ -4984,6 +4985,7 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
             if sections:
                 try:
                     await deliver_digest(user_id, "Твоя утренняя газета", sections)
+                    reset_user_alert_consecutive_failures(user_id)
                     delivered_users_count += 1
                     delivered_posts_count += sum(len(section["posts"]) for section in sections)
                     for result in successful_subscriptions:
