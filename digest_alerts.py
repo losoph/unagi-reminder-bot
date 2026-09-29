@@ -5,6 +5,7 @@ from datetime import datetime
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from data.database import (
     get_failed_digest_executions_pending_alert,
@@ -69,6 +70,32 @@ def format_missed_digest_alert(
         lines.append(f"\nПричина: <code>{html.escape(error_message[:150])}</code>")
 
     return "\n".join(lines)
+
+
+def build_digest_alert_keyboard(execution_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    if execution_id is not None:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🔄 Повторить сейчас",
+                    callback_data=f"alert_retry_{execution_id}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(text="⏸ Пауза 24 ч", callback_data="alert_pause_24h"),
+            InlineKeyboardButton(text="⏸ На 7 дней", callback_data="alert_pause_7d"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(text="🔕 Отключить тех. алерты", callback_data="alert_disable"),
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="ds"),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def should_send_digest_failure_alert(
@@ -142,6 +169,9 @@ async def send_digest_failure_alert(
         will_retry=False,
         error_message=error_message,
     )
+
+    if reply_markup is None:
+        reply_markup = build_digest_alert_keyboard(execution.get("id"))
 
     now_val = now or utc_now()
     sent_at_str = serialize_datetime(now_val)
@@ -220,7 +250,11 @@ async def process_pending_digest_alerts(
                 grace_period_seconds=grace_period_seconds,
             ):
                 continue
-            markup = reply_markup_builder(execution) if reply_markup_builder else None
+            markup = (
+                reply_markup_builder(execution)
+                if reply_markup_builder
+                else build_digest_alert_keyboard(execution.get("id"))
+            )
             sent = await send_digest_failure_alert(
                 bot=bot,
                 execution=execution,

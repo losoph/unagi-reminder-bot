@@ -63,6 +63,7 @@ from data.database import (
     get_scheduled_message_by_delivered_message_id,
     get_subscription_by_id,
     get_subscription_tags,
+    get_user_alert_settings,
     get_saved_messages,
     get_user_messages,
     get_user_subscriptions,
@@ -78,12 +79,15 @@ from data.database import (
     record_digest_execution_finish,
     record_digest_execution_start,
     replace_sent_reminder_with_pending,
+    retry_digest_execution,
     serialize_datetime,
     start_email_verification,
     set_all_subscriptions_paused,
     set_email_period,
     set_subscription_paused,
     set_subscription_tag,
+    set_user_alerts_enabled,
+    set_user_alerts_paused_until,
     unsubscribe_all,
     update_channel_scan_cursor,
     update_subscriptions_next_send_at,
@@ -104,7 +108,7 @@ from channel_links import find_channel_username, is_private_invite
 from ranking import prioritize_channel_posts
 from telegraph_publisher import describe_counts, publish_digest
 from time_parser import parse_reminder_time
-from digest_alerts import process_pending_digest_alerts
+from digest_alerts import build_digest_alert_keyboard, process_pending_digest_alerts
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -420,7 +424,7 @@ def _sort_subscriptions_for_display(user_subs):
     )
 
 
-def build_digest_settings_keyboard(user_subs) -> InlineKeyboardMarkup:
+def build_digest_settings_keyboard(user_subs, user_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(text="⏰ Ежедневный", callback_data="dsch_daily"),
@@ -444,6 +448,21 @@ def build_digest_settings_keyboard(user_subs) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="🗑 Отписаться от всех", callback_data="dunsuball")])
     if email_digest.is_enabled():
         rows.append([InlineKeyboardButton(text="📧 Дайджест на почту", callback_data="email_menu")])
+
+    uid = user_id if user_id is not None else (user_subs[0][1] if user_subs else None)
+    if uid is not None:
+        alert_settings = get_user_alert_settings(uid)
+        is_paused = False
+        if alert_settings["alerts_paused_until"]:
+            dt_pause = parse_db_datetime(alert_settings["alerts_paused_until"])
+            is_paused = dt_pause > utc_now()
+        if not alert_settings["alerts_enabled"]:
+            rows.append([InlineKeyboardButton(text="🔔 Включить тех. алерты", callback_data="alert_toggle_enable")])
+        elif is_paused:
+            rows.append([InlineKeyboardButton(text="▶️ Снять паузу с алертов", callback_data="alert_toggle_enable")])
+        else:
+            rows.append([InlineKeyboardButton(text="🔕 Отключить тех. алерты", callback_data="alert_disable")])
+
     rows.append([
         InlineKeyboardButton(text="📤 Экспорт", callback_data="data_export"),
         InlineKeyboardButton(text="📥 Импорт", callback_data="data_import"),
@@ -470,6 +489,19 @@ def render_digest_settings_text(user_id: int) -> str:
         lines.append(
             f"• <b>{_PERIOD_TITLES[period]}</b>: {format_digest_schedule(period, settings)}{where}"
         )
+    lines.append("")
+
+    alert_settings = get_user_alert_settings(user_id)
+    if not alert_settings["alerts_enabled"]:
+        lines.append("🔕 <b>Технические алерты:</b> отключены")
+    elif alert_settings["alerts_paused_until"]:
+        dt_pause = parse_db_datetime(alert_settings["alerts_paused_until"])
+        if dt_pause > utc_now():
+            lines.append(f"⏸ <b>Технические алерты:</b> на паузе до {dt_pause.strftime('%d.%m %H:%M UTC')}")
+        else:
+            lines.append("🔔 <b>Технические алерты:</b> включены")
+    else:
+        lines.append("🔔 <b>Технические алерты:</b> включены")
     lines.append("")
 
     if not user_subs:
@@ -2370,7 +2402,7 @@ async def _refresh_digest_settings(callback: CallbackQuery):
     await edit_or_answer(
         callback,
         render_digest_settings_text(user_id),
-        reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id)),
+        reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id), user_id=user_id),
     )
 
 
@@ -2399,7 +2431,124 @@ async def render_subscription_actions(callback: CallbackQuery, sub_id: int) -> b
     return True
 
 
-@dp.callback_query(F.data == "digest_settings")
+@dp.callback_query(F.data.startswith("alert_retry_"))
+async def handle_alert_retry(callback: CallbackQuery):
+    suffix = callback.data[len("alert_retry_"):]
+    try:
+        execution_id = int(suffix)
+    except ValueError:
+        await callback.answer("❌ Некорректный ID выпуска.", show_alert=True)
+        return
+
+    success = retry_digest_execution(execution_id)
+    if success:
+        await callback.answer("🔄 Повтор запущен! Бот попытается собрать выпуск в ближайшем цикле.", show_alert=True)
+        callback_msg = get_callback_message(callback)
+        if callback_msg:
+            try:
+                current_text = callback_msg.text or callback_msg.caption or ""
+                note = f"\n\n<i>🔄 Повтор запущен пользователем ({utc_now().astimezone(TZ).strftime('%H:%M')}).</i>"
+                await callback_msg.edit_text(
+                    current_text + note,
+                    parse_mode="HTML",
+                    reply_markup=build_digest_alert_keyboard(execution_id=None),
+                )
+            except TelegramAPIError:
+                pass
+    else:
+        await callback.answer("❌ Запись о выпуске не найдена.", show_alert=True)
+
+
+@dp.callback_query(F.data == "alert_pause_24h")
+async def handle_alert_pause_24h(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    paused_until = utc_now() + timedelta(hours=24)
+    set_user_alerts_paused_until(user_id, serialize_datetime(paused_until))
+    await callback.answer("⏸ Технические алерты на паузе на 24 часа.")
+    callback_msg = get_callback_message(callback)
+    if callback_msg:
+        try:
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="▶️ Снять паузу", callback_data="alert_toggle_enable"),
+                        InlineKeyboardButton(text="⚙️ Настройки", callback_data="ds"),
+                    ]
+                ]
+            )
+            await callback_msg.edit_text(
+                "⏸ <b>Технические алерты поставлены на паузу на 24 часа.</b>\n\n"
+                "Сами дайджесты и автоматические повторы продолжают формироваться по расписанию.",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        except TelegramAPIError:
+            pass
+
+
+@dp.callback_query(F.data == "alert_pause_7d")
+async def handle_alert_pause_7d(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    paused_until = utc_now() + timedelta(days=7)
+    set_user_alerts_paused_until(user_id, serialize_datetime(paused_until))
+    await callback.answer("⏸ Технические алерты на паузе на 7 дней.")
+    callback_msg = get_callback_message(callback)
+    if callback_msg:
+        try:
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="▶️ Снять паузу", callback_data="alert_toggle_enable"),
+                        InlineKeyboardButton(text="⚙️ Настройки", callback_data="ds"),
+                    ]
+                ]
+            )
+            await callback_msg.edit_text(
+                "⏸ <b>Технические алерты поставлены на паузу на 7 дней.</b>\n\n"
+                "Сами дайджесты и автоматические повторы продолжают формироваться по расписанию.",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        except TelegramAPIError:
+            pass
+
+
+@dp.callback_query(F.data == "alert_disable")
+async def handle_alert_disable(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    set_user_alerts_enabled(user_id, False)
+    await callback.answer("🔕 Технические алерты отключены.")
+    callback_msg = get_callback_message(callback)
+    if callback_msg:
+        try:
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="🔔 Включить тех. алерты", callback_data="alert_toggle_enable"),
+                        InlineKeyboardButton(text="⚙️ Настройки", callback_data="ds"),
+                    ]
+                ]
+            )
+            await callback_msg.edit_text(
+                "🔕 <b>Технические алерты отключены.</b>\n\n"
+                "Дайджесты продолжают формироваться по обычному графику. Вы можете включить алерты в любой момент в настройках.",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        except TelegramAPIError:
+            pass
+
+
+@dp.callback_query(F.data == "alert_toggle_enable")
+async def handle_alert_toggle_enable(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    set_user_alerts_enabled(user_id, True)
+    set_user_alerts_paused_until(user_id, None)
+    await callback.answer("🔔 Технические алерты включены!")
+    await _refresh_digest_settings(callback)
+
+
+@dp.callback_query(F.data.in_({"digest_settings", "ds"}))
 async def open_digest_settings(callback: CallbackQuery, state: FSMContext):
     await state.set_state(None)
     await _refresh_digest_settings(callback)

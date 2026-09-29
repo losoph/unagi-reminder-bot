@@ -1647,6 +1647,53 @@ def get_digest_execution(user_id: int, period: str, scheduled_at: str) -> dict |
         return dict(row) if row else None
 
 
+def get_digest_execution_by_id(execution_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT id, user_id, period, scheduled_at, started_at, finished_at,
+                   status, posts_count, channels_count, channels_failed,
+                   channels_partial, error_message, retry_count, created_at
+            FROM digest_executions
+            WHERE id = ?
+            ''',
+            (execution_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def retry_digest_execution(execution_id: int) -> bool:
+    now_str = serialize_datetime(utc_now())
+    with get_connection() as conn:
+        row = conn.execute(
+            'SELECT user_id, period FROM digest_executions WHERE id = ?',
+            (execution_id,),
+        ).fetchone()
+        if not row:
+            return False
+        user_id = row['user_id']
+        period = row['period']
+
+        conn.execute(
+            '''
+            UPDATE digest_executions
+            SET status = 'retrying', retry_count = 0, error_message = NULL
+            WHERE id = ?
+            ''',
+            (execution_id,),
+        )
+        conn.execute(
+            '''
+            UPDATE subscriptions
+            SET next_send_at = ?, failure_count = 0, digest_status = 'pending', is_disabled = 0
+            WHERE user_id = ? AND period = ?
+            ''',
+            (now_str, user_id, period),
+        )
+        conn.commit()
+        return True
+
+
 def get_last_digest_execution(user_id: int, period: str | None = None) -> dict | None:
     with get_connection() as conn:
         if period:
@@ -1726,6 +1773,7 @@ def set_user_alerts_paused_until(user_id: int, paused_until: str | None) -> None
             INSERT INTO user_alert_settings (user_id, alerts_enabled, alerts_paused_until, created_at, updated_at)
             VALUES (?, 1, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
+                alerts_enabled = 1,
                 alerts_paused_until = excluded.alerts_paused_until,
                 updated_at = excluded.updated_at
             ''',
