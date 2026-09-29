@@ -104,6 +104,7 @@ from channel_links import find_channel_username, is_private_invite
 from ranking import prioritize_channel_posts
 from telegraph_publisher import describe_counts, publish_digest
 from time_parser import parse_reminder_time
+from digest_alerts import process_pending_digest_alerts
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -4978,6 +4979,7 @@ async def check_digests():
         while True:
             try:
                 backlog = await run_digest_cycle(session, semaphore)
+                await process_pending_digest_alerts(bot)
             except asyncio.CancelledError:
                 raise
             except Exception:

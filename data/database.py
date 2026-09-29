@@ -405,6 +405,33 @@ def init_db():
             )
             '''
         )
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS user_alert_settings (
+                user_id INTEGER PRIMARY KEY,
+                alerts_enabled INTEGER NOT NULL DEFAULT 1,
+                alerts_paused_until DATETIME,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+            '''
+        )
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS digest_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                period TEXT NOT NULL,
+                scheduled_at DATETIME NOT NULL,
+                alert_type TEXT NOT NULL,
+                sent_at DATETIME NOT NULL,
+                message_id INTEGER,
+                error_text TEXT,
+                created_at DATETIME NOT NULL,
+                UNIQUE(user_id, period, scheduled_at, alert_type)
+            )
+            '''
+        )
         # Early 2026-09-22 builds had a global is_enabled flag; delivery is now per period.
         try:
             cursor.execute("ALTER TABLE user_emails ADD COLUMN email_periods TEXT DEFAULT ''")
@@ -481,6 +508,9 @@ def init_db():
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_digest_executions_sched ON digest_executions(scheduled_at, status)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_digest_alerts_user_sent ON digest_alerts(user_id, sent_at)"
         )
 
         _migrate_legacy_local_timestamps_to_utc(cursor)
@@ -1648,6 +1678,150 @@ def get_last_digest_execution(user_id: int, period: str | None = None) -> dict |
         return dict(row) if row else None
 
 
+def get_user_alert_settings(user_id: int) -> dict:
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT user_id, alerts_enabled, alerts_paused_until
+            FROM user_alert_settings
+            WHERE user_id = ?
+            ''',
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return {
+                "user_id": user_id,
+                "alerts_enabled": True,
+                "alerts_paused_until": None,
+            }
+        return {
+            "user_id": row["user_id"],
+            "alerts_enabled": bool(row["alerts_enabled"]),
+            "alerts_paused_until": row["alerts_paused_until"],
+        }
+
+
+def set_user_alerts_enabled(user_id: int, enabled: bool) -> None:
+    now_str = serialize_datetime(utc_now())
+    val = 1 if enabled else 0
+    with get_connection() as conn:
+        conn.execute(
+            '''
+            INSERT INTO user_alert_settings (user_id, alerts_enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                alerts_enabled = excluded.alerts_enabled,
+                updated_at = excluded.updated_at
+            ''',
+            (user_id, val, now_str, now_str),
+        )
+        conn.commit()
+
+
+def set_user_alerts_paused_until(user_id: int, paused_until: str | None) -> None:
+    now_str = serialize_datetime(utc_now())
+    with get_connection() as conn:
+        conn.execute(
+            '''
+            INSERT INTO user_alert_settings (user_id, alerts_enabled, alerts_paused_until, created_at, updated_at)
+            VALUES (?, 1, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                alerts_paused_until = excluded.alerts_paused_until,
+                updated_at = excluded.updated_at
+            ''',
+            (user_id, paused_until, now_str, now_str),
+        )
+        conn.commit()
+
+
+def is_user_alerting_active(user_id: int, now: datetime | None = None) -> bool:
+    if now is None:
+        now = utc_now()
+    settings = get_user_alert_settings(user_id)
+    if not settings["alerts_enabled"]:
+        return False
+    paused_until_str = settings["alerts_paused_until"]
+    if paused_until_str:
+        paused_until = parse_db_datetime(paused_until_str)
+        if paused_until > now:
+            return False
+    return True
+
+
+def record_digest_alert_sent(
+    user_id: int,
+    period: str,
+    scheduled_at: str,
+    alert_type: str,
+    sent_at: str | None = None,
+    message_id: int | None = None,
+    error_text: str | None = None,
+) -> int | None:
+    created_at = serialize_datetime(utc_now())
+    sent_at_val = sent_at or created_at
+    with get_connection() as conn:
+        cursor = conn.execute(
+            '''
+            INSERT INTO digest_alerts (
+                user_id, period, scheduled_at, alert_type, sent_at, message_id, error_text, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, period, scheduled_at, alert_type) DO UPDATE SET
+                sent_at = excluded.sent_at,
+                message_id = COALESCE(excluded.message_id, digest_alerts.message_id),
+                error_text = COALESCE(excluded.error_text, digest_alerts.error_text)
+            ''',
+            (user_id, period, scheduled_at, alert_type, sent_at_val, message_id, truncate_error_text(error_text), created_at),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def has_digest_alert_been_sent(user_id: int, period: str, scheduled_at: str, alert_type: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT 1 FROM digest_alerts
+            WHERE user_id = ? AND period = ? AND scheduled_at = ? AND alert_type = ?
+            ''',
+            (user_id, period, scheduled_at, alert_type),
+        ).fetchone()
+        return bool(row)
+
+
+def get_failed_digest_executions_pending_alert(
+    older_than_seconds: int,
+    max_retries: int = 3,
+    now_str: str | None = None,
+) -> list[dict]:
+    if not now_str:
+        now_str = serialize_datetime(utc_now())
+    with get_connection() as conn:
+        rows = conn.execute(
+            '''
+            SELECT de.id, de.user_id, de.period, de.scheduled_at, de.started_at, de.finished_at,
+                   de.status, de.posts_count, de.channels_count, de.channels_failed,
+                   de.channels_partial, de.error_message, de.retry_count, de.created_at
+            FROM digest_executions de
+            WHERE (
+                de.status = 'failed'
+                OR (de.status = 'retrying' AND de.retry_count >= ?)
+            )
+            AND datetime(de.scheduled_at, '+' || ? || ' seconds') <= datetime(?)
+            AND datetime(de.scheduled_at) >= datetime(?, '-2 days')
+            AND NOT EXISTS (
+                SELECT 1 FROM digest_alerts da
+                WHERE da.user_id = de.user_id
+                  AND da.period = de.period
+                  AND da.scheduled_at = de.scheduled_at
+                  AND da.alert_type = 'failure'
+            )
+            ORDER BY de.scheduled_at ASC
+            ''',
+            (max_retries, older_than_seconds, now_str, now_str),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def cleanup_old_records(now_str: str) -> dict[str, int]:
     with get_connection() as conn:
         scheduled_sent_deleted = conn.execute(
@@ -1696,6 +1870,13 @@ def cleanup_old_records(now_str: str) -> dict[str, int]:
             """,
             (now_str, f"-{DIGEST_POST_RETENTION_DAYS} days"),
         ).rowcount
+        digest_alerts_deleted = conn.execute(
+            """
+            DELETE FROM digest_alerts
+            WHERE created_at < datetime(?, ?)
+            """,
+            (now_str, f"-{DIGEST_POST_RETENTION_DAYS} days"),
+        ).rowcount
         ai_usage_deleted = conn.execute(
             """
             DELETE FROM ai_usage
@@ -1712,6 +1893,7 @@ def cleanup_old_records(now_str: str) -> dict[str, int]:
         "digest_posts_deleted": digest_posts_deleted,
         "channel_posts_deleted": channel_posts_deleted,
         "digest_executions_deleted": digest_executions_deleted,
+        "digest_alerts_deleted": digest_alerts_deleted,
         "ai_usage_deleted": ai_usage_deleted,
     }
 
