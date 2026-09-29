@@ -40,15 +40,23 @@ case "${1:-steps}" in
     ;;
   steps)
     _need_jq; n="${2:-40}"
-    jq -r 'select(.event=="step_update") | .step_update
-           | select(.state=="DONE")
-           | "\(.step_index)\t\(.step_type)\t\(((.text_delta // "") | gsub("\\s+";" "))[0:160])"' \
+    # Только последний разговор: лог накапливается между прогонами.
+    CID="$("$0" id)"
+    jq -r --arg cid "$CID" 'select(.event=="step_update") | .step_update
+           | select(.conversation_id==$cid and .state=="DONE")
+           | . as $s
+           | (if .step_type=="tool"
+                then "\(.tool_name // "?") \((($s.tool_info.parameters // {}) | tostring)[0:90])"
+                else ((.text_delta // "") | gsub("\\s+";" "))[0:150] end) as $what
+           | select($what | test("\\S"))
+           | "\(.step_index)\t\(.step_type)\t\($what)"' \
       "$LOG" | tail -n "$n"
     ;;
   reasoning)
     _need_jq; n="${2:-25}"
-    jq -r 'select(.event=="step_update") | .step_update
-           | select(.state=="DONE")
+    CID="$("$0" id)"
+    jq -r --arg cid "$CID" 'select(.event=="step_update") | .step_update
+           | select(.conversation_id==$cid and .state=="DONE")
            | select(.step_type|test("thinking|reason|agent_response"))
            | "[\(.step_type)] \(((.text_delta // "") | gsub("\\s+";" "))[0:400])"' \
       "$LOG" | grep -v '^\[[a-z_]*\] *$' | tail -n "$n"

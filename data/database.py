@@ -11,6 +11,8 @@ MESSAGE_RETENTION_DAYS = int(os.getenv("MESSAGE_RETENTION_DAYS", "30"))
 SUBSCRIPTION_FAILURE_RETENTION_DAYS = int(os.getenv("SUBSCRIPTION_FAILURE_RETENTION_DAYS", "90"))
 DIGEST_POST_RETENTION_DAYS = int(os.getenv("DIGEST_POST_RETENTION_DAYS", "30"))
 MAX_ERROR_TEXT_LENGTH = int(os.getenv("MAX_ERROR_TEXT_LENGTH", "800"))
+CHANNEL_BACKLOG_MAX = int(os.getenv("CHANNEL_BACKLOG_MAX", "500"))
+CHANNEL_DELIVERY_BATCH_SIZE = int(os.getenv("CHANNEL_DELIVERY_BATCH_SIZE", "50"))
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "bot_data.db"))
@@ -383,6 +385,26 @@ def init_db():
             )
             '''
         )
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS digest_executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                period TEXT NOT NULL,
+                scheduled_at DATETIME NOT NULL,
+                started_at DATETIME,
+                finished_at DATETIME,
+                status TEXT NOT NULL,
+                posts_count INTEGER DEFAULT 0,
+                channels_count INTEGER DEFAULT 0,
+                channels_failed INTEGER DEFAULT 0,
+                channels_partial INTEGER DEFAULT 0,
+                error_message TEXT,
+                retry_count INTEGER DEFAULT 0,
+                created_at DATETIME NOT NULL
+            )
+            '''
+        )
         # Early 2026-09-22 builds had a global is_enabled flag; delivery is now per period.
         try:
             cursor.execute("ALTER TABLE user_emails ADD COLUMN email_periods TEXT DEFAULT ''")
@@ -401,6 +423,8 @@ def init_db():
             "ALTER TABLE channel_posts ADD COLUMN forwards INTEGER",
             "ALTER TABLE channel_posts ADD COLUMN replies INTEGER",
             "ALTER TABLE channel_posts ADD COLUMN metrics_at DATETIME",
+            "ALTER TABLE channels ADD COLUMN last_scanned_at DATETIME",
+            "ALTER TABLE channels ADD COLUMN last_scanned_post_id INTEGER",
         ):
             try:
                 cursor.execute(statement)
@@ -448,6 +472,15 @@ def init_db():
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_telegraph_digests_user_created ON telegraph_digests(user_id, created_at)"
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_digest_executions_user_period_sched ON digest_executions(user_id, period, scheduled_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_digest_executions_user_status ON digest_executions(user_id, status)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_digest_executions_sched ON digest_executions(scheduled_at, status)"
         )
 
         _migrate_legacy_local_timestamps_to_utc(cursor)
@@ -733,7 +766,7 @@ def get_due_subscriptions(current_time_str, limit: int | None = None):
         rows = conn.execute(
             '''
             SELECT id, user_id, channel_username, channel_title, period, last_scraped_at, failure_count,
-                   last_post_id
+                   last_post_id, next_send_at
             FROM subscriptions
             WHERE next_send_at <= ? AND is_disabled = 0 AND is_paused = 0
             ORDER BY next_send_at, id
@@ -812,6 +845,98 @@ def needs_channel_subscribers_update(channel_username: str, ttl_hours: int = 24)
             return True
         updated_at = parse_db_datetime(row["subscribers_updated_at"])
         return (utc_now() - updated_at).total_seconds() > ttl_hours * 3600
+
+
+def update_channel_scan_cursor(
+    channel_username: str,
+    last_scanned_at: datetime | str | None,
+    last_scanned_post_id: int | None = None,
+) -> None:
+    normalized = normalize_channel_username(channel_username)
+    if isinstance(last_scanned_at, datetime):
+        scanned_str = serialize_datetime(last_scanned_at)
+    else:
+        scanned_str = last_scanned_at
+    with get_connection() as conn:
+        conn.execute(
+            '''
+            INSERT INTO channels (channel_username, last_scanned_at, last_scanned_post_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(channel_username) DO UPDATE SET
+                last_scanned_at = COALESCE(excluded.last_scanned_at, channels.last_scanned_at),
+                last_scanned_post_id = COALESCE(excluded.last_scanned_post_id, channels.last_scanned_post_id)
+            ''',
+            (normalized, scanned_str, last_scanned_post_id),
+        )
+        conn.commit()
+
+
+def get_channel_scan_cursor(channel_username: str) -> tuple[str | None, int | None]:
+    normalized = normalize_channel_username(channel_username)
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT last_scanned_at, last_scanned_post_id FROM channels WHERE channel_username = ?",
+            (normalized,),
+        ).fetchone()
+        if not row:
+            return None, None
+        return row["last_scanned_at"], row["last_scanned_post_id"]
+
+
+def get_channel_backlog_count(
+    channel_username: str,
+    last_post_id: int | None = None,
+    last_scraped_at: str | None = None,
+) -> int:
+    normalized = normalize_channel_username(channel_username)
+    with get_connection() as conn:
+        if last_post_id is not None:
+            row = conn.execute(
+                '''
+                SELECT COUNT(*) FROM channel_posts
+                WHERE channel_username = ? AND post_id > ?
+                ''',
+                (normalized, last_post_id),
+            ).fetchone()
+        else:
+            marker = last_scraped_at or serialize_datetime(datetime.min.replace(tzinfo=UTC))
+            row = conn.execute(
+                '''
+                SELECT COUNT(*) FROM channel_posts
+                WHERE channel_username = ? AND post_time > ?
+                ''',
+                (normalized, marker),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+
+def is_channel_backlog_overloaded(channel_username: str, threshold: int = CHANNEL_BACKLOG_MAX) -> bool:
+    normalized = normalize_channel_username(channel_username)
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT MIN(COALESCE(last_post_id, 0)) as min_post_id,
+                   MIN(COALESCE(last_scraped_at, '1970-01-01 00:00:00')) as min_scraped
+            FROM subscriptions
+            WHERE channel_username = ? AND is_disabled = 0
+            ''',
+            (normalized,),
+        ).fetchone()
+        if not row or (row["min_post_id"] is None and row["min_scraped"] is None):
+            return False
+        min_post_id = row["min_post_id"]
+        min_scraped = row["min_scraped"]
+        if min_post_id is not None and min_post_id > 0:
+            cnt = conn.execute(
+                "SELECT COUNT(*) FROM channel_posts WHERE channel_username = ? AND post_id > ?",
+                (normalized, min_post_id),
+            ).fetchone()[0]
+        else:
+            cnt = conn.execute(
+                "SELECT COUNT(*) FROM channel_posts WHERE channel_username = ? AND post_time > ?",
+                (normalized, min_scraped),
+            ).fetchone()[0]
+        return cnt >= threshold
 
 
 def upsert_channel_posts(channel_username: str, posts: list[dict], source: str) -> int:
@@ -1392,6 +1517,137 @@ def update_saved_message_tag(user_id, msg_id, new_tag):
 
 
 
+def record_digest_execution_start(user_id: int, period: str, scheduled_at: str) -> int:
+    created_at = serialize_datetime(utc_now())
+    started_at = created_at
+    with get_connection() as conn:
+        cursor = conn.execute(
+            '''
+            INSERT INTO digest_executions (
+                user_id, period, scheduled_at, started_at, status, created_at
+            ) VALUES (?, ?, ?, ?, 'retrying', ?)
+            ON CONFLICT(user_id, period, scheduled_at) DO UPDATE SET
+                started_at = excluded.started_at,
+                status = 'retrying'
+            RETURNING id
+            ''',
+            (user_id, period, scheduled_at, started_at, created_at),
+        )
+        row = cursor.fetchone()
+        conn.commit()
+        return row[0]
+
+
+def record_digest_execution_finish(
+    execution_id: int,
+    status: str,
+    posts_count: int = 0,
+    channels_count: int = 0,
+    channels_failed: int = 0,
+    channels_partial: int = 0,
+    error_message: str | None = None,
+) -> None:
+    finished_at = serialize_datetime(utc_now())
+    err_text = truncate_error_text(error_message)
+    with get_connection() as conn:
+        if status in ("retrying", "failed"):
+            conn.execute(
+                '''
+                UPDATE digest_executions
+                SET finished_at = ?,
+                    status = ?,
+                    posts_count = ?,
+                    channels_count = ?,
+                    channels_failed = ?,
+                    channels_partial = ?,
+                    error_message = ?,
+                    retry_count = retry_count + 1
+                WHERE id = ?
+                ''',
+                (
+                    finished_at,
+                    status,
+                    posts_count,
+                    channels_count,
+                    channels_failed,
+                    channels_partial,
+                    err_text,
+                    execution_id,
+                ),
+            )
+        else:
+            conn.execute(
+                '''
+                UPDATE digest_executions
+                SET finished_at = ?,
+                    status = ?,
+                    posts_count = ?,
+                    channels_count = ?,
+                    channels_failed = ?,
+                    channels_partial = ?,
+                    error_message = ?
+                WHERE id = ?
+                ''',
+                (
+                    finished_at,
+                    status,
+                    posts_count,
+                    channels_count,
+                    channels_failed,
+                    channels_partial,
+                    err_text,
+                    execution_id,
+                ),
+            )
+        conn.commit()
+
+
+def get_digest_execution(user_id: int, period: str, scheduled_at: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT id, user_id, period, scheduled_at, started_at, finished_at,
+                   status, posts_count, channels_count, channels_failed,
+                   channels_partial, error_message, retry_count, created_at
+            FROM digest_executions
+            WHERE user_id = ? AND period = ? AND scheduled_at = ?
+            ''',
+            (user_id, period, scheduled_at),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_last_digest_execution(user_id: int, period: str | None = None) -> dict | None:
+    with get_connection() as conn:
+        if period:
+            row = conn.execute(
+                '''
+                SELECT id, user_id, period, scheduled_at, started_at, finished_at,
+                       status, posts_count, channels_count, channels_failed,
+                       channels_partial, error_message, retry_count, created_at
+                FROM digest_executions
+                WHERE user_id = ? AND period = ?
+                ORDER BY scheduled_at DESC, id DESC
+                LIMIT 1
+                ''',
+                (user_id, period),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                '''
+                SELECT id, user_id, period, scheduled_at, started_at, finished_at,
+                       status, posts_count, channels_count, channels_failed,
+                       channels_partial, error_message, retry_count, created_at
+                FROM digest_executions
+                WHERE user_id = ?
+                ORDER BY scheduled_at DESC, id DESC
+                LIMIT 1
+                ''',
+                (user_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+
 def cleanup_old_records(now_str: str) -> dict[str, int]:
     with get_connection() as conn:
         scheduled_sent_deleted = conn.execute(
@@ -1433,6 +1689,13 @@ def cleanup_old_records(now_str: str) -> dict[str, int]:
             """,
             (now_str, f"-{DIGEST_POST_RETENTION_DAYS} days"),
         ).rowcount
+        digest_executions_deleted = conn.execute(
+            """
+            DELETE FROM digest_executions
+            WHERE created_at < datetime(?, ?)
+            """,
+            (now_str, f"-{DIGEST_POST_RETENTION_DAYS} days"),
+        ).rowcount
         ai_usage_deleted = conn.execute(
             """
             DELETE FROM ai_usage
@@ -1448,6 +1711,7 @@ def cleanup_old_records(now_str: str) -> dict[str, int]:
         "subscriptions_failed_deleted": subscriptions_failed_deleted,
         "digest_posts_deleted": digest_posts_deleted,
         "channel_posts_deleted": channel_posts_deleted,
+        "digest_executions_deleted": digest_executions_deleted,
         "ai_usage_deleted": ai_usage_deleted,
     }
 

@@ -37,6 +37,8 @@ from data.database import (
     add_subscription,
     add_telegraph_digest,
     cleanup_old_records,
+    CHANNEL_BACKLOG_MAX,
+    CHANNEL_DELIVERY_BATCH_SIZE,
     clear_email_periods,
     confirm_email_code,
     clear_subscription_failure,
@@ -47,6 +49,7 @@ from data.database import (
     delete_user_email,
     export_user_data,
     get_ai_usage_today,
+    get_channel_scan_cursor,
     get_digest_posts,
     get_digest_settings,
     get_email_delivery,
@@ -66,11 +69,14 @@ from data.database import (
     get_user_tags,
     increment_ai_usage,
     init_db,
+    is_channel_backlog_overloaded,
     mark_as_sent,
     mark_message_delivery_error,
     mark_subscription_delivery_error,
     normalize_channel_username,
     parse_db_datetime,
+    record_digest_execution_finish,
+    record_digest_execution_start,
     replace_sent_reminder_with_pending,
     serialize_datetime,
     start_email_verification,
@@ -79,6 +85,7 @@ from data.database import (
     set_subscription_paused,
     set_subscription_tag,
     unsubscribe_all,
+    update_channel_scan_cursor,
     update_subscriptions_next_send_at,
     update_subscription_time,
     update_subscription_schedule,
@@ -1044,7 +1051,7 @@ async def fetch_subscription_posts(
     now_str: str,
     prefetched_channels: dict[str, dict] | None = None,
 ):
-    sub_id, user_id, username, title, period, last_scraped, failure_count, last_post_id = sub
+    sub_id, user_id, username, title, period, last_scraped, failure_count, last_post_id = sub[:8]
     title_safe = html.escape(title) if title else "Канал"
 
     async with semaphore:
@@ -1058,36 +1065,60 @@ async def fetch_subscription_posts(
                 fetched_posts = prefetched["posts"]
                 source_name = prefetched["source"]
             else:
+                channel_scanned_at, _ = get_channel_scan_cursor(username)
+                if channel_scanned_at and last_scraped:
+                    scan_marker = serialize_datetime(max(parse_db_datetime(last_scraped), parse_db_datetime(channel_scanned_at)))
+                else:
+                    scan_marker = channel_scanned_at or last_scraped
                 fetched_posts, source_name = await channel_source.fetch(
                     username,
-                    last_scraped,
+                    scan_marker,
                     web_session=session,
                 )
                 upsert_channel_posts(username, fetched_posts, source_name)
-            posts = get_channel_posts_since(username, last_scraped, last_post_id)
-            if fetched_posts and not posts:
+                if fetched_posts:
+                    max_time = max(p["time"] for p in fetched_posts)
+                    max_id = max((p["id"] for p in fetched_posts if p.get("id") is not None), default=None)
+                    update_channel_scan_cursor(username, max_time, max_id)
+
+            available_posts = get_channel_posts_since(username, last_scraped, last_post_id)
+            if fetched_posts and not available_posts:
                 # Compatibility for a malformed legacy link without a numeric post id.
-                posts = fetched_posts
+                available_posts = fetched_posts
+
             cursor_reached = getattr(fetched_posts, "cursor_reached", True)
-            if cursor_reached:
+
+            # Backlog batching: take up to CHANNEL_DELIVERY_BATCH_SIZE posts
+            if len(available_posts) > CHANNEL_DELIVERY_BATCH_SIZE:
+                posts_batch = available_posts[:CHANNEL_DELIVERY_BATCH_SIZE]
+                has_remaining_backlog = True
+            else:
+                posts_batch = available_posts
+                has_remaining_backlog = False
+
+            if posts_batch:
                 delivered_marker = max(
-                    (post["time"] for post in posts),
+                    (post["time"] for post in posts_batch),
                     default=parse_db_datetime(last_scraped),
                 )
                 delivered_post_id = max(
-                    (post["id"] for post in posts if post.get("id") is not None),
+                    (post["id"] for post in posts_batch if post.get("id") is not None),
                     default=last_post_id,
                 )
             else:
-                logger.warning(
-                    "Cursor not reached for @%s (page limit reached); leaving cursor at %s",
-                    username,
-                    last_scraped,
-                )
                 delivered_marker = parse_db_datetime(last_scraped)
                 delivered_post_id = last_post_id
 
-            selected_posts, omitted_count = prioritize_channel_posts(username, posts)
+            is_partial = (not cursor_reached) or has_remaining_backlog
+            if not cursor_reached:
+                logger.warning(
+                    "Cursor not reached for @%s (page limit reached); edition is partial, delivery cursor advanced to %s (%s)",
+                    username,
+                    delivered_marker,
+                    delivered_post_id,
+                )
+
+            selected_posts, omitted_count = prioritize_channel_posts(username, posts_batch)
             return {
                 "status": "ok",
                 "sub_id": sub_id,
@@ -1097,7 +1128,8 @@ async def fetch_subscription_posts(
                 "title_safe": title_safe,
                 "posts": selected_posts,
                 "omitted_count": omitted_count,
-                "is_partial": not cursor_reached,
+                "is_partial": is_partial,
+                "has_backlog": has_remaining_backlog,
                 "next_send_str": next_send_str,
                 "last_scraped_str": serialize_datetime(delivered_marker),
                 "last_post_id": delivered_post_id,
@@ -1164,12 +1196,32 @@ async def prefetch_due_channels(
     async def load(username: str, marker: str | None) -> tuple[str, dict]:
         async with semaphore:
             try:
+                # Check for backpressure: if backlog exceeds limit, pause remote fetch to avoid overflow
+                if is_channel_backlog_overloaded(username):
+                    logger.warning(
+                        "Backpressure triggered for channel @%s: backlog exceeds %d posts; skipping telegram fetch until backlog is drained",
+                        username,
+                        CHANNEL_BACKLOG_MAX,
+                    )
+                    return username, {"posts": [], "source": "backpressure", "error": None, "backpressure": True}
+
+                # Scan cursor: check if channel has a more recent scan cursor
+                channel_scanned_at, _ = get_channel_scan_cursor(username)
+                if channel_scanned_at and marker:
+                    scan_marker = serialize_datetime(max(parse_db_datetime(marker), parse_db_datetime(channel_scanned_at)))
+                else:
+                    scan_marker = channel_scanned_at or marker
+
                 posts, source_name = await channel_source.fetch(
                     username,
-                    marker,
+                    scan_marker,
                     web_session=session,
                 )
                 upsert_channel_posts(username, posts, source_name)
+                if posts:
+                    max_time = max(p["time"] for p in posts)
+                    max_id = max((p["id"] for p in posts if p.get("id") is not None), default=None)
+                    update_channel_scan_cursor(username, max_time, max_id)
                 return username, {"posts": posts, "source": source_name, "error": None}
             except ChannelFetchError as exc:
                 return username, {"posts": [], "source": None, "error": exc}
@@ -4708,15 +4760,21 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
     failures_count = 0
     delivered_users_count = 0
     delivered_posts_count = 0
-    users_subs: dict[int, list] = {}
+    user_period_subs: dict[tuple[int, str], list] = {}
     for sub in due_subs:
-        users_subs.setdefault(sub[1], []).append(sub)
+        u_id = sub[1]
+        prd = sub[4]
+        user_period_subs.setdefault((u_id, prd), []).append(sub)
 
-    for user_id, subs in users_subs.items():
+    for (user_id, period), subs in user_period_subs.items():
+        scheduled_at = subs[0][8] if len(subs[0]) > 8 and subs[0][8] else now_str
+        execution_id = record_digest_execution_start(user_id, period, scheduled_at)
         try:
             sections: list[dict] = []
             user_has_temporary_failures = False
             successful_subscriptions: list[dict] = []
+            channels_failed = 0
+            channels_partial = 0
 
             results = await asyncio.gather(
                 *(
@@ -4735,20 +4793,25 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
             for result in results:
                 if isinstance(result, BaseException):
                     failures_count += 1
+                    channels_failed += 1
                     user_has_temporary_failures = True
                     logger.error(
-                        "Изолирована необработанная ошибка чтения для пользователя %s",
+                        "Изолирована необработанная ошибка чтения для пользователя %s (%s)",
                         user_id,
+                        period,
                         exc_info=(type(result), result, result.__traceback__),
                     )
                     continue
                 if result["status"] == "error":
                     failures_count += 1
+                    channels_failed += 1
                     if not result["is_permanent"]:
                         user_has_temporary_failures = True
                     continue
 
                 successful_subscriptions.append(result)
+                if result.get("is_partial"):
+                    channels_partial += 1
                 if result["posts"]:
                     sections.append(
                         {
@@ -4787,13 +4850,25 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
                                 result["next_send_str"],
                                 now_str,
                             )
+                    exec_status = "partial" if (channels_failed > 0 or channels_partial > 0) else "delivered"
+                    record_digest_execution_finish(
+                        execution_id,
+                        status=exec_status,
+                        posts_count=sum(len(s["posts"]) for s in sections),
+                        channels_count=len(subs),
+                        channels_failed=channels_failed,
+                        channels_partial=channels_partial,
+                    )
                 except TelegramAPIError as exc:
                     failures_count += len(successful_subscriptions)
                     is_permanent, error_text = classify_telegram_send_error(exc)
+                    retries_exhausted = False
                     for result in successful_subscriptions:
                         original = next((item for item in subs if item[0] == result["sub_id"]), None)
                         failure_count = original[6] if original else 0
                         new_failure_count = failure_count + 1
+                        if new_failure_count >= MAX_DIGEST_RETRIES:
+                            retries_exhausted = True
                         mark_subscription_delivery_error(
                             result["sub_id"],
                             error_text,
@@ -4801,25 +4876,77 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
                             new_failure_count,
                             is_permanent or new_failure_count >= MAX_DIGEST_RETRIES,
                         )
-                    logger.exception("Не удалось отправить дайджест пользователю %s", user_id)
-            else:
-                for result in successful_subscriptions:
-                    update_subscription_schedule(
-                        result["sub_id"],
-                        result["next_send_str"],
-                        now_str,
+                    exec_status = "failed" if (is_permanent or retries_exhausted) else "retrying"
+                    record_digest_execution_finish(
+                        execution_id,
+                        status=exec_status,
+                        posts_count=0,
+                        channels_count=len(subs),
+                        channels_failed=len(subs),
+                        channels_partial=channels_partial,
+                        error_message=error_text,
                     )
+                    logger.exception("Не удалось отправить дайджест пользователю %s (%s)", user_id, period)
+            else:
+                if channels_failed == 0:
+                    for result in successful_subscriptions:
+                        update_subscription_schedule(
+                            result["sub_id"],
+                            result["next_send_str"],
+                            now_str,
+                        )
+                    record_digest_execution_finish(
+                        execution_id,
+                        status="empty",
+                        posts_count=0,
+                        channels_count=len(subs),
+                        channels_failed=0,
+                        channels_partial=channels_partial,
+                    )
+                else:
+                    all_permanent = all(
+                        r.get("is_permanent", False)
+                        for r in results
+                        if isinstance(r, dict) and r.get("status") == "error"
+                    ) and channels_failed == len(subs)
+                    exec_status = "failed" if all_permanent else "retrying"
+                    record_digest_execution_finish(
+                        execution_id,
+                        status=exec_status,
+                        posts_count=0,
+                        channels_count=len(subs),
+                        channels_failed=channels_failed,
+                        channels_partial=channels_partial,
+                        error_message="Не удалось прочитать каналы",
+                    )
+                    for result in successful_subscriptions:
+                        update_subscription_schedule(
+                            result["sub_id"],
+                            result["next_send_str"],
+                            now_str,
+                        )
 
             if user_has_temporary_failures:
                 logger.info(
-                    "Для пользователя %s чтение части каналов будет повторено позже.",
+                    "Для пользователя %s (%s) чтение части каналов будет повторено позже.",
                     user_id,
+                    period,
                 )
-        except Exception:
+        except Exception as exc:
             failures_count += len(subs)
+            record_digest_execution_finish(
+                execution_id,
+                status="failed",
+                posts_count=0,
+                channels_count=len(subs),
+                channels_failed=len(subs),
+                channels_partial=0,
+                error_message=str(exc),
+            )
             logger.exception(
-                "Изолирована ошибка обработки дайджеста пользователя %s; продолжаю со следующим пользователем",
+                "Изолирована ошибка обработки дайджеста пользователя %s (%s); продолжаю со следующим пользователем",
                 user_id,
+                period,
             )
 
     logger.info(

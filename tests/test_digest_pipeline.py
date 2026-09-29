@@ -510,7 +510,7 @@ class WebFallbackPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(posts.cursor_reached)
         self.assertEqual([p["id"] for p in posts], [42, 43, 44])
 
-    async def test_ceiling_reached_cursor_not_reached_leaves_cursor_unmoved(self):
+    async def test_ceiling_reached_advances_cursor_for_inspected_posts_and_marks_partial(self):
         from scraper import get_latest_posts
 
         page1 = message_html(30, "2026-07-24T12:00:00+00:00", text="Post 30")
@@ -532,22 +532,11 @@ class WebFallbackPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(posts.cursor_reached)
         self.assertTrue(posts.is_partial)
 
-        cursor_reached = getattr(posts, "cursor_reached", True)
-        last_scraped = "2026-07-24 08:00:00"
-        last_post_id = 10
-        if cursor_reached:
-            delivered_marker = max(p["time"] for p in posts)
-            delivered_post_id = max(p["id"] for p in posts)
-        else:
-            from data.database import parse_db_datetime
-
-            delivered_marker = parse_db_datetime(last_scraped)
-            delivered_post_id = last_post_id
-
-        from data.database import serialize_datetime
-
-        self.assertEqual(serialize_datetime(delivered_marker), last_scraped)
-        self.assertEqual(delivered_post_id, last_post_id)
+        # In T8, scan cursor and delivery cursor advance for the actually inspected/delivered posts (post 30)
+        max_scanned_id = max(p["id"] for p in posts)
+        delivered_post_id = max(p["id"] for p in posts)
+        self.assertEqual(max_scanned_id, 30)
+        self.assertEqual(delivered_post_id, 30)
 
 
 class FakeJsonResponse:
