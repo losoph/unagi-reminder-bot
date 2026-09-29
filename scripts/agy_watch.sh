@@ -22,6 +22,9 @@ LOG="$LOG_DIR/session.ndjson"
 mkdir -p "$LOG_DIR"
 
 _need_jq() { command -v jq >/dev/null || { echo "нужен jq"; exit 1; }; }
+# В лог попадают и не-JSON строки (ошибки CLI, сообщения шелла) — отсекаем их,
+# иначе jq падает и монитор слепнет ровно тогда, когда что-то пошло не так.
+_json() { grep '^{' "$LOG"; }
 
 case "${1:-steps}" in
   run|cont)
@@ -50,7 +53,7 @@ case "${1:-steps}" in
                 else ((.text_delta // "") | gsub("\\s+";" "))[0:150] end) as $what
            | select($what | test("\\S"))
            | "\(.step_index)\t\(.step_type)\t\($what)"' \
-      "$LOG" | tail -n "$n"
+      <(_json) | tail -n "$n"
     ;;
   reasoning)
     _need_jq; n="${2:-25}"
@@ -59,21 +62,26 @@ case "${1:-steps}" in
            | select(.conversation_id==$cid and .state=="DONE")
            | select(.step_type|test("thinking|reason|agent_response"))
            | "[\(.step_type)] \(((.text_delta // "") | gsub("\\s+";" "))[0:400])"' \
-      "$LOG" | grep -v '^\[[a-z_]*\] *$' | tail -n "$n"
+      <(_json) | grep -v '^\[[a-z_]*\] *$' | tail -n "$n"
+    ;;
+  status)
+    _need_jq
+    _json | jq -r 'select(.event=="result") | .result | "status=\(.status) \(.error // "")"' | tail -1
+    grep -c '^AGY_ERROR' "$LOG" 2>/dev/null | sed 's/^/сетевых ошибок в логе: /'
     ;;
   result)
     _need_jq
     jq -r 'select(.event=="result") | .result
            | "status=\(.status) turns=\(.num_turns) sec=\(.duration_seconds|floor)\n\(.response)"' \
-      "$LOG" | tail -40
+      <(_json) | tail -40
     ;;
   id)
-    _need_jq; jq -r 'select(.event=="init") | .conversation_id' "$LOG" | tail -1
+    _need_jq; _json | jq -r 'select(.event=="init") | .conversation_id' | tail -1
     ;;
   usage)
     _need_jq
     jq -r 'select(.event=="result") | .result.usage
-           | "in=\(.input_tokens) out=\(.output_tokens) think=\(.thinking_tokens) total=\(.total_tokens)"' "$LOG"
+           | "in=\(.input_tokens) out=\(.output_tokens) think=\(.thinking_tokens) total=\(.total_tokens)"' <(_json)
     ;;
   *) sed -n '2,20p' "$0"; exit 1 ;;
 esac
