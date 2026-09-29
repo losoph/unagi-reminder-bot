@@ -28,7 +28,7 @@ prev="$(_size)"; sleep 20
 while [ "$(_size)" != "$prev" ]; do prev="$(_size)"; sleep 20; done
 
 for attempt in $(seq 1 "$MAX"); do
-  if git log --oneline -40 | grep -q -- "$DONE_MARK"; then
+  if git log --oneline -40 | grep -- "$DONE_MARK" >/dev/null; then
     say "готово: маркер '$DONE_MARK' найден в истории"; exit 0
   fi
 
@@ -53,6 +53,6 @@ for attempt in $(seq 1 "$MAX"); do
   esac
 done
 
-git log --oneline -40 | grep -q -- "$DONE_MARK" \
+git log --oneline -40 | grep -- "$DONE_MARK" >/dev/null \
   && { say "готово после ретраев"; exit 0; } \
   || { say "ИСЧЕРПАНЫ попытки, маркер '$DONE_MARK' не найден"; exit 1; }
