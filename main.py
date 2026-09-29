@@ -76,6 +76,7 @@ from data.database import (
     mark_subscription_delivery_error,
     normalize_channel_username,
     parse_db_datetime,
+    record_digest_cycle_heartbeat,
     record_digest_execution_finish,
     record_digest_execution_start,
     replace_sent_reminder_with_pending,
@@ -110,6 +111,7 @@ from ranking import prioritize_channel_posts
 from telegraph_publisher import describe_counts, publish_digest
 from time_parser import parse_reminder_time
 from digest_alerts import build_digest_alert_keyboard, process_pending_digest_alerts
+from watchdog import WATCHDOG_CHECK_INTERVAL_SECONDS, run_watchdog_loop
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -5115,7 +5117,9 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
         failures_count,
         round((time.monotonic() - cycle_started_at) * 1000),
     )
-    return max(due_total - len(due_subs), 0)
+    backlog = max(due_total - len(due_subs), 0)
+    record_digest_cycle_heartbeat(backlog=backlog)
+    return backlog
 
 
 async def check_digests():
@@ -5172,12 +5176,14 @@ async def main():
         asyncio.create_task(check_messages(), name="reminder-scheduler"),
         asyncio.create_task(check_digests(), name="digest-scheduler"),
         asyncio.create_task(cleanup_database(), name="database-cleanup"),
+        asyncio.create_task(run_watchdog_loop(bot), name="watchdog-monitor"),
     ]
     logger.info("✅ Бот успешно запущен")
     logger.info("📋 Фоновые процессы:")
     logger.info("  • Напоминания: проверка каждые 30 сек")
     logger.info("  • Дайджесты: проверка каждые %d мин (оптимизировано с 1 мин)", DIGEST_CHECK_INTERVAL_SECONDS // 60)
     logger.info("  • Очистка БД: раз в %d часов", CLEANUP_INTERVAL_SECONDS // 3600)
+    logger.info("  • Watchdog: проверка каждые %d сек", WATCHDOG_CHECK_INTERVAL_SECONDS)
     logger.info("🚀 Ожидаю входящих сообщений...")
     try:
         await dp.start_polling(bot)

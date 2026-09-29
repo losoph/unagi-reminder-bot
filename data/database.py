@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -1502,6 +1503,54 @@ def delete_app_meta(key: str) -> None:
     with get_connection() as conn:
         conn.execute("DELETE FROM app_meta WHERE key = ?", (key,))
         conn.commit()
+
+
+META_LAST_CYCLE_AT = "watchdog_last_cycle_at"
+META_BACKLOG_HISTORY = "watchdog_backlog_history"
+META_ALERT_STALL_SENT = "watchdog_alert_stall_sent"
+META_ALERT_BACKLOG_SENT = "watchdog_alert_backlog_sent"
+
+
+def record_digest_cycle_heartbeat(backlog: int = 0, now: datetime | None = None) -> None:
+    now_val = now or utc_now()
+    now_str = serialize_datetime(now_val)
+    set_app_meta(META_LAST_CYCLE_AT, now_str)
+
+    hist_raw = get_app_meta(META_BACKLOG_HISTORY)
+    history: list[int] = []
+    if hist_raw:
+        try:
+            parsed = json.loads(hist_raw)
+            if isinstance(parsed, list):
+                history = [int(x) for x in parsed]
+        except Exception:
+            history = []
+    history.append(int(backlog))
+    if len(history) > 10:
+        history = history[-10:]
+    set_app_meta(META_BACKLOG_HISTORY, json.dumps(history))
+
+    if len(history) >= 2 and history[-1] < history[-2]:
+        delete_app_meta(META_ALERT_BACKLOG_SENT)
+    elif backlog == 0:
+        delete_app_meta(META_ALERT_BACKLOG_SENT)
+
+    delete_app_meta(META_ALERT_STALL_SENT)
+
+
+def get_last_digest_cycle_at() -> str | None:
+    return get_app_meta(META_LAST_CYCLE_AT)
+
+
+def get_digest_cycle_backlog_history() -> list[int]:
+    hist_raw = get_app_meta(META_BACKLOG_HISTORY)
+    if not hist_raw:
+        return []
+    try:
+        parsed = json.loads(hist_raw)
+        return [int(x) for x in parsed] if isinstance(parsed, list) else []
+    except Exception:
+        return []
 
 
 def add_saved_message(user_id, full_text, source_name, tag, saved_at):
