@@ -1325,6 +1325,33 @@ def add_telegraph_digest(user_id, url, title, channel_count, post_count):
         conn.commit()
 
 
+def get_latest_telegraph_digest(user_id: int, since_str: str | None = None) -> dict | None:
+    with get_connection() as conn:
+        if since_str:
+            row = conn.execute(
+                '''
+                SELECT id, user_id, url, title, channel_count, post_count, created_at
+                FROM telegraph_digests
+                WHERE user_id = ? AND datetime(created_at) >= datetime(?)
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                ''',
+                (user_id, since_str),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                '''
+                SELECT id, user_id, url, title, channel_count, post_count, created_at
+                FROM telegraph_digests
+                WHERE user_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                ''',
+                (user_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+
 def get_digest_posts(user_id, since_str, channel_username=None):
     with get_connection() as conn:
         if channel_username:
@@ -1670,13 +1697,14 @@ def retry_digest_execution(execution_id: int) -> bool:
     now_str = serialize_datetime(utc_now())
     with get_connection() as conn:
         row = conn.execute(
-            'SELECT user_id, period FROM digest_executions WHERE id = ?',
+            'SELECT user_id, period, scheduled_at FROM digest_executions WHERE id = ?',
             (execution_id,),
         ).fetchone()
         if not row:
             return False
         user_id = row['user_id']
         period = row['period']
+        sched_at = row['scheduled_at'] if ('scheduled_at' in row.keys() and row['scheduled_at']) else now_str
 
         conn.execute(
             '''
@@ -1692,7 +1720,7 @@ def retry_digest_execution(execution_id: int) -> bool:
             SET next_send_at = ?, failure_count = 0, digest_status = 'pending', is_disabled = 0
             WHERE user_id = ? AND period = ?
             ''',
-            (now_str, user_id, period),
+            (sched_at, user_id, period),
         )
         conn.commit()
         return True
@@ -1920,6 +1948,40 @@ def get_failed_digest_executions_pending_alert(
             ORDER BY de.scheduled_at ASC
             ''',
             (max_retries, older_than_seconds, now_str, now_str),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_delivered_executions_pending_recovery_alert(now_str: str | None = None) -> list[dict]:
+    if not now_str:
+        now_str = serialize_datetime(utc_now())
+    with get_connection() as conn:
+        rows = conn.execute(
+            '''
+            SELECT de.id, de.user_id, de.period, de.scheduled_at, de.started_at, de.finished_at,
+                   de.status, de.posts_count, de.channels_count, de.channels_failed,
+                   de.channels_partial, de.error_message, de.retry_count, de.created_at
+            FROM digest_executions de
+            WHERE de.status IN ('delivered', 'partial')
+              AND de.posts_count > 0
+              AND datetime(de.scheduled_at) >= datetime(?, '-7 days')
+              AND EXISTS (
+                  SELECT 1 FROM digest_alerts da
+                  WHERE da.user_id = de.user_id
+                    AND da.period = de.period
+                    AND da.scheduled_at = de.scheduled_at
+                    AND da.alert_type = 'failure'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM digest_alerts da
+                  WHERE da.user_id = de.user_id
+                    AND da.period = de.period
+                    AND da.scheduled_at = de.scheduled_at
+                    AND da.alert_type = 'recovery'
+              )
+            ORDER BY de.finished_at ASC, de.id ASC
+            ''',
+            (now_str,),
         ).fetchall()
         return [dict(r) for r in rows]
 

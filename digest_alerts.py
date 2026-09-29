@@ -8,8 +8,10 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramFor
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from data.database import (
+    get_delivered_executions_pending_recovery_alert,
     get_digest_alert,
     get_failed_digest_executions_pending_alert,
+    get_latest_telegraph_digest,
     get_user_alert_settings,
     has_digest_alert_been_sent,
     is_user_alerting_active,
@@ -354,6 +356,172 @@ async def process_pending_digest_alerts(
         except Exception:
             logger.exception(
                 "Ошибка при обработке алерта по execution %s",
+                execution.get("id"),
+            )
+
+    recovery_count = await process_pending_recovery_alerts(bot, now=now)
+    return sent_count + recovery_count
+
+
+def format_recovery_alert(
+    period: str,
+    scheduled_at: str | datetime,
+    posts_count: int = 0,
+    digest_url: str | None = None,
+) -> str:
+    title = PERIOD_TITLES.get(period, f"дайджест ({period})")
+    if isinstance(scheduled_at, datetime):
+        sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC")
+    else:
+        try:
+            dt = parse_db_datetime(scheduled_at)
+            sched_str = dt.strftime("%d.%m.%Y %H:%M UTC")
+        except Exception:
+            sched_str = html.escape(str(scheduled_at))
+
+    lines = [
+        f"✅ <b>{html.escape(title.capitalize())} восстановлен</b>\n",
+        f"Выпуск за <b>{sched_str}</b> успешно собран.",
+    ]
+    if posts_count > 0:
+        lines.append(f"Количество постов: <b>{posts_count}</b>")
+
+    if digest_url and digest_url.strip():
+        lines.append(f'\n📖 <a href="{html.escape(digest_url.strip())}">Открыть дайджест в Telegraph</a>')
+
+    return "\n".join(lines)
+
+
+def build_recovery_alert_keyboard(digest_url: str | None = None) -> InlineKeyboardMarkup | None:
+    if digest_url and digest_url.strip():
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📖 Открыть дайджест", url=digest_url.strip())]
+            ]
+        )
+    return None
+
+
+async def send_digest_recovery_alert(
+    bot: Bot,
+    execution: dict,
+    digest_url: str | None = None,
+    now: datetime | None = None,
+) -> bool:
+    user_id = execution.get("user_id")
+    period = execution.get("period", "")
+    scheduled_at = execution.get("scheduled_at", "")
+    posts_count = execution.get("posts_count", 0)
+
+    if not user_id:
+        return False
+
+    now_val = now or utc_now()
+    sent_at_str = serialize_datetime(now_val)
+
+    # 1. Deduplication: exactly one recovery notification per edition
+    if has_digest_alert_been_sent(user_id, period, scheduled_at, "recovery"):
+        return False
+
+    # 2. Only send recovery if failure alert was sent for this edition
+    if not has_digest_alert_been_sent(user_id, period, scheduled_at, "failure"):
+        return False
+
+    # 3. Do not send if user alerts are paused or disabled
+    if not is_user_alerting_active(user_id, now=now_val):
+        record_digest_alert_sent(
+            user_id=user_id,
+            period=period,
+            scheduled_at=scheduled_at,
+            alert_type="recovery",
+            sent_at=sent_at_str,
+            error_text="suppressed_alerts_inactive",
+        )
+        return False
+
+    # 4. Resolve Telegraph link if available
+    if digest_url is None:
+        t_row = get_latest_telegraph_digest(user_id, since_str=execution.get("started_at"))
+        if t_row:
+            digest_url = t_row.get("url")
+
+    text = format_recovery_alert(
+        period=period,
+        scheduled_at=scheduled_at,
+        posts_count=posts_count,
+        digest_url=digest_url,
+    )
+    keyboard = build_recovery_alert_keyboard(digest_url)
+
+    try:
+        sent_msg = await bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        msg_id = getattr(sent_msg, "message_id", None)
+        record_digest_alert_sent(
+            user_id=user_id,
+            period=period,
+            scheduled_at=scheduled_at,
+            alert_type="recovery",
+            sent_at=sent_at_str,
+            message_id=msg_id,
+        )
+        logger.info(
+            "Отправлен recovery алерт: user=%s, period=%s, sched=%s, posts=%s",
+            user_id,
+            period,
+            scheduled_at,
+            posts_count,
+        )
+        return True
+    except TelegramForbiddenError:
+        logger.warning(
+            "Пользователь %s заблокировал бота при отправке recovery; отключаю алерты",
+            user_id,
+        )
+        set_user_alerts_enabled(user_id, False)
+        record_digest_alert_sent(
+            user_id=user_id,
+            period=period,
+            scheduled_at=scheduled_at,
+            alert_type="recovery",
+            sent_at=sent_at_str,
+            error_text="TelegramForbiddenError",
+        )
+        return False
+    except TelegramAPIError as exc:
+        logger.warning(
+            "Не удалось доставить recovery алерт пользователю %s: %s",
+            user_id,
+            exc,
+        )
+        return False
+
+
+async def process_pending_recovery_alerts(
+    bot: Bot,
+    now: datetime | None = None,
+) -> int:
+    if now is None:
+        now = utc_now()
+    now_str = serialize_datetime(now)
+    pending_list = get_delivered_executions_pending_recovery_alert(now_str=now_str)
+    sent_count = 0
+    for execution in pending_list:
+        try:
+            sent = await send_digest_recovery_alert(
+                bot=bot,
+                execution=execution,
+                now=now,
+            )
+            if sent:
+                sent_count += 1
+        except Exception:
+            logger.exception(
+                "Ошибка при обработке recovery алерта по execution %s",
                 execution.get("id"),
             )
     return sent_count
