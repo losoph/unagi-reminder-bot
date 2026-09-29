@@ -20,8 +20,12 @@ SUP="$LOG_DIR/supervise.log"
 
 say() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$SUP"; }
 
-# Ждём, пока завершится уже идущий прогон, чтобы не запустить второй параллельно.
-while pgrep -f "stream-json" >/dev/null 2>&1; do sleep 10; done
+# Активность определяем по РОСТУ лога, а не через pgrep: pgrep -f "stream-json"
+# матчит зависшие процессы без читаемой cmdline, и цикл ожидания не кончается
+# никогда (проверено — супервизор так залип и не запустил ни одной попытки).
+_size() { wc -c < "$LOG_DIR/session.ndjson" 2>/dev/null || echo 0; }
+prev="$(_size)"; sleep 20
+while [ "$(_size)" != "$prev" ]; do prev="$(_size)"; sleep 20; done
 
 for attempt in $(seq 1 "$MAX"); do
   if git log --oneline -40 | grep -q -- "$DONE_MARK"; then
