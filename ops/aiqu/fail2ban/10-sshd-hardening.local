@@ -1,0 +1,9 @@
+# 2026-10-11: SSH только на 2258; меньше попыток, повторные баны растут.
+[sshd]
+enabled  = true
+port     = 2258
+maxretry = 3
+findtime = 10m
+bantime  = 1h
+bantime.increment = true
+bantime.maxtime   = 1w
