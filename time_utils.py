@@ -5,9 +5,13 @@ import re
 from datetime import datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
 from data.database import parse_db_datetime
 
 TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Moscow"))
+_DAY_PART_HOURS = {"morning": 9, "day": 14, "evening": 20}
+TIME_TEXT_EXAMPLES = "«завтра 11», «24/09 в 9», «через 2 дня»"
 
 
 def get_app_timezone() -> ZoneInfo:
@@ -54,3 +58,63 @@ def local_now() -> datetime:
 
 def display_db_datetime(value: str, tz: tzinfo | None = None) -> datetime:
     return parse_db_datetime(value).astimezone(tz or TZ)
+
+
+def format_when(moment: datetime, now: datetime) -> str:
+    day = {0: "сегодня", 1: "завтра", 2: "послезавтра"}.get((moment.date() - now.date()).days)
+    return f"{day or moment.strftime('%d.%m')} в {moment.strftime('%H:%M')}"
+
+
+def get_quick_scheduled_time(
+    action: str, now: datetime, hours: dict[str, int] | None = None
+) -> tuple[datetime | None, str]:
+    day_hours = hours or _DAY_PART_HOURS
+    if action in day_hours:
+        # The nearest such moment: «Утро» at 02:00 means this morning, not tomorrow's.
+        scheduled_time = now.replace(hour=day_hours[action], minute=0, second=0, microsecond=0)
+        if scheduled_time <= now:
+            scheduled_time += timedelta(days=1)
+        return scheduled_time, f"на {format_when(scheduled_time, now)}"
+
+    if action == "hour":
+        return now + timedelta(hours=1), "через час"
+
+    if action == "now":
+        return now + timedelta(hours=3), "через 3 часа"
+
+    return None, ""
+
+
+def describe_quick_times(now: datetime, hours: dict[str, int] | None = None) -> str:
+    """One line that tells what the day-part buttons resolve to right now."""
+    emojis = {"morning": "🌅", "day": "☀️", "evening": "🌙"}
+    day_hours = hours or _DAY_PART_HOURS
+    return " · ".join(
+        f"{emojis[action]} {format_when(get_quick_scheduled_time(action, now, day_hours)[0], now)}"
+        for action in day_hours
+    )
+
+
+def build_time_selection_keyboard(prefix: str, *, back_callback: str | None = None) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="🌅 Утро", callback_data=f"{prefix}_morning"),
+            InlineKeyboardButton(text="☀️ День", callback_data=f"{prefix}_day"),
+            InlineKeyboardButton(text="🌙 Вечер", callback_data=f"{prefix}_evening"),
+        ],
+        [
+            InlineKeyboardButton(text="⏱ 1 час", callback_data=f"{prefix}_hour"),
+            InlineKeyboardButton(text="⏱ 3 часа", callback_data=f"{prefix}_now"),
+            InlineKeyboardButton(text="🗓 Дата…", callback_data=f"{prefix}_custom"),
+        ],
+    ]
+    if back_callback:
+        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_standard_message_keyboard() -> InlineKeyboardMarkup:
+    kb = build_time_selection_keyboard("time").inline_keyboard
+    kb.append([InlineKeyboardButton(text="📁 В закладки (База знаний)", callback_data="bookmark_setup")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+

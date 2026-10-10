@@ -467,6 +467,39 @@ def init_db():
                 cursor.execute(statement)
             except sqlite3.OperationalError:
                 pass
+
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS reschedule_undo_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                new_pending_id INTEGER NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                old_reminder_id INTEGER NOT NULL,
+                message_id INTEGER,
+                delivered_message_id INTEGER,
+                delivered_at TEXT,
+                old_send_at TEXT,
+                created_at TEXT,
+                text_preview TEXT,
+                source_name TEXT,
+                tag TEXT,
+                full_text TEXT,
+                note TEXT,
+                source_url TEXT,
+                delivery_status TEXT DEFAULT 'sent',
+                original_text TEXT,
+                original_message_id INTEGER,
+                created_timestamp REAL,
+                is_undone INTEGER DEFAULT 0
+            )
+            '''
+        )
+        cursor.execute(
+            '''
+            CREATE INDEX IF NOT EXISTS idx_reschedule_undo_lookup
+            ON reschedule_undo_history(new_pending_id, user_id)
+            '''
+        )
         # Early 2026-09-22 builds had a global is_enabled flag; delivery is now per period.
         try:
             cursor.execute("ALTER TABLE user_emails ADD COLUMN email_periods TEXT DEFAULT ''")
@@ -793,6 +826,188 @@ def mark_reminder_as_done(user_id: int, db_id: int) -> bool:
         )
         conn.commit()
         return cur.rowcount > 0
+
+
+def get_last_delivered_reminder(user_id: int) -> dict | None:
+    """Returns the most recent reminder with delivered_at that is not marked done and not yet deleted."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM scheduled_messages
+            WHERE user_id = ?
+              AND is_sent = 1
+              AND delivery_status != 'done'
+              AND delivered_at IS NOT NULL
+            ORDER BY delivered_at DESC, id DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+
+def get_recent_delivered_reminder(
+    user_id: int,
+    window_minutes: int = 10,
+    now: datetime | None = None,
+) -> dict | None:
+    """Returns the most recently delivered reminder if delivered within the last window_minutes."""
+    candidate = get_last_delivered_reminder(user_id)
+    if not candidate or not candidate.get("delivered_at"):
+        return None
+    delivered_at_str = candidate["delivered_at"]
+    delivered_at_dt = parse_db_datetime(delivered_at_str)
+    current_utc = now.astimezone(UTC) if now else utc_now()
+    elapsed = (current_utc - delivered_at_dt).total_seconds()
+    if 0 <= elapsed <= window_minutes * 60:
+        return candidate
+    return None
+
+
+def save_reschedule_undo(
+    new_pending_id: int,
+    user_id: int,
+    old_reminder: dict,
+    original_text: str = "",
+    original_message_id: int | None = None,
+) -> None:
+    """Saves a snapshot of the rescheduled reminder before replacing it with pending."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO reschedule_undo_history (
+                new_pending_id, user_id, old_reminder_id, message_id, delivered_message_id,
+                delivered_at, old_send_at, created_at, text_preview, source_name,
+                tag, full_text, note, source_url, delivery_status,
+                original_text, original_message_id, created_timestamp, is_undone
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                new_pending_id,
+                user_id,
+                old_reminder["id"],
+                old_reminder.get("message_id"),
+                old_reminder.get("delivered_message_id"),
+                old_reminder.get("delivered_at"),
+                old_reminder.get("send_at"),
+                old_reminder.get("created_at"),
+                old_reminder.get("text_preview"),
+                old_reminder.get("source_name"),
+                old_reminder.get("tag"),
+                old_reminder.get("full_text"),
+                old_reminder.get("note"),
+                old_reminder.get("source_url"),
+                old_reminder.get("delivery_status") or "sent",
+                original_text,
+                original_message_id,
+                datetime.now(UTC).timestamp(),
+            ),
+        )
+        conn.commit()
+
+
+def undo_followup_reschedule(user_id: int, new_pending_id: int) -> tuple[bool, str, dict | None]:
+    """Atomically undoes a followup reschedule: deletes new pending reminder and restores old delivered reminder.
+    Returns (success, reason, snapshot).
+    """
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM reschedule_undo_history
+                WHERE new_pending_id = ? AND user_id = ?
+                """,
+                (new_pending_id, user_id),
+            ).fetchone()
+            if not row:
+                conn.rollback()
+                return False, "not_found", None
+
+            undo_dict = dict(row)
+            if undo_dict.get("is_undone"):
+                conn.rollback()
+                return False, "already_undone", None
+
+            pending_row = conn.execute(
+                """
+                SELECT id, delivery_status, is_sent
+                FROM scheduled_messages
+                WHERE id = ? AND user_id = ?
+                """,
+                (new_pending_id, user_id),
+            ).fetchone()
+            if not pending_row:
+                conn.rollback()
+                return False, "already_changed", None
+
+            if pending_row["delivery_status"] != "pending" or pending_row["is_sent"] != 0:
+                conn.rollback()
+                return False, "already_changed", None
+
+            # Delete the pending reminder
+            del_cur = conn.execute(
+                "DELETE FROM scheduled_messages WHERE id = ? AND user_id = ?",
+                (new_pending_id, user_id),
+            )
+            if del_cur.rowcount != 1:
+                conn.rollback()
+                return False, "already_changed", None
+
+            # Restore the delivered reminder row
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO scheduled_messages (
+                    id, user_id, message_id, delivered_message_id, send_at, created_at,
+                    is_sent, text_preview, source_name, delivery_status, retry_count,
+                    last_error, last_attempt_at, tag, full_text, note, delivered_at, source_url
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?,
+                    1, ?, ?, ?, 0,
+                    NULL, NULL, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    undo_dict["old_reminder_id"],
+                    user_id,
+                    undo_dict["message_id"],
+                    undo_dict["delivered_message_id"],
+                    undo_dict["old_send_at"],
+                    undo_dict["created_at"],
+                    undo_dict["text_preview"],
+                    undo_dict["source_name"],
+                    undo_dict["delivery_status"] or "sent",
+                    undo_dict["tag"],
+                    undo_dict["full_text"],
+                    undo_dict["note"],
+                    undo_dict["delivered_at"],
+                    undo_dict["source_url"],
+                ),
+            )
+
+            conn.execute(
+                "UPDATE reschedule_undo_history SET is_undone = 1 WHERE new_pending_id = ? AND user_id = ?",
+                (new_pending_id, user_id),
+            )
+            conn.commit()
+
+            snapshot = {
+                "old_reminder_id": undo_dict["old_reminder_id"],
+                "new_pending_id": new_pending_id,
+                "original_text": undo_dict.get("original_text") or "",
+                "original_message_id": undo_dict.get("original_message_id"),
+                "text_preview": undo_dict.get("text_preview"),
+                "full_text": undo_dict.get("full_text"),
+            }
+            return True, "ok", snapshot
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def get_scheduled_message_by_delivered_message_id(user_id, delivered_message_id):

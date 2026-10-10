@@ -132,7 +132,18 @@ import reminders_ux
 import user_prefs
 dp.include_router(reminders_ux.router)
 dp.include_router(user_prefs.router)
-from time_utils import TZ, display_db_datetime, local_now  # noqa: E402
+from time_utils import (  # noqa: E402
+    _DAY_PART_HOURS,
+    TIME_TEXT_EXAMPLES,
+    TZ,
+    build_standard_message_keyboard,
+    build_time_selection_keyboard,
+    describe_quick_times,
+    display_db_datetime,
+    format_when,
+    get_quick_scheduled_time,
+    local_now,
+)
 from user_prefs import day_part_hours, user_now, user_tz  # noqa: E402
 fallback_router = Router(name="fallback")
 MAX_MESSAGE_RETRIES = 5
@@ -141,6 +152,7 @@ DIGEST_FETCH_CONCURRENCY = 5
 DIGEST_DUE_BATCH_SIZE = max(1, int(os.getenv("DIGEST_DUE_BATCH_SIZE", "100")))
 DIGEST_BACKLOG_RETRY_SECONDS = max(1, int(os.getenv("DIGEST_BACKLOG_RETRY_SECONDS", "5")))
 DIGEST_CHECK_INTERVAL_SECONDS = int(os.getenv("DIGEST_CHECK_INTERVAL_SECONDS", 30 * 60))  # Можно переопределить через .env
+RESCHEDULE_FOLLOWUP_WINDOW_MINUTES = int(os.getenv("RESCHEDULE_FOLLOWUP_WINDOW_MINUTES", "10"))
 CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 # Дайджесты с таким числом постов и более публикуются в Telegraph одной ссылкой.
 DIGEST_TELEGRAPH_THRESHOLD = int(os.getenv("DIGEST_TELEGRAPH_THRESHOLD", "4"))
@@ -720,24 +732,6 @@ def parse_callback_strip_prefix(data: str | None, prefix: str) -> str | None:
     return rest if rest else None
 
 
-def build_time_selection_keyboard(prefix: str, *, back_callback: str | None = None) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(text="🌅 Утро", callback_data=f"{prefix}_morning"),
-            InlineKeyboardButton(text="☀️ День", callback_data=f"{prefix}_day"),
-            InlineKeyboardButton(text="🌙 Вечер", callback_data=f"{prefix}_evening"),
-        ],
-        [
-            InlineKeyboardButton(text="⏱ 1 час", callback_data=f"{prefix}_hour"),
-            InlineKeyboardButton(text="⏱ 3 часа", callback_data=f"{prefix}_now"),
-            InlineKeyboardButton(text="🗓 Дата…", callback_data=f"{prefix}_custom"),
-        ],
-    ]
-    if back_callback:
-        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 def build_manual_date_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -825,45 +819,6 @@ def build_sent_reminder_actions_keyboard(
     return reminders_ux.build_sent_reminder_actions_keyboard(
         now=user_time,
         evening_hour=user_h.get("evening", 20),
-    )
-
-
-_DAY_PART_HOURS = {"morning": 9, "day": 14, "evening": 20}
-TIME_TEXT_EXAMPLES = "«завтра 11», «24/09 в 9», «через 2 дня»"
-
-
-def format_when(moment: datetime, now: datetime) -> str:
-    day = {0: "сегодня", 1: "завтра", 2: "послезавтра"}.get((moment.date() - now.date()).days)
-    return f"{day or moment.strftime('%d.%m')} в {moment.strftime('%H:%M')}"
-
-
-def get_quick_scheduled_time(
-    action: str, now: datetime, hours: dict[str, int] | None = None
-) -> tuple[datetime | None, str]:
-    day_hours = hours or _DAY_PART_HOURS
-    if action in day_hours:
-        # The nearest such moment: «Утро» at 02:00 means this morning, not tomorrow's.
-        scheduled_time = now.replace(hour=day_hours[action], minute=0, second=0, microsecond=0)
-        if scheduled_time <= now:
-            scheduled_time += timedelta(days=1)
-        return scheduled_time, f"на {format_when(scheduled_time, now)}"
-
-    if action == "hour":
-        return now + timedelta(hours=1), "через час"
-
-    if action == "now":
-        return now + timedelta(hours=3), "через 3 часа"
-
-    return None, ""
-
-
-def describe_quick_times(now: datetime, hours: dict[str, int] | None = None) -> str:
-    """One line that tells what the day-part buttons resolve to right now."""
-    emojis = {"morning": "🌅", "day": "☀️", "evening": "🌙"}
-    day_hours = hours or _DAY_PART_HOURS
-    return " · ".join(
-        f"{emojis[action]} {format_when(get_quick_scheduled_time(action, now, day_hours)[0], now)}"
-        for action in day_hours
     )
 
 
@@ -4583,13 +4538,26 @@ def message_link_urls(message: types.Message) -> list[str]:
 
 @fallback_router.message()
 async def catch_message(message: types.Message, state: FSMContext):
-    await state.clear()
-
     # A text reply to a delivered reminder is a new time for it: «завтра 11», «через 2 дня».
     if message.text and not message.text.startswith("/"):
         scheduled_msg = get_replied_sent_schedule(message)
         if scheduled_msg:
+            await state.clear()
             await reschedule_replied_by_text(message, scheduled_msg, message.text)
+            return
+
+    current_state = await state.get_state()
+    await state.clear()
+
+    # T17: Followup reschedule for recently delivered reminder without reply
+    if (
+        current_state is None
+        and message.text
+        and not message.text.startswith("/")
+        and message.reply_to_message is None
+        and not getattr(message, "forward_origin", None)
+    ):
+        if await reminders_ux.handle_followup_text_reschedule(message):
             return
 
     channel_username = None
@@ -4612,8 +4580,7 @@ async def catch_message(message: types.Message, state: FSMContext):
         elif is_private_invite(text):
             channel_note = "\n\nℹ️ Это приглашение в закрытый канал — дайджест работает только с публичными."
 
-    kb = build_time_selection_keyboard("time").inline_keyboard
-    kb.append([InlineKeyboardButton(text="📁 В закладки (База знаний)", callback_data="bookmark_setup")])
+    kb = build_standard_message_keyboard().inline_keyboard
 
     prompt = "Что мне сделать с этим сообщением?"
     if channel_username:

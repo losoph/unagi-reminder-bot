@@ -2,6 +2,7 @@
 
 import html
 import logging
+import os
 import re
 from datetime import datetime
 from typing import Any
@@ -12,8 +13,23 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from data.database import get_reminder_by_id, update_reminder_note
-from time_utils import display_db_datetime
+from data.database import (
+    get_recent_delivered_reminder,
+    get_reminder_by_id,
+    replace_sent_reminder_with_pending,
+    save_reschedule_undo,
+    serialize_datetime,
+    undo_followup_reschedule,
+    update_reminder_note,
+)
+from time_parser import parse_reminder_time
+from time_utils import (
+    build_standard_message_keyboard,
+    describe_quick_times,
+    display_db_datetime,
+    format_when,
+)
+from user_prefs import day_part_hours, user_now
 
 logger = logging.getLogger(__name__)
 
@@ -532,3 +548,142 @@ def build_sent_reminder_actions_keyboard(
             ],
         ]
     )
+
+
+RESCHEDULE_FOLLOWUP_WINDOW_MINUTES = int(os.getenv("RESCHEDULE_FOLLOWUP_WINDOW_MINUTES", "10"))
+
+
+def build_followup_reschedule_keyboard(new_db_id: int) -> InlineKeyboardMarkup:
+    """Keyboard attached to followup reschedule confirmation with undo option (T17)."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="↩️ Нет, это новое", callback_data=f"undo_resched_{new_db_id}")],
+        ]
+    )
+
+
+async def send_standard_message_actions(
+    bot: Any,
+    chat_id: int,
+    user_id: int,
+    reply_to_message_id: int | None = None,
+) -> Any:
+    """Sends the standard «Что мне сделать с этим сообщением?» prompt with quick time buttons and bookmarking."""
+    now = user_now(user_id)
+    hours = day_part_hours(user_id)
+    kb = build_standard_message_keyboard()
+    prompt = "Что мне сделать с этим сообщением?"
+    text = f"{prompt}\n\n⏰ {describe_quick_times(now, hours)}"
+    if reply_to_message_id:
+        try:
+            return await bot.send_message(
+                chat_id,
+                text,
+                parse_mode="HTML",
+                reply_markup=kb,
+                reply_to_message_id=reply_to_message_id,
+            )
+        except TelegramAPIError:
+            pass
+    return await bot.send_message(
+        chat_id,
+        text,
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("undo_resched_"))
+async def handle_undo_followup_reschedule(callback: types.CallbackQuery):
+    """Handles «↩️ Нет, это новое» callback: restores delivered reminder, removes pending, sends standard menu."""
+    raw_id = callback.data[len("undo_resched_") :]
+    try:
+        new_db_id = int(raw_id)
+    except ValueError:
+        await callback.answer("❌ Некорректный ID.")
+        return
+
+    user_id = callback.from_user.id
+    success, reason, snapshot = undo_followup_reschedule(user_id, new_db_id)
+    if not success:
+        if reason == "already_undone":
+            await callback.answer("Уже отменено.")
+            return
+        await callback.answer("Уже нельзя отменить.", show_alert=True)
+        return
+
+    await callback.answer("Перенос отменён.")
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    chat_id = callback.message.chat.id if callback.message else user_id
+    orig_msg_id = snapshot.get("original_message_id") if snapshot else None
+    bot_inst = callback.bot or _bot
+    if bot_inst:
+        await send_standard_message_actions(
+            bot=bot_inst,
+            chat_id=chat_id,
+            user_id=user_id,
+            reply_to_message_id=orig_msg_id,
+        )
+
+
+async def handle_followup_text_reschedule(
+    message: types.Message,
+    now: datetime | None = None,
+    window_minutes: int | None = None,
+) -> bool:
+    """Attempts to reschedule the most recently delivered reminder if message text parses as a valid reminder time.
+    Returns True if rescheduled, False otherwise.
+    """
+    user_id = message.chat.id
+    current_now = now or user_now(user_id)
+    hours = day_part_hours(user_id)
+    text = (message.text or "").strip()
+    scheduled_time = parse_reminder_time(text, current_now, hours=hours)
+    if scheduled_time is None or scheduled_time <= current_now:
+        return False
+
+    win = window_minutes if window_minutes is not None else RESCHEDULE_FOLLOWUP_WINDOW_MINUTES
+    candidate = get_recent_delivered_reminder(
+        user_id,
+        window_minutes=win,
+        now=current_now,
+    )
+    if not candidate:
+        return False
+
+    preview = candidate.get("text_preview") or candidate.get("full_text") or ""
+    try:
+        new_db_id = replace_sent_reminder_with_pending(
+            user_id,
+            candidate["id"],
+            candidate.get("message_id"),
+            serialize_datetime(scheduled_time),
+            preview,
+            candidate.get("source_name") or "",
+        )
+    except Exception:
+        logger.exception("replace_sent_reminder_with_pending failed in followup reschedule")
+        return False
+
+    save_reschedule_undo(
+        new_pending_id=new_db_id,
+        user_id=user_id,
+        old_reminder=candidate,
+        original_text=text,
+        original_message_id=message.message_id,
+    )
+
+    confirmation = (
+        f"✅ Отложил «{html.escape(preview)}» на {format_when(scheduled_time, current_now)}."
+        if preview
+        else f"✅ Отложил на {format_when(scheduled_time, current_now)}."
+    )
+    kb = build_followup_reschedule_keyboard(new_db_id)
+    await message.reply(confirmation, parse_mode="HTML", reply_markup=kb)
+    return True
+
