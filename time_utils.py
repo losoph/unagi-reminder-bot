@@ -36,11 +36,14 @@ def parse_timezone(tz_input: str | None) -> tuple[tzinfo | None, str | None]:
         sign = 1 if m.group(1) == "+" else -1
         hours = int(m.group(2))
         mins = int(m.group(3) or 0)
-        if 0 <= hours <= 14 and 0 <= mins < 60:
-            offset = timedelta(hours=hours, minutes=mins) * sign
-            canonical = f"UTC{m.group(1)}{hours:02d}:{mins:02d}"
-            tz = timezone(offset, name=canonical)
-            return tz, canonical
+        if 0 <= mins < 60:
+            total_mins = hours * 60 + mins
+            # Earth timezone offsets: -12:00 to +14:00
+            if (sign == 1 and total_mins <= 14 * 60) or (sign == -1 and total_mins <= 12 * 60):
+                offset = timedelta(minutes=total_mins) * sign
+                canonical = f"UTC{m.group(1)}{hours:02d}:{mins:02d}"
+                tz = timezone(offset, name=canonical)
+                return tz, canonical
 
     return None, None
 

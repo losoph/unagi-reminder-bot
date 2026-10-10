@@ -91,6 +91,18 @@ def extract_source_url(msg: types.Message) -> str | None:
     return None
 
 
+def is_safe_source_url(url: str | None) -> bool:
+    """Whitelists only https://t.me/... and tg://user?id=<digits>."""
+    if not url or not isinstance(url, str):
+        return False
+    u = url.strip()
+    if u.startswith("https://t.me/"):
+        return True
+    if re.match(r"^tg://user\?id=\d+$", u):
+        return True
+    return False
+
+
 def resolve_reminder_display_data(
     source: str | None,
     full_text: str | None,
@@ -111,7 +123,8 @@ def resolve_reminder_display_data(
             effective_source = log_name
             display_text = stripped
 
-    return effective_source, display_text, source_url
+    safe_url = source_url if is_safe_source_url(source_url) else None
+    return effective_source, display_text, safe_url
 
 
 def extract_first_line(text: str, max_len: int = 100) -> str:
@@ -148,6 +161,8 @@ def format_day_group_header(moment: datetime, now: datetime) -> str:
     if days_diff == 2:
         return "Послезавтра"
     wd = RU_WEEKDAYS_SHORT.get(moment.weekday(), "")
+    if moment.year != now.year:
+        return f"{wd} {moment.strftime('%d.%m.%Y')}"
     return f"{wd} {moment.strftime('%d.%m')}"
 
 
@@ -171,7 +186,7 @@ def format_reminder_relative(dt_obj: datetime, now: datetime) -> str:
 
 
 def group_reminders_by_day(items: list[Any], now: datetime, dt_getter=None) -> list[tuple[str, list[Any]]]:
-    """Groups reminders by day into [(header, items), ...], preserving order."""
+    """Groups reminders by calendar date into [(header, items), ...], preserving order."""
     if dt_getter is None:
         def dt_getter(item):
             val = item["send_at"] if isinstance(item, dict) or hasattr(item, "__getitem__") else item.send_at
@@ -179,12 +194,15 @@ def group_reminders_by_day(items: list[Any], now: datetime, dt_getter=None) -> l
                 return display_db_datetime(val, tz=now.tzinfo)
             return val
 
-    groups: dict[str, list[Any]] = {}
+    groups: dict[Any, tuple[str, list[Any]]] = {}
     for item in items:
         dt = dt_getter(item)
-        header = format_day_group_header(dt, now)
-        groups.setdefault(header, []).append(item)
-    return list(groups.items())
+        cal_date = dt.date()
+        if cal_date not in groups:
+            header = format_day_group_header(dt, now)
+            groups[cal_date] = (header, [])
+        groups[cal_date][1].append(item)
+    return [entry for entry in groups.values()]
 
 
 def render_reminder_list_text(
@@ -334,14 +352,23 @@ def render_reminder_detail_text(row: Any, now: datetime) -> str:
     )
 
 
-def build_reminder_detail_keyboard(msg_id: int, has_message_id: bool) -> InlineKeyboardMarkup:
+def build_reminder_detail_keyboard(
+    msg_id: int,
+    has_message_id: bool,
+    source_url: str | None = None,
+) -> InlineKeyboardMarkup:
     """Builds inline keyboard for reminder detail screen with:
-    «💬 К сообщению» (if message_id), «⏰ Перенести», «📌 Примечание», «🏷 Тег»,
-    «📁 В закладки», «🗑 Удалить», «🔙 К списку».
+    «💬 К сообщению» (if message_id), «↗️ Открыть в канале» (if https://t.me/...),
+    «⏰ Перенести», «📌 Примечание», «🏷 Тег», «📁 В закладки», «🗑 Удалить», «🔙 К списку».
     """
     buttons: list[list[InlineKeyboardButton]] = []
+    nav_row: list[InlineKeyboardButton] = []
     if has_message_id:
-        buttons.append([InlineKeyboardButton(text="💬 К сообщению", callback_data=f"rem_goto_{msg_id}")])
+        nav_row.append(InlineKeyboardButton(text="💬 К сообщению", callback_data=f"rem_goto_{msg_id}"))
+    if source_url and source_url.startswith("https://t.me/"):
+        nav_row.append(InlineKeyboardButton(text="↗️ Открыть в канале", url=source_url))
+    if nav_row:
+        buttons.append(nav_row)
     buttons.append([
         InlineKeyboardButton(text="⏰ Перенести", callback_data=f"rem_resched_init_{msg_id}"),
         InlineKeyboardButton(text="📌 Примечание", callback_data=f"rem_note:{msg_id}:detail"),

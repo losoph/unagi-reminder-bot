@@ -1637,7 +1637,7 @@ def get_digest_cycle_backlog_history() -> list[int]:
 
 def add_saved_message(user_id, full_text, source_name, tag, saved_at):
     with get_connection() as conn:
-        conn.execute(
+        cur = conn.execute(
             '''
             INSERT INTO saved_messages (user_id, full_text, source_name, tag, saved_at)
             VALUES (?, ?, ?, ?, ?)
@@ -1645,6 +1645,7 @@ def add_saved_message(user_id, full_text, source_name, tag, saved_at):
             (user_id, full_text, source_name, tag, saved_at),
         )
         conn.commit()
+        return cur.lastrowid
 
 
 def get_user_tags(user_id):

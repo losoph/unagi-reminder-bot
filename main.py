@@ -1765,7 +1765,7 @@ async def show_sent_reminder_time_actions(callback: CallbackQuery):
         callback_message.chat.id, callback_message.message_id
     )
     if not scheduled_msg:
-        await callback.answer("❌ Напоминание уже обработано.", show_alert=True)
+        await callback.answer("Напоминание уже перенесено.")
         return
 
     # Swap the buttons in place instead of posting a separate «when?» message.
@@ -1811,7 +1811,7 @@ async def handle_sent_reminder_time_selection(callback: CallbackQuery, state: FS
         callback_message.chat.id, delivered_message_id
     )
     if not scheduled_msg:
-        await callback.answer("❌ Напоминание уже обработано.", show_alert=True)
+        await callback.answer("Напоминание уже перенесено.")
         return
 
     db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
@@ -1932,7 +1932,7 @@ async def handle_sent_snooze(callback: CallbackQuery):
         callback_message.chat.id, callback_message.message_id
     )
     if not scheduled_msg:
-        await callback.answer("❌ Напоминание уже обработано.", show_alert=True)
+        await callback.answer("Напоминание уже перенесено.")
         return
 
     db_id, source_message_id, delivered_message_id, _, preview, source, _ = scheduled_msg
@@ -2146,7 +2146,8 @@ async def render_rem_detail_screen(chat_id: int, msg_id: int, target: types.Mess
     text = reminders_ux.render_reminder_detail_text(row, now)
     message_id = row["message_id"] if "message_id" in row.keys() else row[5]
     has_message_id = bool(message_id and message_id > 0)
-    markup = reminders_ux.build_reminder_detail_keyboard(msg_id, has_message_id)
+    source_url = row["source_url"] if "source_url" in row.keys() else (row[8] if len(row) > 8 else None)
+    markup = reminders_ux.build_reminder_detail_keyboard(msg_id, has_message_id, source_url=source_url)
 
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
@@ -4010,7 +4011,7 @@ async def handle_bksched_choice(callback: CallbackQuery, state: FSMContext):
     scheduled_time, label = get_quick_scheduled_time(action, now, hours=hours)
     if scheduled_time:
         # Move: create the reminder (keeping the tag) and drop the bookmark.
-        add_message(
+        new_id = add_message(
             callback_message.chat.id,
             None,
             serialize_datetime(scheduled_time),
@@ -4020,18 +4021,21 @@ async def handle_bksched_choice(callback: CallbackQuery, state: FSMContext):
             full_text=full_text,
         )
         delete_saved_message(callback_message.chat.id, msg_id)
+        reply_markup = reminders_ux.build_reschedule_note_keyboard(new_id) if new_id else None
         confirm_msg = await bot.send_message(
             callback_message.chat.id,
-            f"✅ Перенесено в напоминания на {scheduled_time.strftime('%d.%m.%Y %H:%M')}!"
+            f"✅ Перенесено в напоминания на {scheduled_time.strftime('%d.%m.%Y %H:%M')}!",
+            reply_markup=reply_markup,
         )
         await state.clear()
         await push_screen(state, "rem_list", tag=None, page=1)
 
-        await asyncio.sleep(2)
-        try:
-            await confirm_msg.delete()
-        except TelegramAPIError:
-            pass
+        if not reply_markup:
+            await asyncio.sleep(2)
+            try:
+                await confirm_msg.delete()
+            except TelegramAPIError:
+                pass
 
         await render_screen(callback_message.chat.id, {"screen": "rem_list", "args": {"tag": None, "page": 1}}, callback_message, state)
     await callback.answer()
@@ -4110,7 +4114,7 @@ async def complete_manual_schedule(
         )
         confirmation_text = f"✅ Принято! Запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}."
     elif is_bksched:
-        add_message(
+        new_db_id = add_message(
             chat_id,
             None,
             serialize_datetime(scheduled_time),
@@ -4155,7 +4159,7 @@ async def complete_manual_schedule(
             pass
 
     reply_markup = None
-    if (scheduled_db_id or msg_id) and new_db_id:
+    if (scheduled_db_id or msg_id or is_bksched) and new_db_id:
         reply_markup = reminders_ux.build_reschedule_note_keyboard(new_db_id)
     confirm_msg = await bot.send_message(chat_id, confirmation_text, reply_markup=reply_markup)
     await state.clear()
@@ -4163,15 +4167,16 @@ async def complete_manual_schedule(
     if is_bksched:
         # The bookmark was moved into reminders — land on the reminders list.
         await push_screen(state, "rem_list", tag=None, page=1)
-        await asyncio.sleep(2)
-        try:
-            await confirm_msg.delete()
-        except TelegramAPIError:
-            pass
+        if not reply_markup:
+            await asyncio.sleep(2)
+            try:
+                await confirm_msg.delete()
+            except TelegramAPIError:
+                pass
         await render_screen(chat_id, {"screen": "rem_list", "args": {"tag": None, "page": 1}}, reply_target, state)
         return
 
-    if not (scheduled_db_id or (msg_id and reply_markup)):
+    if not (scheduled_db_id or ((msg_id or is_bksched) and reply_markup)):
         await asyncio.sleep(3)
         try:
             await confirm_msg.delete()
