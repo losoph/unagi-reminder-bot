@@ -19,6 +19,11 @@ from digest_alerts import (  # noqa: E402
 )
 
 
+
+# Выпуски в тестах датированы 29.09.2026; «сейчас» фиксируем рядом, иначе
+# окно recovery-алертов уезжает вместе с реальной датой.
+FIXED_NOW = datetime(2026, 9, 29, 9, 30, 0, tzinfo=timezone.utc)
+
 class TestAlertRecovery(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
@@ -215,7 +220,7 @@ class TestAlertRecovery(unittest.TestCase):
         mock_msg.message_id = 404
         bot.send_message = AsyncMock(return_value=mock_msg)
 
-        sent_count = asyncio.run(process_pending_recovery_alerts(bot))
+        sent_count = asyncio.run(process_pending_recovery_alerts(bot, now=FIXED_NOW))
         self.assertEqual(sent_count, 1)
         bot.send_message.assert_called_once()
         self.assertEqual(bot.send_message.call_args.kwargs["chat_id"], u1)
@@ -232,7 +237,7 @@ class TestAlertRecovery(unittest.TestCase):
         mock_msg.message_id = 505
         bot.send_message = AsyncMock(return_value=mock_msg)
 
-        total_sent = asyncio.run(process_pending_digest_alerts(bot))
+        total_sent = asyncio.run(process_pending_digest_alerts(bot, now=FIXED_NOW))
         self.assertEqual(total_sent, 1)
         bot.send_message.assert_called_once()
 

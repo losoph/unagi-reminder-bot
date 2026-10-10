@@ -6,6 +6,7 @@
 # обрывки и перезапустить. Этот скрипт делает и то, и другое сам.
 #
 #   ./scripts/agy_supervise.sh <task-file> <маркер-готовности> [попыток]
+#   AGY_RESUME=1 ...  — продолжить начатый разговор вместо нового
 #
 # <маркер-готовности> — подстрока в git log, по которой видно, что всё сделано
 # (например "(T13)"). Пока её нет и попытки не исчерпаны — возобновляем.
@@ -42,8 +43,13 @@ for attempt in $(seq 1 "$MAX"); do
     git clean -fdq -e .agy 2>/dev/null
   fi
 
-  say "попытка $attempt/$MAX: возобновляю agy"
-  ./scripts/agy_watch.sh cont "$TASK" >/dev/null 2>&1
+  # Первая попытка нового спринта — чистый разговор: `cont` подхватил бы
+  # последний разговор agy, то есть контекст прошлого спринта.
+  # AGY_RESUME=1 — продолжить уже начатый разговор этого спринта.
+  mode=cont
+  [ "$attempt" = 1 ] && [ "${AGY_RESUME:-0}" != 1 ] && mode=run
+  say "попытка $attempt/$MAX: agy $mode (модель ${AGY_MODEL:-gemini-3.8-flash-high})"
+  ./scripts/agy_watch.sh "$mode" "$TASK" >/dev/null 2>&1
 
   st="$(./scripts/agy_watch.sh status 2>/dev/null | head -1)"
   say "итог попытки: $st"

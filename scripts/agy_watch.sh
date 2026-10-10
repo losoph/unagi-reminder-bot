@@ -15,10 +15,16 @@
 #   ./scripts/agy_watch.sh result            # финальный ответ последнего прогона
 #   ./scripts/agy_watch.sh id                # conversation_id
 #   ./scripts/agy_watch.sh usage             # токены по прогонам
+#   ./scripts/agy_watch.sh follow            # live: по строке на каждый завершённый шаг
+#
+# Модель: AGY_MODEL (по умолчанию gemini-3.8-flash-high — дешёвая рабочая
+# лошадка с нормальным рассуждением; Pro/Opus тратят лимиты в разы быстрее
+# и нужны только для точечных сложных задач).
 set -euo pipefail
 
 LOG_DIR="${AGY_LOG_DIR:-.agy}"
 LOG="$LOG_DIR/session.ndjson"
+AGY_MODEL="${AGY_MODEL:-gemini-3.8-flash-high}"
 mkdir -p "$LOG_DIR"
 
 _need_jq() { command -v jq >/dev/null || { echo "нужен jq"; exit 1; }; }
@@ -34,9 +40,9 @@ case "${1:-steps}" in
     # креды прокси остаются в личном ~/.zshrc и в репозиторий не попадают.
     AGY_TASK_FILE="${2:?нужен путь к файлу с промптом}"
     [ -r "$AGY_TASK_FILE" ] || { echo "файл не читается: $AGY_TASK_FILE"; exit 1; }
-    export AGY_TASK_FILE
+    export AGY_TASK_FILE AGY_MODEL
     flag=""; [ "$1" = "cont" ] && flag="-c"
-    zsh -ic "agy $flag -p \"\$(cat \"\$AGY_TASK_FILE\")\" --output-format stream-json" \
+    zsh -ic "agy $flag --model \"\$AGY_MODEL\" -p \"\$(cat \"\$AGY_TASK_FILE\")\" --output-format stream-json" \
       2>&1 | tee -a "$LOG" >/dev/null
     echo "прогон записан в $LOG"
     "$0" result
@@ -63,6 +69,24 @@ case "${1:-steps}" in
            | select(.step_type|test("thinking|reason|agent_response"))
            | "[\(.step_type)] \(((.text_delta // "") | gsub("\\s+";" "))[0:400])"' \
       <(_json) | grep -v '^\[[a-z_]*\] *$' | tail -n "$n"
+    ;;
+  follow)
+    # Живой монитор для наблюдателя (Claude Monitor / второй терминал):
+    # только новые события, по строке на завершённый шаг, рассуждения целиком
+    # до 600 символов, плюс итог прогона. Спиннеры и диффы TUI сюда не попадают.
+    _need_jq
+    touch "$LOG"
+    ${AGY_FOLLOW_SRC:-tail -n0 -F "$LOG"} 2>/dev/null | grep --line-buffered '^{' \
+      | jq --unbuffered -r '
+          if .event=="step_update" then .step_update
+            | select(.state=="DONE")
+            | if .step_type=="tool"
+                then "TOOL \(.tool_name // "?") \(((.tool_info.parameters // {}) | tostring)[0:160])"
+                else (((.text_delta // "") | gsub("\\s+";" "))[0:600]) as $t
+                     | select($t | test("\\S")) | "\(.step_type | ascii_upcase) \($t)" end
+          elif .event=="result" then .result
+            | "RESULT status=\(.status) turns=\(.num_turns) \(.error // "")"
+          else empty end'
     ;;
   status)
     _need_jq

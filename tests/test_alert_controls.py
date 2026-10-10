@@ -139,7 +139,8 @@ class TestAlertControls(unittest.TestCase):
         self.assertIn("alert_toggle_enable", callbacks_disabled)
 
         # 3. Paused
-        future = datetime(2026, 9, 29, 20, 0, 0, tzinfo=timezone.utc)
+        # Пауза сравнивается с реальным «сейчас», поэтому дата относительная.
+        future = datetime.now(timezone.utc) + timedelta(hours=11)
         db.set_user_alerts_paused_until(user_id, db.serialize_datetime(future))
         text_paused = render_digest_settings_text(user_id)
         self.assertIn("Технические алерты:</b> на паузе", text_paused)
