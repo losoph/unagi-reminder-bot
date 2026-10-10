@@ -34,7 +34,11 @@ for attempt in $(seq 1 "$MAX"); do
   fi
 
   # Обрывки прошлой попытки: незакоммиченное после краха доверия не заслуживает.
-  if ! git diff --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+  # AGY_KEEP_TREE=1: первая попытка продолжает поверх незакоммиченных правок
+  # (например, после зависания по сети, когда работа в дереве ещё годная).
+  if [ "$attempt" = 1 ] && [ "${AGY_KEEP_TREE:-0}" = 1 ]; then
+    say "AGY_KEEP_TREE=1: незакоммиченные правки оставляю"
+  elif ! git diff --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]; then
     ts=$(date +%Y%m%d-%H%M%S); bak="$LOG_DIR/partial-$ts"; mkdir -p "$bak"
     git diff > "$bak/partial.diff" 2>/dev/null
     for f in $(git ls-files --others --exclude-standard); do cp "$f" "$bak/" 2>/dev/null; done
