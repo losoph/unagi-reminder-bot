@@ -71,22 +71,51 @@ case "${1:-steps}" in
       <(_json) | grep -v '^\[[a-z_]*\] *$' | tail -n "$n"
     ;;
   follow)
-    # Живой монитор для наблюдателя (Claude Monitor / второй терминал):
-    # только новые события, по строке на завершённый шаг, рассуждения целиком
-    # до 600 символов, плюс итог прогона. Спиннеры и диффы TUI сюда не попадают.
-    _need_jq
+    # Живой монитор для наблюдателя (Claude Monitor / второй терминал).
+    # Текст агента приходит дельтами в событиях ACTIVE, а DONE приходит пустым,
+    # поэтому дельты копятся по шагу и печатаются целиком на его завершении.
+    # Чтения файлов (view_file/grep/list) сворачиваются в счётчик — это шум.
     touch "$LOG"
-    ${AGY_FOLLOW_SRC:-tail -n0 -F "$LOG"} 2>/dev/null | grep --line-buffered '^{' \
-      | jq --unbuffered -r '
-          if .event=="step_update" then .step_update
-            | select(.state=="DONE")
-            | if .step_type=="tool"
-                then "TOOL \(.tool_name // "?") \(((.tool_info.parameters // {}) | tostring)[0:160])"
-                else (((.text_delta // "") | gsub("\\s+";" "))[0:600]) as $t
-                     | select($t | test("\\S")) | "\(.step_type | ascii_upcase) \($t)" end
-          elif .event=="result" then .result
-            | "RESULT status=\(.status) turns=\(.num_turns) \(.error // "")"
-          else empty end'
+    ${AGY_FOLLOW_SRC:-tail -n0 -F "$LOG"} 2>/dev/null | grep --line-buffered '^{' | python3 -u -c '
+import json, sys
+buf, quiet = {}, 0
+READS = ("view_file", "grep_search", "list_dir", "find_by_name", "codebase_search", "view_code_item")
+def flush_quiet():
+    global quiet
+    if quiet:
+        print(f"READ x{quiet}"); quiet = 0
+for line in sys.stdin:
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        continue
+    if ev.get("event") == "result":
+        r = ev.get("result") or {}
+        flush_quiet()
+        print("RESULT status=%s turns=%s %s" % (r.get("status"), r.get("num_turns"), r.get("error") or ""))
+        continue
+    st = ev.get("step_update")
+    if ev.get("event") != "step_update" or not st:
+        continue
+    key = (st.get("conversation_id"), st.get("step_index"))
+    if st.get("step_type") != "tool":
+        buf[key] = buf.get(key, "") + (st.get("text_delta") or "")
+    if st.get("state") != "DONE":
+        continue
+    if st.get("step_type") == "tool":
+        name = st.get("tool_name") or "?"
+        if name in READS:
+            quiet += 1
+            continue
+        flush_quiet()
+        params = json.dumps((st.get("tool_info") or {}).get("parameters") or {}, ensure_ascii=False)
+        print(f"TOOL {name} {params[:200]}")
+    else:
+        text = " ".join(buf.pop(key, "").split())
+        if text:
+            flush_quiet()
+            print(f"SAY {text[:700]}")
+'
     ;;
   status)
     _need_jq
