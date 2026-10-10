@@ -228,7 +228,11 @@ def init_db():
                 delivery_status TEXT DEFAULT 'pending',
                 retry_count INTEGER DEFAULT 0,
                 last_error TEXT,
-                last_attempt_at DATETIME
+                last_attempt_at DATETIME,
+                tag TEXT,
+                full_text TEXT,
+                note TEXT,
+                delivered_at DATETIME
             )
         ''')
 
@@ -242,6 +246,9 @@ def init_db():
             "ALTER TABLE scheduled_messages ADD COLUMN last_error TEXT",
             "ALTER TABLE scheduled_messages ADD COLUMN last_attempt_at DATETIME",
             "ALTER TABLE scheduled_messages ADD COLUMN tag TEXT",
+            "ALTER TABLE scheduled_messages ADD COLUMN full_text TEXT",
+            "ALTER TABLE scheduled_messages ADD COLUMN note TEXT",
+            "ALTER TABLE scheduled_messages ADD COLUMN delivered_at DATETIME",
         ):
             try:
                 cursor.execute(statement)
@@ -557,26 +564,41 @@ def init_db():
         conn.commit()
 
 
-def add_message(user_id, message_id, send_at, text_preview="", source_name="", tag=None):
+def add_message(
+    user_id,
+    message_id,
+    send_at,
+    text_preview="",
+    source_name="",
+    tag=None,
+    full_text=None,
+    note=None,
+):
     created_at = serialize_datetime(utc_now())
+    if full_text is None and text_preview:
+        full_text = text_preview
+    if not text_preview and full_text:
+        normalized = full_text.replace("\n", " ")
+        text_preview = normalized[:37] + "..." if len(normalized) > 40 else normalized
     with get_connection() as conn:
-        conn.execute(
+        cur = conn.execute(
             '''
             INSERT INTO scheduled_messages (
-                user_id, message_id, send_at, created_at, text_preview, source_name, tag, delivery_status
+                user_id, message_id, send_at, created_at, text_preview, source_name, tag, full_text, note, delivery_status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
             ''',
-            (user_id, message_id, send_at, created_at, text_preview, source_name, tag),
+            (user_id, message_id, send_at, created_at, text_preview, source_name, tag, full_text, note),
         )
         conn.commit()
+        return cur.lastrowid
 
 
 def get_pending_messages(current_time_str):
     with get_connection() as conn:
         rows = conn.execute(
             '''
-            SELECT id, user_id, message_id, retry_count, text_preview, source_name
+            SELECT id, user_id, message_id, retry_count, text_preview, source_name, full_text, note
             FROM scheduled_messages
             WHERE send_at <= ? AND is_sent = 0 AND delivery_status != 'failed_permanent'
             ''',
@@ -585,15 +607,17 @@ def get_pending_messages(current_time_str):
     return rows
 
 
-def mark_as_sent(msg_id, delivered_message_id=None):
+def mark_as_sent(msg_id, delivered_message_id=None, delivered_at=None):
+    if delivered_at is None:
+        delivered_at = serialize_datetime(utc_now())
     with get_connection() as conn:
         conn.execute(
             '''
             UPDATE scheduled_messages
-            SET is_sent = 1, delivered_message_id = ?, delivery_status = 'sent', last_error = NULL
+            SET is_sent = 1, delivered_message_id = ?, delivery_status = 'sent', last_error = NULL, delivered_at = ?
             WHERE id = ?
             ''',
-            (delivered_message_id, msg_id),
+            (delivered_message_id, delivered_at, msg_id),
         )
         conn.commit()
 
@@ -681,37 +705,53 @@ def delete_message(user_id, msg_id):
 def replace_sent_reminder_with_pending(
     user_id: int,
     old_db_id: int,
-    message_id: int,
+    message_id: int | None,
     send_at: str,
     text_preview: str = "",
     source_name: str = "",
-) -> None:
+) -> int:
     """Atomically insert a new pending reminder and remove the delivered row."""
     created_at = serialize_datetime(utc_now())
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            # Copy the tag from the delivered row so a reschedule keeps the folder.
-            conn.execute(
+            # Copy tag, full_text, note from the delivered row so a reschedule keeps them.
+            cur = conn.execute(
                 """
                 INSERT INTO scheduled_messages (
-                    user_id, message_id, send_at, created_at, text_preview, source_name, tag, delivery_status
+                    user_id, message_id, send_at, created_at, text_preview, source_name, tag, full_text, note, delivery_status
                 )
-                SELECT ?, ?, ?, ?, ?, ?, tag, 'pending'
+                SELECT ?, ?, ?, ?, ?, ?, tag, COALESCE(full_text, ?), note, 'pending'
                 FROM scheduled_messages WHERE id = ? AND user_id = ?
                 """,
-                (user_id, message_id, send_at, created_at, text_preview, source_name, old_db_id, user_id),
+                (user_id, message_id, send_at, created_at, text_preview, source_name, text_preview, old_db_id, user_id),
             )
-            cur = conn.execute(
+            new_id = cur.lastrowid
+            del_cur = conn.execute(
                 "DELETE FROM scheduled_messages WHERE id = ? AND user_id = ?",
                 (old_db_id, user_id),
             )
-            if cur.rowcount != 1:
+            if del_cur.rowcount != 1:
                 raise ValueError("Scheduled row missing or already changed")
             conn.commit()
+            return new_id
         except Exception:
             conn.rollback()
             raise
+
+
+def update_reminder_note(user_id: int, reminder_id: int, note: str) -> bool:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE scheduled_messages
+            SET note = ?
+            WHERE id = ? AND user_id = ? AND is_sent = 0
+            """,
+            (note, reminder_id, user_id),
+        )
+        conn.commit()
+    return cur.rowcount > 0
 
 
 def get_scheduled_message_by_delivered_message_id(user_id, delivered_message_id):
@@ -1426,7 +1466,7 @@ def export_user_data(user_id) -> dict:
     with get_connection() as conn:
         reminders = conn.execute(
             '''
-            SELECT send_at, text_preview, source_name
+            SELECT send_at, text_preview, source_name, full_text, note
             FROM scheduled_messages
             WHERE user_id = ? AND is_sent = 0 AND delivery_status != 'failed_permanent'
             ORDER BY send_at

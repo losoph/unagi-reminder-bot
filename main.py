@@ -128,6 +128,8 @@ if not BOT_TOKEN:
 bot_session = AiohttpSession(proxy=TELEGRAM_PROXY) if TELEGRAM_PROXY else None
 bot = Bot(token=BOT_TOKEN, session=bot_session)
 dp = Dispatcher()
+import reminders_ux
+dp.include_router(reminders_ux.router)
 TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Moscow"))
 MAX_MESSAGE_RETRIES = 5
 MAX_DIGEST_RETRIES = 5
@@ -1611,9 +1613,9 @@ async def _apply_replied_reschedule(
     scheduled_time: datetime,
     confirmation: str,
 ) -> None:
-    db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
+    db_id, source_message_id, _, _, preview, source, *_ = scheduled_msg
     try:
-        replace_sent_reminder_with_pending(
+        new_db_id = replace_sent_reminder_with_pending(
             message.chat.id,
             db_id,
             source_message_id,
@@ -1631,7 +1633,8 @@ async def _apply_replied_reschedule(
         await message.delete()
     except TelegramAPIError:
         pass
-    await message.answer(confirmation)
+    kb = reminders_ux.build_reschedule_note_keyboard(new_db_id)
+    await message.answer(confirmation, reply_markup=kb)
 
 
 async def _reschedule_replied_reminder(
@@ -1828,7 +1831,7 @@ async def handle_sent_reminder_time_selection(callback: CallbackQuery, state: FS
         return
 
     try:
-        replace_sent_reminder_with_pending(
+        new_db_id = replace_sent_reminder_with_pending(
             callback_message.chat.id,
             db_id,
             source_message_id,
@@ -1848,7 +1851,8 @@ async def handle_sent_reminder_time_selection(callback: CallbackQuery, state: FS
             pass
 
     await callback.answer()
-    await bot.send_message(callback_message.chat.id, f"✅ Отложил {label}.")
+    kb = reminders_ux.build_reschedule_note_keyboard(new_db_id)
+    await bot.send_message(callback_message.chat.id, f"✅ Отложил {label}.", reply_markup=kb)
 
 
 @dp.callback_query(F.data == "sent_save")
@@ -2071,21 +2075,26 @@ async def render_rem_detail_screen(chat_id: int, msg_id: int, target: types.Mess
             await target.answer(text, parse_mode="HTML", reply_markup=markup)
         return
 
-    _id, send_at, preview, source, row_tag, _msg_id = row
+    _id, send_at, preview, source, row_tag, _msg_id = row[:6]
+    row_keys = row.keys() if hasattr(row, "keys") else []
+    full_text_val = row["full_text"] if "full_text" in row_keys and row["full_text"] else preview
+    note_val = row["note"] if "note" in row_keys and row["note"] else None
     dt_obj = display_db_datetime(send_at)
     when = format_reminder_when(dt_obj)
     tag_safe = html.escape(row_tag) if row_tag else "Без тега"
     source_safe = html.escape(source) if source else "Неизвестно"
-    full_text_safe = html.escape(preview) if preview else "Без текста"
+    full_text_safe = html.escape(full_text_val) if full_text_val else "Без текста"
     max_len = 3000
     if len(full_text_safe) > max_len:
         full_text_safe = full_text_safe[:max_len] + "\n\n⚠️ <i>(Текст обрезан)</i>"
+
+    note_section = f"\n\n📌 <b>Примечание:</b> {html.escape(note_val)}" if note_val else ""
 
     text = (
         f"⏰ <b>Когда:</b> {dt_obj.strftime('%d.%m.%Y в %H:%M')} <i>({when})</i>\n"
         f"🏷 <b>Тег:</b> #{tag_safe}\n"
         f"👤 <b>Источник:</b> {source_safe}\n\n"
-        f"📝 <b>Текст:</b>\n{full_text_safe}"
+        f"📝 <b>Текст:</b>\n{full_text_safe}{note_section}"
     )
 
     markup = InlineKeyboardMarkup(
@@ -3421,12 +3430,17 @@ def _import_user_payload(user_id: int, payload) -> str:
         try:
             if parse_db_datetime(send_at) <= utc_now():
                 continue  # пропускаем напоминания из прошлого
+            text_preview = reminder.get("text_preview") or ""
+            full_text = reminder.get("full_text") or text_preview
+            note = reminder.get("note")
             add_message(
                 user_id,
                 None,
                 send_at,
-                reminder.get("text_preview") or "",
-                reminder.get("source_name") or "Импорт",
+                text_preview=text_preview,
+                source_name=reminder.get("source_name") or "Импорт",
+                full_text=full_text,
+                note=note,
             )
             added_rems += 1
         except Exception:
@@ -3879,11 +3893,13 @@ async def handle_bksched_init(callback: CallbackQuery, state: FSMContext):
         return
         
     full_text, source, tag, saved_at = msg_data
+    preview = full_text.replace('\n', ' ')[:37] + '...' if len(full_text.replace('\n', ' ')) > 40 else full_text.replace('\n', ' ')
     await state.update_data(
         is_bookmark_scheduling=True,
         bookmark_msg_id=msg_id,
         bookmark_tag=tag,
-        preview=full_text,
+        preview=preview,
+        full_text=full_text,
         source=source,
         prompt_msg_id=callback.message.message_id,
     )
@@ -3913,13 +3929,15 @@ async def handle_bksched_choice(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Закладка не найдена.")
         return
     full_text, source, tag, saved_at = msg_data
+    preview = full_text.replace('\n', ' ')[:37] + '...' if len(full_text.replace('\n', ' ')) > 40 else full_text.replace('\n', ' ')
     
     if action == "custom":
         await state.update_data(
             is_bookmark_scheduling=True,
             bookmark_msg_id=msg_id,
             bookmark_tag=tag,
-            preview=full_text,
+            preview=preview,
+            full_text=full_text,
             source=source,
             prompt_msg_id=callback_message.message_id,
         )
@@ -3939,9 +3957,10 @@ async def handle_bksched_choice(callback: CallbackQuery, state: FSMContext):
             callback_message.chat.id,
             None,
             serialize_datetime(scheduled_time),
-            full_text,
+            preview,
             source,
             tag,
+            full_text=full_text,
         )
         delete_saved_message(callback_message.chat.id, msg_id)
         confirm_msg = await bot.send_message(
@@ -4019,16 +4038,18 @@ async def complete_manual_schedule(
         await render_screen(chat_id, {"screen": "rem_detail", "args": {"msg_id": rem_reschedule_id}}, reply_target, state)
         return
 
+    full_text = data.get("full_text")
+    new_db_id = None
     if msg_id:
-        add_message(chat_id, msg_id, serialize_datetime(scheduled_time), preview, source)
+        add_message(chat_id, msg_id, serialize_datetime(scheduled_time), preview, source, full_text=full_text)
         confirmation_text = f"✅ Принято! Запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}."
     elif is_bksched:
-        add_message(chat_id, None, serialize_datetime(scheduled_time), preview, source, bookmark_tag)
+        add_message(chat_id, None, serialize_datetime(scheduled_time), preview, source, bookmark_tag, full_text=full_text)
         if bookmark_msg_id:
             delete_saved_message(chat_id, bookmark_msg_id)
         confirmation_text = f"✅ Перенесено в напоминания на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}!"
     elif scheduled_db_id:
-        replace_sent_reminder_with_pending(
+        new_db_id = replace_sent_reminder_with_pending(
             chat_id,
             scheduled_db_id,
             source_message_id,
@@ -4058,7 +4079,10 @@ async def complete_manual_schedule(
         except TelegramAPIError:
             pass
 
-    confirm_msg = await bot.send_message(chat_id, confirmation_text)
+    reply_markup = None
+    if scheduled_db_id and new_db_id:
+        reply_markup = reminders_ux.build_reschedule_note_keyboard(new_db_id)
+    confirm_msg = await bot.send_message(chat_id, confirmation_text, reply_markup=reply_markup)
     await state.clear()
 
     if is_bksched:
@@ -4072,11 +4096,12 @@ async def complete_manual_schedule(
         await render_screen(chat_id, {"screen": "rem_list", "args": {"tag": None, "page": 1}}, reply_target, state)
         return
 
-    await asyncio.sleep(3)
-    try:
-        await confirm_msg.delete()
-    except TelegramAPIError:
-        pass
+    if not scheduled_db_id:
+        await asyncio.sleep(3)
+        try:
+            await confirm_msg.delete()
+        except TelegramAPIError:
+            pass
 
 
 @dp.message(ScheduleState.waiting_for_datetime)
@@ -4639,6 +4664,7 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
 
     orig_msg = callback_message.reply_to_message
     preview, source = get_message_preview(orig_msg)
+    full_text = get_message_full_text(orig_msg)
     action = parse_callback_strip_prefix(callback.data, "time_")
     if action is None:
         await callback_message.edit_text("❌ Некорректные данные.")
@@ -4649,6 +4675,7 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
             message_id=orig_msg.message_id,
             preview=preview,
             source=source,
+            full_text=full_text,
             prompt_msg_id=callback_message.message_id,
         )
         await push_screen(state, "manual_date")
@@ -4670,6 +4697,7 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
                 serialize_datetime(scheduled_time),
                 preview,
                 source,
+                full_text=full_text,
             )
             await asyncio.sleep(3)
             await callback_message.delete()
@@ -4835,13 +4863,23 @@ async def check_messages():
         now_str = serialize_datetime(utc_now())
         pending = get_pending_messages(now_str)
 
-        for db_id, chat_id, message_id, retry_count, text_preview, source_name in pending:
+        for row in pending:
+            db_id = row["id"]
+            chat_id = row["user_id"]
+            message_id = row["message_id"]
+            retry_count = row["retry_count"]
+            text_preview = row["text_preview"]
+            source_name = row["source_name"]
+            full_text = row["full_text"]
+            note = row["note"]
             attempt_number = retry_count + 1
             try:
                 if message_id is None or message_id == 0:
-                    text_to_send = text_preview or ""
+                    content_text = full_text or text_preview or ""
                     if source_name:
-                        text_to_send = f"👤 <b>Источник:</b> {html.escape(source_name)}\n\n{text_to_send}"
+                        text_to_send = f"👤 <b>Источник:</b> {html.escape(source_name)}\n\n{content_text}"
+                    else:
+                        text_to_send = content_text
                     sent_message = await bot.send_message(
                         chat_id=int(chat_id),
                         text=text_to_send,
@@ -4856,6 +4894,15 @@ async def check_messages():
                         reply_markup=build_sent_reminder_actions_keyboard(),
                     )
                 mark_as_sent(db_id, sent_message.message_id)
+                if note:
+                    try:
+                        await bot.send_message(
+                            chat_id=int(chat_id),
+                            text=f"📝 {note}",
+                            reply_to_message_id=sent_message.message_id,
+                        )
+                    except TelegramAPIError:
+                        logger.warning("Не удалось отправить примечание к сообщению %s", db_id)
             except TelegramAPIError as exc:
                 is_permanent, error_text = classify_telegram_send_error(exc)
                 retries_exhausted = attempt_number >= MAX_MESSAGE_RETRIES
