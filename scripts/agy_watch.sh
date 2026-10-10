@@ -16,6 +16,8 @@
 #   ./scripts/agy_watch.sh id                # conversation_id
 #   ./scripts/agy_watch.sh usage             # токены по прогонам
 #   ./scripts/agy_watch.sh follow            # live: по строке на каждый завершённый шаг
+#   ./scripts/agy_watch.sh digest [SEC]      # сводка раз в SEC (600): рассуждения, правки,
+#                                            # коммиты; риск и ошибки — сразу
 #
 # Модель: AGY_MODEL (по умолчанию gemini-3.8-flash-high — дешёвая рабочая
 # лошадка с нормальным рассуждением; Pro/Opus тратят лимиты в разы быстрее
@@ -115,6 +117,51 @@ for line in sys.stdin:
         if text:
             flush_quiet()
             print(f"SAY {text[:700]}")
+'
+    ;;
+  digest)
+    # Экономный режим наблюдателя: поверх follow копит события и раз в SEC
+    # секунд печатает одну сводку (если что-то было). Рискованное и сбои —
+    # отдельной строкой сразу, не дожидаясь окна.
+    SEC="${2:-600}" "$0" follow | SEC="${2:-600}" python3 -u -c '
+import os, re, select, sys, time
+period = int(os.environ["SEC"])
+risk = re.compile(r"git push|git reset --hard|rm -rf|\.env|msmtprc|SESSION|Traceback|FAILED|RESULT status=(?!SUCCESS)")
+says, tools, files, commits, reads = [], 0, set(), [], 0
+last = time.time()
+def emit():
+    global says, tools, files, commits, reads, last
+    if says or tools or commits:
+        parts = ["DIGEST " + time.strftime("%H:%M") + ": действий %d, чтений %d" % (tools, reads)]
+        if files: parts.append("правки: " + ", ".join(sorted(files))[:300])
+        if commits: parts.append("коммиты: " + "; ".join(commits)[:300])
+        if says: parts.append("мысли: " + " | ".join(says[-3:])[:600])
+        print(" · ".join(parts))
+    says, tools, files, commits, reads = [], 0, set(), [], 0
+    last = time.time()
+while True:
+    r, _, _ = select.select([sys.stdin], [], [], 30)
+    if r:
+        line = sys.stdin.readline()
+        if not line:
+            emit(); break
+        line = line.rstrip()
+        if risk.search(line):
+            print("ALERT " + line[:400])
+        if line.startswith("SAY "):
+            says.append(line[4:200])
+        elif line.startswith("READ x"):
+            reads += int(line[6:] or 1)
+        elif line.startswith("TOOL "):
+            tools += 1
+            for f in re.findall(r"\"(?:TargetFile|AbsolutePath|File)\": ?\"([^\"]+)", line):
+                files.add(f.rsplit("/", 1)[-1])
+            if "git commit" in line:
+                commits.append(line[5:160])
+        elif line.startswith("RESULT"):
+            print(line); emit()
+    if time.time() - last >= period:
+        emit()
 '
     ;;
   status)
