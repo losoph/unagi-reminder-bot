@@ -444,6 +444,29 @@ def init_db():
             )
             '''
         )
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS user_prefs (
+                user_id INTEGER PRIMARY KEY,
+                timezone TEXT,
+                morning_hour INTEGER DEFAULT 9,
+                day_hour INTEGER DEFAULT 14,
+                evening_hour INTEGER DEFAULT 20,
+                updated_at DATETIME
+            )
+            '''
+        )
+        for statement in (
+            "ALTER TABLE user_prefs ADD COLUMN timezone TEXT",
+            "ALTER TABLE user_prefs ADD COLUMN morning_hour INTEGER DEFAULT 9",
+            "ALTER TABLE user_prefs ADD COLUMN day_hour INTEGER DEFAULT 14",
+            "ALTER TABLE user_prefs ADD COLUMN evening_hour INTEGER DEFAULT 20",
+            "ALTER TABLE user_prefs ADD COLUMN updated_at DATETIME",
+        ):
+            try:
+                cursor.execute(statement)
+            except sqlite3.OperationalError:
+                pass
         # Early 2026-09-22 builds had a global is_enabled flag; delivery is now per period.
         try:
             cursor.execute("ALTER TABLE user_emails ADD COLUMN email_periods TEXT DEFAULT ''")
@@ -1508,6 +1531,7 @@ def export_user_data(user_id) -> dict:
         "bookmarks": [dict(row) for row in bookmarks],
         "subscriptions": [dict(row) for row in subscriptions],
         "digest_settings": [dict(row) for row in digest_settings],
+        "prefs": get_user_prefs(user_id),
     }
 
 
@@ -1955,6 +1979,74 @@ def is_user_alerting_active(user_id: int, now: datetime | None = None) -> bool:
         if paused_until > now:
             return False
     return True
+
+
+def get_user_prefs(user_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT user_id, timezone, morning_hour, day_hour, evening_hour, updated_at
+            FROM user_prefs
+            WHERE user_id = ?
+            ''',
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "user_id": row["user_id"],
+            "timezone": row["timezone"],
+            "morning_hour": row["morning_hour"] if row["morning_hour"] is not None else 9,
+            "day_hour": row["day_hour"] if row["day_hour"] is not None else 14,
+            "evening_hour": row["evening_hour"] if row["evening_hour"] is not None else 20,
+            "updated_at": row["updated_at"],
+        }
+
+
+def upsert_user_prefs(
+    user_id: int,
+    timezone: str | None = None,
+    morning_hour: int | None = None,
+    day_hour: int | None = None,
+    evening_hour: int | None = None,
+) -> dict:
+    now_str = serialize_datetime(utc_now())
+    with get_connection() as conn:
+        current = get_user_prefs(user_id)
+        if current is None:
+            tz_val = timezone
+            m_val = morning_hour if morning_hour is not None else 9
+            d_val = day_hour if day_hour is not None else 14
+            e_val = evening_hour if evening_hour is not None else 20
+            conn.execute(
+                '''
+                INSERT INTO user_prefs (user_id, timezone, morning_hour, day_hour, evening_hour, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''',
+                (user_id, tz_val, m_val, d_val, e_val, now_str),
+            )
+        else:
+            tz_val = timezone if timezone is not None else current["timezone"]
+            m_val = morning_hour if morning_hour is not None else current["morning_hour"]
+            d_val = day_hour if day_hour is not None else current["day_hour"]
+            e_val = evening_hour if evening_hour is not None else current["evening_hour"]
+            conn.execute(
+                '''
+                UPDATE user_prefs
+                SET timezone = ?, morning_hour = ?, day_hour = ?, evening_hour = ?, updated_at = ?
+                WHERE user_id = ?
+                ''',
+                (tz_val, m_val, d_val, e_val, now_str, user_id),
+            )
+        conn.commit()
+    return {
+        "user_id": user_id,
+        "timezone": tz_val,
+        "morning_hour": m_val,
+        "day_hour": d_val,
+        "evening_hour": e_val,
+        "updated_at": now_str,
+    }
 
 
 def get_digest_alert(user_id: int, period: str, scheduled_at: str, alert_type: str = "failure") -> dict | None:

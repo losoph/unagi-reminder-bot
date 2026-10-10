@@ -176,7 +176,7 @@ def group_reminders_by_day(items: list[Any], now: datetime, dt_getter=None) -> l
         def dt_getter(item):
             val = item["send_at"] if isinstance(item, dict) or hasattr(item, "__getitem__") else item.send_at
             if isinstance(val, str):
-                return display_db_datetime(val)
+                return display_db_datetime(val, tz=now.tzinfo)
             return val
 
     groups: dict[str, list[Any]] = {}
@@ -202,7 +202,7 @@ def render_reminder_list_text(
         text_lines.append(f"<b>{day_header}</b>")
         for item in items:
             send_at = item["send_at"]
-            dt_obj = display_db_datetime(send_at)
+            dt_obj = display_db_datetime(send_at, tz=now.tzinfo)
             when = format_reminder_relative(dt_obj, now)
 
             source = item["source_name"] if "source_name" in item.keys() else item[3]
@@ -249,7 +249,7 @@ def build_reminder_list_keyboard(
     for item in page_items:
         msg_id = item["id"] if "id" in item.keys() else item[0]
         send_at = item["send_at"] if "send_at" in item.keys() else item[1]
-        dt_obj = display_db_datetime(send_at)
+        dt_obj = display_db_datetime(send_at, tz=now.tzinfo)
 
         source = item["source_name"] if "source_name" in item.keys() else item[3]
         preview = item["text_preview"] if "text_preview" in item.keys() else item[2]
@@ -288,7 +288,7 @@ def build_reminder_list_keyboard(
 def render_reminder_detail_text(row: Any, now: datetime) -> str:
     """Builds the HTML text for the reminder detail card."""
     send_at = row["send_at"] if "send_at" in row.keys() else row[1]
-    dt_obj = display_db_datetime(send_at)
+    dt_obj = display_db_datetime(send_at, tz=now.tzinfo)
     when = format_reminder_relative(dt_obj, now)
     weekday_name = RU_WEEKDAYS_FULL.get(dt_obj.weekday(), "")
 

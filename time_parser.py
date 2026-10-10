@@ -55,8 +55,14 @@ def _cut(text: str, match: re.Match) -> str:
     return text[: match.start()] + " " + text[match.end() :]
 
 
-def parse_reminder_time(text: str, now: datetime) -> datetime | None:
+def parse_reminder_time(text: str, now: datetime, hours: dict[str, int] | None = None) -> datetime | None:
     """Resolve a phrase to an aware datetime in now's timezone, or None if unsure."""
+    morning_h = hours.get("morning", DEFAULT_HOUR) if hours else DEFAULT_HOUR
+    day_h = hours.get("day", DAY_PARTS["днем"]) if hours else DAY_PARTS["днем"]
+    evening_h = hours.get("evening", DAY_PARTS["вечером"]) if hours else DAY_PARTS["вечером"]
+    default_hour = morning_h
+    day_parts = {"утром": morning_h, "днем": day_h, "вечером": evening_h}
+
     s = _normalize(text or "")
     if not s or len(s) > 60:
         return None
@@ -125,7 +131,7 @@ def parse_reminder_time(text: str, now: datetime) -> datetime | None:
             return None
         s = _cut(s, match)
 
-    for word, hour in DAY_PARTS.items():
+    for word, hour in day_parts.items():
         if re.search(rf"\b{word}\b", s):
             if not set_clock(hour, 0):
                 return None
@@ -196,7 +202,7 @@ def parse_reminder_time(text: str, now: datetime) -> datetime | None:
         result = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         return result if result > now else result + timedelta(days=1)
 
-    hour, minute = clock if clock else (DEFAULT_HOUR, 0)
+    hour, minute = clock if clock else (default_hour, 0)
     return now.replace(
         year=date.year, month=date.month, day=date.day, hour=hour, minute=minute, second=0, microsecond=0
     )

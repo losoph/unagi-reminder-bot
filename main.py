@@ -8,7 +8,7 @@ import os
 import re
 import secrets
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router, types
@@ -128,8 +128,11 @@ bot_session = AiohttpSession(proxy=TELEGRAM_PROXY) if TELEGRAM_PROXY else None
 bot = Bot(token=BOT_TOKEN, session=bot_session)
 dp = Dispatcher()
 import reminders_ux
+import user_prefs
 dp.include_router(reminders_ux.router)
+dp.include_router(user_prefs.router)
 from time_utils import TZ, display_db_datetime, local_now  # noqa: E402
+from user_prefs import day_part_hours, user_now, user_tz  # noqa: E402
 fallback_router = Router(name="fallback")
 MAX_MESSAGE_RETRIES = 5
 MAX_DIGEST_RETRIES = 5
@@ -830,10 +833,13 @@ def format_when(moment: datetime, now: datetime) -> str:
     return f"{day or moment.strftime('%d.%m')} в {moment.strftime('%H:%M')}"
 
 
-def get_quick_scheduled_time(action: str, now: datetime) -> tuple[datetime | None, str]:
-    if action in _DAY_PART_HOURS:
+def get_quick_scheduled_time(
+    action: str, now: datetime, hours: dict[str, int] | None = None
+) -> tuple[datetime | None, str]:
+    day_hours = hours or _DAY_PART_HOURS
+    if action in day_hours:
         # The nearest such moment: «Утро» at 02:00 means this morning, not tomorrow's.
-        scheduled_time = now.replace(hour=_DAY_PART_HOURS[action], minute=0, second=0, microsecond=0)
+        scheduled_time = now.replace(hour=day_hours[action], minute=0, second=0, microsecond=0)
         if scheduled_time <= now:
             scheduled_time += timedelta(days=1)
         return scheduled_time, f"на {format_when(scheduled_time, now)}"
@@ -847,23 +853,28 @@ def get_quick_scheduled_time(action: str, now: datetime) -> tuple[datetime | Non
     return None, ""
 
 
-def describe_quick_times(now: datetime) -> str:
+def describe_quick_times(now: datetime, hours: dict[str, int] | None = None) -> str:
     """One line that tells what the day-part buttons resolve to right now."""
     emojis = {"morning": "🌅", "day": "☀️", "evening": "🌙"}
+    day_hours = hours or _DAY_PART_HOURS
     return " · ".join(
-        f"{emojis[action]} {format_when(get_quick_scheduled_time(action, now)[0], now)}"
-        for action in _DAY_PART_HOURS
+        f"{emojis[action]} {format_when(get_quick_scheduled_time(action, now, day_hours)[0], now)}"
+        for action in day_hours
     )
 
 
-def get_suggested_manual_time(now: datetime) -> datetime:
-    if now.hour < 8:
-        return now.replace(hour=9, minute=0, second=0, microsecond=0)
-    if now.hour < 13:
-        return now.replace(hour=14, minute=0, second=0, microsecond=0)
-    if now.hour < 20:
-        return now.replace(hour=20, minute=0, second=0, microsecond=0)
-    return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+def get_suggested_manual_time(now: datetime, hours: dict[str, int] | None = None) -> datetime:
+    day_hours = hours or _DAY_PART_HOURS
+    m_h = day_hours.get("morning", 9)
+    d_h = day_hours.get("day", 14)
+    e_h = day_hours.get("evening", 20)
+    if now.hour < m_h - 1:
+        return now.replace(hour=m_h, minute=0, second=0, microsecond=0)
+    if now.hour < d_h - 1:
+        return now.replace(hour=d_h, minute=0, second=0, microsecond=0)
+    if now.hour < e_h:
+        return now.replace(hour=e_h, minute=0, second=0, microsecond=0)
+    return (now + timedelta(days=1)).replace(hour=m_h, minute=0, second=0, microsecond=0)
 
 
 def get_manual_date(action: str, now: datetime) -> datetime | None:
@@ -882,7 +893,7 @@ def get_manual_date(action: str, now: datetime) -> datetime | None:
     return None
 
 
-def build_scheduled_time_from_state(data: dict, *, hour: int, minute: int) -> datetime | None:
+def build_scheduled_time_from_state(data: dict, *, hour: int, minute: int, tz: tzinfo | None = None) -> datetime | None:
     selected_date = data.get("selected_date")
     if not selected_date:
         return None
@@ -892,7 +903,7 @@ def build_scheduled_time_from_state(data: dict, *, hour: int, minute: int) -> da
             minute=minute,
             second=0,
             microsecond=0,
-            tzinfo=TZ,
+            tzinfo=tz or TZ,
         )
     except (TypeError, ValueError):
         return None
@@ -1500,11 +1511,11 @@ async def cmd_start(message: types.Message, state: FSMContext, command: CommandO
     await state.clear()
     if command.args and await handle_digest_deep_link(message, command.args.strip()):
         return
-    markup = None
+    keyboard = []
     if email_digest.is_enabled():
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="📧 Дайджест на почту", callback_data="email_menu")]]
-        )
+        keyboard.append([InlineKeyboardButton(text="📧 Дайджест на почту", callback_data="email_menu")])
+    keyboard.append([InlineKeyboardButton(text="⚙️ Время и пояс", callback_data="prefs_menu")])
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
     await message.answer(WELCOME_TEXT, reply_markup=markup)
 
 
@@ -1517,16 +1528,17 @@ async def cmd_help(message: types.Message, state: FSMContext):
         "/start — Перезапустить бота\n"
         "/help — Показать эту справку\n"
         "/home — Сбросить текущее действие и вернуться в главное меню\n"
-        "/back — Вернуться на один шаг назад во всех меню\n\n"
+        "/back — Вернуться на один шаг назад во всех меню\n"
+        "/prefs — ⚙️ Настройки времени и часового пояса\n\n"
         "📅 <b>Напоминания (Задачи):</b>\n"
         "/list — Список напоминаний с фильтром по тегам\n"
         "💡 <i>Перешлите любое сообщение или напишите текст, чтобы запланировать его.</i>\n"
         "💡 <i>В меню напоминания можно перенести время, сменить тег, перенести в закладки или удалить.</i>\n\n"
         "✍️ <b>Быстрые команды (ответом на доставленное напоминание):</b>\n"
         "Ответьте на сообщение напоминания одной из команд:\n"
-        "• <code>/morning</code> — на ближайшее утро (09:00)\n"
-        "• <code>/day</code> — на ближайший день (14:00)\n"
-        "• <code>/evening</code> — на ближайший вечер (20:00)\n"
+        "• <code>/morning</code> — на ближайшее утро (по вашим часам)\n"
+        "• <code>/day</code> — на ближайший день (по вашим часам)\n"
+        "• <code>/evening</code> — на ближайший вечер (по вашим часам)\n"
         "• <code>/later</code> (или <code>/l</code>) — отложить на 3 часа\n"
         "• <code>/at 24.09 18:30</code> — отложить на точное время\n"
         "• или просто ответьте текстом: <i>завтра 11</i>, <i>24/09 в 9</i>, <i>через 2 дня</i>, <i>в пятницу в 10</i>\n"
@@ -1554,6 +1566,7 @@ async def set_bot_commands(bot: Bot):
     commands = [
         types.BotCommand(command="start", description="Начать работу"),
         types.BotCommand(command="help", description="ℹ️ Справка по всем командам"),
+        types.BotCommand(command="prefs", description="⚙️ Время и пояс"),
         types.BotCommand(command="list", description="📅 Мои напоминания"),
         types.BotCommand(command="list_digest", description="📡 Мои подписки"),
         types.BotCommand(command="saved", description="📁 База знаний (закладки)"),
@@ -1641,7 +1654,10 @@ async def _reschedule_replied_reminder(
         await message.answer("Ответь этой командой на доставленное напоминание от бота.")
         return
 
-    scheduled_time, label = get_quick_scheduled_time(quick_action, local_now())
+    user_id = message.chat.id
+    now = user_now(user_id)
+    hours = day_part_hours(user_id)
+    scheduled_time, label = get_quick_scheduled_time(quick_action, now, hours=hours)
     if scheduled_time is None:
         await message.answer("❌ Ошибка при планировании времени.")
         return
@@ -1650,8 +1666,9 @@ async def _reschedule_replied_reminder(
 
 async def reschedule_replied_by_text(message: types.Message, scheduled_msg, text: str) -> None:
     """«завтра 11» / «24/09 в 9» / «через 2 дня» as a reply to a delivered reminder (or /at)."""
-    now = local_now()
-    scheduled_time = parse_reminder_time(text, now)
+    now = user_now(message.chat.id)
+    hours = day_part_hours(message.chat.id)
+    scheduled_time = parse_reminder_time(text, now, hours=hours)
     if scheduled_time is None:
         await message.answer(
             f"🤔 Не понял время. Примеры: {TIME_TEXT_EXAMPLES}, «в пятницу в 10», «18:30».\n"
@@ -1755,7 +1772,8 @@ async def show_sent_reminder_time_actions(callback: CallbackQuery):
         )
     except TelegramBadRequest:
         pass
-    await callback.answer(f"{describe_quick_times(local_now())}\nИли ответь текстом: {TIME_TEXT_EXAMPLES}")
+    user_id = callback_message.chat.id
+    await callback.answer(f"{describe_quick_times(user_now(user_id), day_part_hours(user_id))}\nИли ответь текстом: {TIME_TEXT_EXAMPLES}")
 
 
 @dp.callback_query(F.data.startswith("senttime_"))
@@ -1793,7 +1811,9 @@ async def handle_sent_reminder_time_selection(callback: CallbackQuery, state: FS
         return
 
     db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
-    now = local_now()
+    user_id = callback_message.chat.id
+    now = user_now(user_id)
+    hours = day_part_hours(user_id)
 
     if action == "custom":
         # Keep the reminder itself intact (it may be media) and ask in a separate message.
@@ -1819,7 +1839,7 @@ async def handle_sent_reminder_time_selection(callback: CallbackQuery, state: FS
         await callback.answer()
         return
 
-    scheduled_time, label = get_quick_scheduled_time(action, now)
+    scheduled_time, label = get_quick_scheduled_time(action, now, hours=hours)
     if scheduled_time is None:
         await callback.answer("❌ Ошибка при планировании времени.")
         return
@@ -2007,7 +2027,7 @@ async def render_rem_list_screen(chat_id: int, tag: str | None, page: int, targe
     )
 
     header = f"🏷 #{tag}" if tag else "⏳ Все напоминания"
-    now = local_now()
+    now = user_now(chat_id)
     text = reminders_ux.render_reminder_list_text(header, page, total_pages, page_items, now)
     markup = reminders_ux.build_reminder_list_keyboard(page_items, page, total_pages, tag, now)
 
@@ -2035,7 +2055,7 @@ async def render_rem_detail_screen(chat_id: int, msg_id: int, target: types.Mess
             await target.answer(text, parse_mode="HTML", reply_markup=markup)
         return
 
-    now = local_now()
+    now = user_now(chat_id)
     text = reminders_ux.render_reminder_detail_text(row, now)
     message_id = row["message_id"] if "message_id" in row.keys() else row[5]
     has_message_id = bool(message_id and message_id > 0)
@@ -2283,8 +2303,11 @@ async def handle_rem_resched_init(callback: CallbackQuery, state: FSMContext):
         source=row[3] or "",
         prompt_msg_id=callback.message.message_id,
     )
+    user_id = callback.message.chat.id
+    now = user_now(user_id)
+    hours = day_part_hours(user_id)
     await callback.message.edit_text(
-        f"⏰ <b>Перенос времени</b>\n\nВыбери новое время напоминания:\n{describe_quick_times(local_now())}",
+        f"⏰ <b>Перенос времени</b>\n\nВыбери новое время напоминания:\n{describe_quick_times(now, hours)}",
         parse_mode="HTML",
         reply_markup=build_time_selection_keyboard(f"remresched_{msg_id}"),
     )
@@ -2311,7 +2334,10 @@ async def handle_rem_resched_choice(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    scheduled_time, label = get_quick_scheduled_time(action, local_now())
+    user_id = callback.message.chat.id
+    now = user_now(user_id)
+    hours = day_part_hours(user_id)
+    scheduled_time, label = get_quick_scheduled_time(action, now, hours=hours)
     if scheduled_time is None:
         await callback.answer("❌ Ошибка при планировании времени.")
         return
@@ -3844,8 +3870,11 @@ async def handle_bksched_init(callback: CallbackQuery, state: FSMContext):
     )
 
     markup = build_time_selection_keyboard(f"bksched_choice_{msg_id}")
+    u_id = callback.message.chat.id
+    now = user_now(u_id)
+    hours = day_part_hours(u_id)
     await callback.message.edit_text(
-        f"⏰ <b>Перенос закладки в напоминание</b>\n\nВыбери время отправки напоминания:\n{describe_quick_times(local_now())}",
+        f"⏰ <b>Перенос закладки в напоминание</b>\n\nВыбери время отправки напоминания:\n{describe_quick_times(now, hours)}",
         parse_mode="HTML",
         reply_markup=markup
     )
@@ -3888,8 +3917,10 @@ async def handle_bksched_choice(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    now = local_now()
-    scheduled_time, label = get_quick_scheduled_time(action, now)
+    u_id = callback_message.chat.id
+    now = user_now(u_id)
+    hours = day_part_hours(u_id)
+    scheduled_time, label = get_quick_scheduled_time(action, now, hours=hours)
     if scheduled_time:
         # Move: create the reminder (keeping the tag) and drop the bookmark.
         add_message(
@@ -3927,7 +3958,7 @@ async def complete_manual_schedule(
     reply_target: Message,
     cleanup_message_id: int | None = None,
 ) -> None:
-    if scheduled_time < local_now():
+    if scheduled_time < user_now(chat_id):
         await reply_target.answer("Эта дата уже в прошлом! Попробуй еще раз.")
         return
 
@@ -4063,7 +4094,8 @@ async def complete_manual_schedule(
 
 @dp.message(ScheduleState.waiting_for_datetime)
 async def process_custom_datetime(message: types.Message, state: FSMContext):
-    scheduled_time = parse_reminder_time(message.text or "", local_now())
+    user_id = message.chat.id
+    scheduled_time = parse_reminder_time(message.text or "", user_now(user_id), hours=day_part_hours(user_id))
     if scheduled_time is None:
         await message.answer(f"🤔 Не понял время. Примеры: {TIME_TEXT_EXAMPLES}, «15.03.2026 14:30».")
         return
@@ -4093,7 +4125,7 @@ async def process_custom_time(message: types.Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    scheduled_time = build_scheduled_time_from_state(data, hour=hour, minute=minute)
+    scheduled_time = build_scheduled_time_from_state(data, hour=hour, minute=minute, tz=user_tz(message.chat.id))
     if scheduled_time is None:
         await message.answer("Ошибка: дата выбора утеряна. Попробуй выбрать время заново.")
         await state.clear()
@@ -4128,7 +4160,7 @@ async def process_custom_minutes(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    scheduled_time = build_scheduled_time_from_state(data, hour=int(hour), minute=minute)
+    scheduled_time = build_scheduled_time_from_state(data, hour=int(hour), minute=minute, tz=user_tz(message.chat.id))
     if scheduled_time is None:
         await message.answer("Ошибка: дата выбора утеряна. Попробуй выбрать время заново.")
         await state.clear()
@@ -4497,8 +4529,11 @@ async def catch_message(message: types.Message, state: FSMContext):
         await state.update_data(channel_username=channel_username, channel_title=channel_title)
         prompt = f"📡 Канал <b>{html.escape(channel_title or channel_username)}</b> (@{html.escape(channel_username)})\nЧто сделать?"
 
+    user_id = message.chat.id
+    now = user_now(user_id)
+    hours = day_part_hours(user_id)
     await message.reply(
-        f"{prompt}{channel_note}\n\n⏰ {describe_quick_times(local_now())}",
+        f"{prompt}{channel_note}\n\n⏰ {describe_quick_times(now, hours)}",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
     )
@@ -4614,7 +4649,9 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Сообщение недоступно.")
         return
 
-    now = local_now()
+    user_id = callback_message.chat.id
+    now = user_now(user_id)
+    hours = day_part_hours(user_id)
     if callback_message.reply_to_message is None:
         await callback_message.edit_text("❌ Ошибка: не могу найти оригинальное сообщение.")
         return
@@ -4652,7 +4689,7 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    scheduled_time, label = get_quick_scheduled_time(action, now)
+    scheduled_time, label = get_quick_scheduled_time(action, now, hours=hours)
 
     if scheduled_time:
         new_id = add_message(
@@ -4692,8 +4729,12 @@ async def handle_manual_date_selection(callback: CallbackQuery, state: FSMContex
         await state.clear()
         return
 
+    user_id = callback_message.chat.id
+    user_time = user_now(user_id)
+    hours = day_part_hours(user_id)
+
     if action == "manual":
-        suggested_time = get_suggested_manual_time(local_now())
+        suggested_time = get_suggested_manual_time(user_time, hours=hours)
         suggested_str = suggested_time.strftime("%d.%m.%Y %H:%M")
         await state.set_state(ScheduleState.waiting_for_datetime)
         await callback_message.edit_text(
@@ -4706,7 +4747,7 @@ async def handle_manual_date_selection(callback: CallbackQuery, state: FSMContex
         await callback.answer()
         return
 
-    selected = get_manual_date(action, local_now())
+    selected = get_manual_date(action, user_time)
     if selected is None:
         await callback.answer("❌ Некорректная дата.")
         return
@@ -4806,7 +4847,9 @@ async def handle_manual_minute_selection(callback: CallbackQuery, state: FSMCont
         await callback.answer("❌ Некорректные минуты.")
         return
 
-    scheduled_time = build_scheduled_time_from_state(data, hour=int(hour), minute=minute)
+    scheduled_time = build_scheduled_time_from_state(
+        data, hour=int(hour), minute=minute, tz=user_tz(callback_message.chat.id)
+    )
     if scheduled_time is None:
         await callback.answer("❌ Дата выбора утеряна.", show_alert=True)
         await state.clear()
