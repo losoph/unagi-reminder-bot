@@ -13,10 +13,22 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from data.database import get_reminder_by_id, update_reminder_note
+from time_utils import display_db_datetime
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="reminders_ux")
+
+_bot: Any = None
+_render_detail: Any = None
+
+
+def configure(*, bot: Any = None, render_detail: Any = None) -> None:
+    global _bot, _render_detail
+    if bot is not None:
+        _bot = bot
+    if render_detail is not None:
+        _render_detail = render_detail
 
 # Pattern for logs copied from Telegram Desktop: [09.10.2026 17:57] Name: text...
 LOG_PREFIX_PATTERN = re.compile(
@@ -164,7 +176,6 @@ def group_reminders_by_day(items: list[Any], now: datetime, dt_getter=None) -> l
         def dt_getter(item):
             val = item["send_at"] if isinstance(item, dict) or hasattr(item, "__getitem__") else item.send_at
             if isinstance(val, str):
-                from main import display_db_datetime
                 return display_db_datetime(val)
             return val
 
@@ -190,7 +201,6 @@ def render_reminder_list_text(
     for day_header, items in groups:
         text_lines.append(f"<b>{day_header}</b>")
         for item in items:
-            from main import display_db_datetime
             send_at = item["send_at"]
             dt_obj = display_db_datetime(send_at)
             when = format_reminder_relative(dt_obj, now)
@@ -235,7 +245,6 @@ def build_reminder_list_keyboard(
 ) -> InlineKeyboardMarkup:
     """Builds inline keyboard with 1 button per reminder with ЧЧ:ММ · <источник/текст>."""
     keyboard: list[list[InlineKeyboardButton]] = []
-    from main import display_db_datetime
 
     for item in page_items:
         msg_id = item["id"] if "id" in item.keys() else item[0]
@@ -278,8 +287,6 @@ def build_reminder_list_keyboard(
 
 def render_reminder_detail_text(row: Any, now: datetime) -> str:
     """Builds the HTML text for the reminder detail card."""
-    from main import display_db_datetime
-
     send_at = row["send_at"] if "send_at" in row.keys() else row[1]
     dt_obj = display_db_datetime(send_at)
     when = format_reminder_relative(dt_obj, now)
@@ -337,7 +344,7 @@ def build_reminder_detail_keyboard(msg_id: int, has_message_id: bool) -> InlineK
         buttons.append([InlineKeyboardButton(text="💬 К сообщению", callback_data=f"rem_goto_{msg_id}")])
     buttons.append([
         InlineKeyboardButton(text="⏰ Перенести", callback_data=f"rem_resched_init_{msg_id}"),
-        InlineKeyboardButton(text="📌 Примечание", callback_data=f"rem_note:{msg_id}"),
+        InlineKeyboardButton(text="📌 Примечание", callback_data=f"rem_note:{msg_id}:detail"),
     ])
     buttons.append([
         InlineKeyboardButton(text="🏷 Тег", callback_data=f"rem_tag_init_{msg_id}"),
@@ -386,7 +393,10 @@ async def handle_rem_goto(callback: types.CallbackQuery):
         await callback.answer("Оригинал отсутствует.", show_alert=True)
         return
 
-    from main import bot
+    bot = callback.bot or _bot
+    if not bot:
+        await callback.answer("Бот временно недоступен.", show_alert=True)
+        return
     try:
         await bot.send_message(
             chat_id=callback.message.chat.id,
@@ -414,8 +424,9 @@ async def cb_rem_note(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Некорректный ID.")
         return
 
+    is_detail = len(parts) > 2 and parts[2] == "detail"
     await state.set_state(ReminderNoteState.waiting_for_note)
-    await state.update_data(note_rem_id=rem_id)
+    await state.update_data(note_rem_id=rem_id, note_from_detail=is_detail)
     await callback.answer()
     if callback.message:
         try:
@@ -453,6 +464,7 @@ async def process_reminder_note(message: types.Message, state: FSMContext):
 
     data = await state.get_data()
     rem_id = data.get("note_rem_id")
+    from_detail = data.get("note_from_detail", False)
     if not rem_id:
         await message.answer("❌ Ошибка: не найден ID напоминания.")
         await state.clear()
@@ -462,7 +474,7 @@ async def process_reminder_note(message: types.Message, state: FSMContext):
     await state.clear()
     if updated:
         await message.answer("✅ Примечание сохранено!")
-        from main import render_rem_detail_screen
-        await render_rem_detail_screen(message.chat.id, int(rem_id), message, state)
+        if from_detail and _render_detail:
+            await _render_detail(message.chat.id, int(rem_id), message, state)
     else:
         await message.answer("❌ Не удалось сохранить примечание (напоминание не найдено или уже отправлено).")

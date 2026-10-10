@@ -9,10 +9,9 @@ import re
 import secrets
 import time
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import (
     TelegramAPIError,
@@ -130,7 +129,8 @@ bot = Bot(token=BOT_TOKEN, session=bot_session)
 dp = Dispatcher()
 import reminders_ux
 dp.include_router(reminders_ux.router)
-TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Moscow"))
+from time_utils import TZ, display_db_datetime, local_now  # noqa: E402
+fallback_router = Router(name="fallback")
 MAX_MESSAGE_RETRIES = 5
 MAX_DIGEST_RETRIES = 5
 DIGEST_FETCH_CONCURRENCY = 5
@@ -235,12 +235,6 @@ def chunk_html_text(lines, max_length=4000):
     return chunks
 
 
-def local_now() -> datetime:
-    return datetime.now(TZ)
-
-
-def display_db_datetime(value: str) -> datetime:
-    return parse_db_datetime(value).astimezone(TZ)
 
 
 def get_default_digest_settings(period: str, now: datetime | None = None) -> dict[str, int | str]:
@@ -2052,6 +2046,9 @@ async def render_rem_detail_screen(chat_id: int, msg_id: int, target: types.Mess
         await target.answer()
     else:
         await target.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+reminders_ux.configure(bot=bot, render_detail=render_rem_detail_screen)
 
 
 async def render_rem_move_screen(chat_id: int, msg_id: int, target: types.Message | types.CallbackQuery, state: FSMContext):
@@ -3984,7 +3981,7 @@ async def complete_manual_schedule(
     source_url = data.get("source_url")
     new_db_id = None
     if msg_id:
-        add_message(
+        new_db_id = add_message(
             chat_id,
             msg_id,
             serialize_datetime(scheduled_time),
@@ -4040,7 +4037,7 @@ async def complete_manual_schedule(
             pass
 
     reply_markup = None
-    if scheduled_db_id and new_db_id:
+    if (scheduled_db_id or msg_id) and new_db_id:
         reply_markup = reminders_ux.build_reschedule_note_keyboard(new_db_id)
     confirm_msg = await bot.send_message(chat_id, confirmation_text, reply_markup=reply_markup)
     await state.clear()
@@ -4056,7 +4053,7 @@ async def complete_manual_schedule(
         await render_screen(chat_id, {"screen": "rem_list", "args": {"tag": None, "page": 1}}, reply_target, state)
         return
 
-    if not scheduled_db_id:
+    if not (scheduled_db_id or (msg_id and reply_markup)):
         await asyncio.sleep(3)
         try:
             await confirm_msg.delete()
@@ -4460,7 +4457,7 @@ def message_link_urls(message: types.Message) -> list[str]:
     return [entity.url for entity in entities if entity.type == "text_link" and entity.url]
 
 
-@dp.message()
+@fallback_router.message()
 async def catch_message(message: types.Message, state: FSMContext):
     await state.clear()
 
@@ -4658,19 +4655,21 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
     scheduled_time, label = get_quick_scheduled_time(action, now)
 
     if scheduled_time:
+        new_id = add_message(
+            callback_message.chat.id,
+            orig_msg.message_id,
+            serialize_datetime(scheduled_time),
+            preview,
+            source,
+            full_text=full_text,
+            source_url=source_url,
+        )
+        reply_markup = reminders_ux.build_reschedule_note_keyboard(new_id) if new_id else None
         try:
-            await callback_message.edit_text(f"✅ Принято! Отправлю это сообщение тебе {label}.")
-            add_message(
-                callback_message.chat.id,
-                orig_msg.message_id,
-                serialize_datetime(scheduled_time),
-                preview,
-                source,
-                full_text=full_text,
-                source_url=source_url,
+            await callback_message.edit_text(
+                f"✅ Принято! Отправлю это сообщение тебе {label}.",
+                reply_markup=reply_markup,
             )
-            await asyncio.sleep(3)
-            await callback_message.delete()
         except TelegramAPIError:
             pass
 
@@ -4828,6 +4827,10 @@ async def handle_manual_minute_selection(callback: CallbackQuery, state: FSMCont
     await callback.answer()
 
 
+# Fallback router with catch-all catch_message must be included after all feature routers
+dp.include_router(fallback_router)
+
+
 async def check_messages():
     while True:
         now_str = serialize_datetime(utc_now())
@@ -4845,7 +4848,8 @@ async def check_messages():
             attempt_number = retry_count + 1
             try:
                 if message_id is None or message_id == 0:
-                    content_text = full_text or text_preview or ""
+                    raw_text = full_text or text_preview or ""
+                    content_text = html.escape(raw_text)
                     if source_name:
                         text_to_send = f"👤 <b>Источник:</b> {html.escape(source_name)}\n\n{content_text}"
                     else:
