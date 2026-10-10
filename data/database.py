@@ -780,13 +780,28 @@ def update_reminder_note(user_id: int, reminder_id: int, note: str) -> bool:
     return cur.rowcount > 0
 
 
+def mark_reminder_as_done(user_id: int, db_id: int) -> bool:
+    """Marks a delivered reminder as done without deleting it (T16)."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE scheduled_messages
+            SET delivery_status = 'done'
+            WHERE id = ? AND user_id = ?
+            """,
+            (db_id, user_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
 def get_scheduled_message_by_delivered_message_id(user_id, delivered_message_id):
     with get_connection() as conn:
         row = conn.execute(
             '''
             SELECT id, message_id, delivered_message_id, send_at, text_preview, source_name, is_sent
             FROM scheduled_messages
-            WHERE user_id = ? AND delivered_message_id = ? AND is_sent = 1
+            WHERE user_id = ? AND delivered_message_id = ? AND is_sent = 1 AND (delivery_status != 'done' OR delivery_status IS NULL)
             ORDER BY id DESC
             LIMIT 1
             ''',

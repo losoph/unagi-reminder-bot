@@ -72,6 +72,7 @@ from data.database import (
     is_channel_backlog_overloaded,
     mark_as_sent,
     mark_message_delivery_error,
+    mark_reminder_as_done,
     mark_subscription_delivery_error,
     normalize_channel_username,
     parse_db_datetime,
@@ -810,17 +811,20 @@ def build_back_home_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def build_sent_reminder_actions_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="⏰ Отложить", callback_data="sent_later"),
-                InlineKeyboardButton(text="🗑 Удалить", callback_data="sent_delete"),
-            ],
-            [
-                InlineKeyboardButton(text="📁 Сохранить", callback_data="sent_save"),
-            ],
-        ]
+def build_sent_reminder_actions_keyboard(
+    user_id: int | None = None,
+    now: datetime | None = None,
+    hours: dict[str, int] | None = None,
+) -> InlineKeyboardMarkup:
+    if user_id is not None:
+        user_time = now or user_now(user_id)
+        user_h = hours or day_part_hours(user_id)
+    else:
+        user_time = now or local_now()
+        user_h = hours or {"morning": 9, "day": 14, "evening": 20}
+    return reminders_ux.build_sent_reminder_actions_keyboard(
+        now=user_time,
+        evening_hour=user_h.get("evening", 20),
     )
 
 
@@ -1915,6 +1919,89 @@ async def delete_sent_reminder(callback: CallbackQuery):
     except TelegramAPIError:
         pass
     await callback.answer("Удалено!")
+
+
+@dp.callback_query(F.data.in_({"snooze_1h", "snooze_evening", "snooze_tomorrow_morning"}))
+async def handle_sent_snooze(callback: CallbackQuery):
+    callback_message = get_callback_message(callback)
+    if callback_message is None:
+        await callback.answer("❌ Сообщение недоступно.")
+        return
+
+    scheduled_msg = get_scheduled_message_by_delivered_message_id(
+        callback_message.chat.id, callback_message.message_id
+    )
+    if not scheduled_msg:
+        await callback.answer("❌ Напоминание уже обработано.", show_alert=True)
+        return
+
+    db_id, source_message_id, delivered_message_id, _, preview, source, _ = scheduled_msg
+    user_id = callback_message.chat.id
+    now = user_now(user_id)
+    hours = day_part_hours(user_id)
+
+    action = callback.data
+    if action == "snooze_1h":
+        scheduled_time = (now + timedelta(hours=1)).replace(second=0, microsecond=0)
+    elif action == "snooze_evening":
+        scheduled_time = now.replace(hour=hours["evening"], minute=0, second=0, microsecond=0)
+        if scheduled_time <= now:
+            scheduled_time += timedelta(days=1)
+    elif action == "snooze_tomorrow_morning":
+        scheduled_time = (now + timedelta(days=1)).replace(hour=hours["morning"], minute=0, second=0, microsecond=0)
+    else:
+        await callback.answer("❌ Некорректное действие.")
+        return
+
+    try:
+        new_db_id = replace_sent_reminder_with_pending(
+            callback_message.chat.id,
+            db_id,
+            source_message_id,
+            serialize_datetime(scheduled_time),
+            preview or "",
+            source or "",
+        )
+    except Exception:
+        logger.exception("replace_sent_reminder_with_pending failed in snooze callback")
+        await callback.answer(USER_FACING_ERROR, show_alert=True)
+        return
+
+    for message_id in {delivered_message_id, callback_message.message_id}:
+        try:
+            await bot.delete_message(callback_message.chat.id, message_id)
+        except TelegramAPIError:
+            pass
+
+    await callback.answer()
+    kb = reminders_ux.build_reschedule_note_keyboard(new_db_id)
+    await bot.send_message(
+        callback_message.chat.id,
+        f"✅ Отложил на {format_when(scheduled_time, now)}.",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data.in_({"sent_done", "snooze_done"}))
+async def handle_sent_reminder_done(callback: CallbackQuery):
+    callback_message = get_callback_message(callback)
+    if callback_message is None:
+        await callback.answer("❌ Сообщение недоступно.")
+        return
+
+    scheduled_msg = get_scheduled_message_by_delivered_message_id(
+        callback_message.chat.id, callback_message.message_id
+    )
+    if scheduled_msg:
+        db_id = scheduled_msg[0]
+        mark_reminder_as_done(callback_message.chat.id, db_id)
+
+    try:
+        await callback_message.edit_reply_markup(reply_markup=None)
+    except (TelegramBadRequest, TelegramAPIError):
+        pass
+
+    await callback.answer("Готово")
 
 
 EMOJI_NUMS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
@@ -4901,14 +4988,14 @@ async def check_messages():
                         chat_id=int(chat_id),
                         text=text_to_send,
                         parse_mode="HTML",
-                        reply_markup=build_sent_reminder_actions_keyboard(),
+                        reply_markup=build_sent_reminder_actions_keyboard(int(chat_id)),
                     )
                 else:
                     sent_message = await bot.copy_message(
                         chat_id=int(chat_id),
                         from_chat_id=int(chat_id),
                         message_id=message_id,
-                        reply_markup=build_sent_reminder_actions_keyboard(),
+                        reply_markup=build_sent_reminder_actions_keyboard(int(chat_id)),
                     )
                 mark_as_sent(db_id, sent_message.message_id)
                 if note:

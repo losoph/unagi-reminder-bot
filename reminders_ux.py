@@ -478,3 +478,30 @@ async def process_reminder_note(message: types.Message, state: FSMContext):
             await _render_detail(message.chat.id, int(rem_id), message, state)
     else:
         await message.answer("❌ Не удалось сохранить примечание (напоминание не найдено или уже отправлено).")
+
+
+def build_sent_reminder_actions_keyboard(
+    now: datetime,
+    evening_hour: int = 20,
+) -> InlineKeyboardMarkup:
+    """Builds action keyboard for a delivered reminder (T16)."""
+    row1: list[InlineKeyboardButton] = [
+        InlineKeyboardButton(text="+1 ч", callback_data="snooze_1h"),
+    ]
+    if now.hour < evening_hour:
+        row1.append(InlineKeyboardButton(text="Вечером", callback_data="snooze_evening"))
+    row1.append(InlineKeyboardButton(text="Завтра утром", callback_data="snooze_tomorrow_morning"))
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            row1,
+            [
+                InlineKeyboardButton(text="⏰ Другое время", callback_data="sent_later"),
+                InlineKeyboardButton(text="✅ Готово", callback_data="sent_done"),
+            ],
+            [
+                InlineKeyboardButton(text="📁 Сохранить", callback_data="sent_save"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data="sent_delete"),
+            ],
+        ]
+    )
