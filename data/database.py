@@ -232,7 +232,8 @@ def init_db():
                 tag TEXT,
                 full_text TEXT,
                 note TEXT,
-                delivered_at DATETIME
+                delivered_at DATETIME,
+                source_url TEXT
             )
         ''')
 
@@ -249,6 +250,7 @@ def init_db():
             "ALTER TABLE scheduled_messages ADD COLUMN full_text TEXT",
             "ALTER TABLE scheduled_messages ADD COLUMN note TEXT",
             "ALTER TABLE scheduled_messages ADD COLUMN delivered_at DATETIME",
+            "ALTER TABLE scheduled_messages ADD COLUMN source_url TEXT",
         ):
             try:
                 cursor.execute(statement)
@@ -573,6 +575,7 @@ def add_message(
     tag=None,
     full_text=None,
     note=None,
+    source_url=None,
 ):
     created_at = serialize_datetime(utc_now())
     if full_text is None and text_preview:
@@ -584,11 +587,11 @@ def add_message(
         cur = conn.execute(
             '''
             INSERT INTO scheduled_messages (
-                user_id, message_id, send_at, created_at, text_preview, source_name, tag, full_text, note, delivery_status
+                user_id, message_id, send_at, created_at, text_preview, source_name, tag, full_text, note, source_url, delivery_status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
             ''',
-            (user_id, message_id, send_at, created_at, text_preview, source_name, tag, full_text, note),
+            (user_id, message_id, send_at, created_at, text_preview, source_name, tag, full_text, note, source_url),
         )
         conn.commit()
         return cur.lastrowid
@@ -646,7 +649,7 @@ def get_user_messages(user_id):
     with get_connection() as conn:
         rows = conn.execute(
             '''
-            SELECT id, send_at, text_preview, source_name, tag, message_id
+            SELECT id, send_at, text_preview, source_name, tag, message_id, full_text, note, source_url
             FROM scheduled_messages
             WHERE user_id = ? AND is_sent = 0
             ORDER BY send_at
@@ -660,7 +663,7 @@ def get_reminder_by_id(user_id, msg_id):
     with get_connection() as conn:
         row = conn.execute(
             '''
-            SELECT id, send_at, text_preview, source_name, tag, message_id
+            SELECT id, send_at, text_preview, source_name, tag, message_id, full_text, note, source_url
             FROM scheduled_messages
             WHERE id = ? AND user_id = ? AND is_sent = 0
             ''',
@@ -715,13 +718,13 @@ def replace_sent_reminder_with_pending(
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            # Copy tag, full_text, note from the delivered row so a reschedule keeps them.
+            # Copy tag, full_text, note, source_url from the delivered row so a reschedule keeps them.
             cur = conn.execute(
                 """
                 INSERT INTO scheduled_messages (
-                    user_id, message_id, send_at, created_at, text_preview, source_name, tag, full_text, note, delivery_status
+                    user_id, message_id, send_at, created_at, text_preview, source_name, tag, full_text, note, source_url, delivery_status
                 )
-                SELECT ?, ?, ?, ?, ?, ?, tag, COALESCE(full_text, ?), note, 'pending'
+                SELECT ?, ?, ?, ?, ?, ?, tag, COALESCE(full_text, ?), note, source_url, 'pending'
                 FROM scheduled_messages WHERE id = ? AND user_id = ?
                 """,
                 (user_id, message_id, send_at, created_at, text_preview, source_name, text_preview, old_db_id, user_id),
@@ -1466,7 +1469,7 @@ def export_user_data(user_id) -> dict:
     with get_connection() as conn:
         reminders = conn.execute(
             '''
-            SELECT send_at, text_preview, source_name, full_text, note
+            SELECT send_at, text_preview, source_name, full_text, note, source_url
             FROM scheduled_messages
             WHERE user_id = ? AND is_sent = 0 AND delivery_status != 'failed_permanent'
             ORDER BY send_at
