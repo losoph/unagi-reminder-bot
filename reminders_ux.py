@@ -527,9 +527,13 @@ def build_sent_reminder_actions_keyboard(
     now: datetime,
     evening_hour: int = 20,
 ) -> InlineKeyboardMarkup:
-    """Builds action keyboard for a delivered reminder (T16)."""
+    """Builds action keyboard for a delivered reminder (T16).
+
+    The quick snooze is +3 h: an hour turned out too short. Old messages still carry
+    ``snooze_1h`` and keep working.
+    """
     row1: list[InlineKeyboardButton] = [
-        InlineKeyboardButton(text="+1 ч", callback_data="snooze_1h"),
+        InlineKeyboardButton(text="+3 ч", callback_data="snooze_3h"),
     ]
     if now.hour < evening_hour:
         row1.append(InlineKeyboardButton(text="Вечером", callback_data="snooze_evening"))

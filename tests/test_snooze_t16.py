@@ -24,15 +24,15 @@ class SnoozeT16Tests(unittest.IsolatedAsyncioTestCase):
         self.temp_dir.cleanup()
 
     def test_delivered_keyboard_layout_before_evening(self):
-        """When evening is still ahead, row 1 has 3 buttons (+1 ч, Вечером, Завтра утром)."""
+        """When evening is still ahead, row 1 has 3 buttons (+3 ч, Вечером, Завтра утром)."""
         tz = ZoneInfo("Europe/Moscow")
         now = datetime(2026, 6, 15, 14, 0, 0, tzinfo=tz)
         kb = reminders_ux.build_sent_reminder_actions_keyboard(now=now, evening_hour=20)
 
         # Row 1
         self.assertEqual(len(kb.inline_keyboard[0]), 3)
-        self.assertEqual(kb.inline_keyboard[0][0].text, "+1 ч")
-        self.assertEqual(kb.inline_keyboard[0][0].callback_data, "snooze_1h")
+        self.assertEqual(kb.inline_keyboard[0][0].text, "+3 ч")
+        self.assertEqual(kb.inline_keyboard[0][0].callback_data, "snooze_3h")
         self.assertEqual(kb.inline_keyboard[0][1].text, "Вечером")
         self.assertEqual(kb.inline_keyboard[0][1].callback_data, "snooze_evening")
         self.assertEqual(kb.inline_keyboard[0][2].text, "Завтра утром")
@@ -58,15 +58,15 @@ class SnoozeT16Tests(unittest.IsolatedAsyncioTestCase):
         now = datetime(2026, 6, 15, 21, 30, 0, tzinfo=tz)
         kb = reminders_ux.build_sent_reminder_actions_keyboard(now=now, evening_hour=20)
 
-        # Row 1 has only 2 buttons: +1 ч and Завтра утром
+        # Row 1 has only 2 buttons: +3 ч and Завтра утром
         self.assertEqual(len(kb.inline_keyboard[0]), 2)
-        self.assertEqual(kb.inline_keyboard[0][0].text, "+1 ч")
-        self.assertEqual(kb.inline_keyboard[0][0].callback_data, "snooze_1h")
+        self.assertEqual(kb.inline_keyboard[0][0].text, "+3 ч")
+        self.assertEqual(kb.inline_keyboard[0][0].callback_data, "snooze_3h")
         self.assertEqual(kb.inline_keyboard[0][1].text, "Завтра утром")
         self.assertEqual(kb.inline_keyboard[0][1].callback_data, "snooze_tomorrow_morning")
 
     async def test_snooze_1h(self):
-        """Snooze +1 ч reschedules by 1 hour and replaces delivered reminder."""
+        """Legacy «+1 ч» button on old messages still reschedules by 1 hour."""
         chat_id = 111222
         user_id = chat_id
         db_id = database.add_message(
@@ -113,6 +113,39 @@ class SnoozeT16Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(new_rows[0][0], "2026-06-15 12:15:00")
             self.assertEqual(new_rows[0][1], "pending")
             self.assertEqual(new_rows[0][2], "Купить молоко и хлеб")
+
+    async def test_snooze_3h(self):
+        """Snooze +3 ч reschedules by 3 hours."""
+        chat_id = 111333
+        db_id = database.add_message(
+            user_id=chat_id,
+            message_id=11,
+            send_at="2026-06-15 10:00:00",
+            text_preview="Позвонить",
+            full_text="Позвонить в банк",
+        )
+        database.mark_as_sent(db_id, 902)
+        mock_now = datetime(2026, 6, 15, 14, 15, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+
+        cb = MagicMock()
+        cb.from_user.id = chat_id
+        cb.message.chat.id = chat_id
+        cb.message.message_id = 902
+        cb.answer = AsyncMock()
+        cb.data = "snooze_3h"
+
+        with patch("main.user_now", return_value=mock_now), \
+             patch.object(main.bot, "delete_message", new_callable=AsyncMock), \
+             patch.object(main.bot, "send_message", new_callable=AsyncMock) as mock_send:
+            await main.handle_sent_snooze(cb)
+            self.assertIn("17:15", mock_send.call_args[0][1])
+
+        with database.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT send_at FROM scheduled_messages WHERE user_id = ? AND is_sent = 0", (chat_id,)
+            ).fetchall()
+        # 17:15 Moscow (UTC+3) is 14:15 UTC
+        self.assertEqual([r[0] for r in rows], ["2026-06-15 14:15:00"])
 
     async def test_snooze_evening_with_user_prefs(self):
         """Snooze evening uses user's custom evening hour and timezone."""

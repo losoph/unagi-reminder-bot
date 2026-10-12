@@ -1876,7 +1876,10 @@ async def delete_sent_reminder(callback: CallbackQuery):
     await callback.answer("Удалено!")
 
 
-@dp.callback_query(F.data.in_({"snooze_1h", "snooze_evening", "snooze_tomorrow_morning"}))
+_SNOOZE_HOURS = {"snooze_1h": 1, "snooze_3h": 3}  # snooze_1h — legacy button on old messages
+
+
+@dp.callback_query(F.data.in_({"snooze_1h", "snooze_3h", "snooze_evening", "snooze_tomorrow_morning"}))
 async def handle_sent_snooze(callback: CallbackQuery):
     callback_message = get_callback_message(callback)
     if callback_message is None:
@@ -1896,8 +1899,8 @@ async def handle_sent_snooze(callback: CallbackQuery):
     hours = day_part_hours(user_id)
 
     action = callback.data
-    if action == "snooze_1h":
-        scheduled_time = (now + timedelta(hours=1)).replace(second=0, microsecond=0)
+    if action in _SNOOZE_HOURS:
+        scheduled_time = (now + timedelta(hours=_SNOOZE_HOURS[action])).replace(second=0, microsecond=0)
     elif action == "snooze_evening":
         scheduled_time = now.replace(hour=hours["evening"], minute=0, second=0, microsecond=0)
         if scheduled_time <= now:
