@@ -115,6 +115,8 @@ def normalize_email(text: str | None) -> str | None:
 _FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
 _TAG_STYLES = {
     "p": "margin:0 0 14px;line-height:1.55;",
+    "h3": "margin:32px 0 6px;padding-bottom:6px;font-size:20px;line-height:1.3;color:#111827;"
+    "border-bottom:2px solid #e5e7eb;",
     "h4": "margin:28px 0 10px;font-size:18px;line-height:1.3;color:#111827;",
     "ul": "margin:0 0 14px;padding-left:20px;line-height:1.55;",
     "li": "margin:0 0 4px;",
@@ -194,7 +196,12 @@ def build_digest_email(
     lines = [title, ""]
     if telegraph_url:
         lines += [f"Открыть в Telegraph: {telegraph_url}", ""]
+    current_group = None
     for section in sections:
+        group = section.get("group")
+        if group and group != current_group:
+            lines += [f"##### {group} #####", ""]
+        current_group = group
         lines.append(f"== {section.get('title') or 'Канал'} ==")
         for post in section.get("posts", []):
             lines.append(f"- {(post.get('text') or '').strip()}")

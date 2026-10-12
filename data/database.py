@@ -1108,6 +1108,39 @@ def get_due_subscriptions(current_time_str, limit: int | None = None):
     return rows
 
 
+def get_user_subscriptions_due_until(user_id, until_str):
+    """Active subscriptions of one user scheduled up to ``until_str`` (same row shape as
+    get_due_subscriptions): everything that belongs to the user's edition of the day."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            '''
+            SELECT id, user_id, channel_username, channel_title, period, last_scraped_at, failure_count,
+                   last_post_id, next_send_at
+            FROM subscriptions
+            WHERE user_id = ? AND next_send_at <= ? AND is_disabled = 0 AND is_paused = 0
+            ORDER BY next_send_at, id
+            ''',
+            (user_id, until_str),
+        ).fetchall()
+    return rows
+
+
+def defer_subscriptions(sub_ids, next_send_at) -> int:
+    """Move due subscriptions to a later moment of the same day (the senior edition's time)
+    without touching their status, cursor or failure counters."""
+    ids = [int(sub_id) for sub_id in sub_ids]
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    with get_connection() as conn:
+        cursor = conn.execute(
+            f'UPDATE subscriptions SET next_send_at = ? WHERE id IN ({placeholders})',
+            (next_send_at, *ids),
+        )
+        conn.commit()
+    return cursor.rowcount
+
+
 def update_subscription_time(sub_id, last_scraped_at, next_send_at, last_post_id=None):
     with get_connection() as conn:
         conn.execute(

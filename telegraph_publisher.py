@@ -144,7 +144,12 @@ def build_content(sections: list[dict], *, with_actions: bool = False) -> list:
     public and must not carry subscription controls.
     """
     nodes: list = _build_summary(sections)
+    current_group = None
     for section in sections:
+        group = section.get("group")
+        if group and group != current_group:
+            nodes.append({"tag": "h3", "children": [str(group)]})
+        current_group = group
         title = section.get("title") or "Канал"
         nodes.append({"tag": "h4", "children": [str(title)]})
         for post in section.get("posts", []):
@@ -214,8 +219,8 @@ def _truncate_to_limit(content: list, max_bytes: int = _MAX_CONTENT_BYTES) -> li
         if _is_post_node(node):
             omitted_posts += 1
 
-    # Remove trailing empty channel headers or hr
-    while content and content[-1].get("tag") in ("h4", "hr"):
+    # Remove trailing empty group/channel headers or hr
+    while content and content[-1].get("tag") in ("h3", "h4", "hr"):
         content.pop()
 
     if omitted_posts > 0:

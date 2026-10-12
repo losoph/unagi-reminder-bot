@@ -56,6 +56,8 @@ from data.database import (
     delete_subscription,
     get_channel_posts_since,
     get_due_subscriptions,
+    get_user_subscriptions_due_until,
+    defer_subscriptions,
     get_pending_messages,
     get_reminder_by_id,
     get_saved_message_by_id,
@@ -154,6 +156,7 @@ from time_utils import (  # noqa: E402
     local_now,
 )
 from user_prefs import day_part_hours, user_now, user_tz  # noqa: E402
+import digest_edition  # noqa: E402
 fallback_router = Router(name="fallback")
 MAX_MESSAGE_RETRIES = 5
 MAX_DIGEST_RETRIES = 5
@@ -972,7 +975,12 @@ def append_digest_channel_lines(
 
 def render_digest_lines(title_plain: str, sections: list[dict]) -> list[str]:
     lines = [f"📰 <b>{html.escape(title_plain)}</b> ☕️", ""]
+    current_group = None
     for section in sections:
+        group = section.get("group")
+        if group and group != current_group:
+            lines += [f"━━━━━━━━━━\n<b>{html.escape(group)}</b>", ""]
+        current_group = group
         append_digest_channel_lines(
             lines,
             section["sub_id"],
@@ -993,24 +1001,38 @@ def get_email_delivery_periods(user_id: int) -> tuple[str | None, set[str]]:
     return get_email_delivery(user_id)
 
 
-async def deliver_digest(user_id: int, title_plain: str, sections: list[dict]) -> bool:
+async def deliver_digest(
+    user_id: int,
+    title_plain: str | None,
+    sections: list[dict],
+    *,
+    group_by_period: bool = True,
+) -> bool:
     """Send a digest: each period goes either to email or to Telegram, never both.
 
     Returns True if delivered. A failed email falls back to Telegram, so posts are never lost.
+    With ``group_by_period`` the sections are ordered juniors-first and, when one delivery
+    mixes periods, split into groups «За сутки / За неделю / За месяц». Without a title,
+    each delivery is named by the senior period inside it.
     """
     sections = [s for s in sections if s["posts"]]
     if not sections:
         return False
 
+    def prepare(part: list[dict]) -> tuple[str, list[dict]]:
+        if group_by_period:
+            part = digest_edition.arrange_edition_sections(part)
+        return title_plain or digest_edition.edition_title(part, local_now()), part
+
     address, email_periods = get_email_delivery_periods(user_id)
     email_sections = [s for s in sections if s.get("period") in email_periods]
     telegram_sections = [s for s in sections if s.get("period") not in email_periods]
     note = ""
-    if email_sections and not await send_digest_email(address, title_plain, email_sections):
+    if email_sections and not await send_digest_email(address, *prepare(email_sections)):
         telegram_sections += email_sections
         note = "📧 Не удалось отправить дайджест на почту — присылаю сюда."
     if telegram_sections:
-        await send_telegram_digest(user_id, title_plain, telegram_sections, note)
+        await send_telegram_digest(user_id, *prepare(telegram_sections), note)
     return True
 
 
@@ -1089,12 +1111,14 @@ async def fetch_subscription_posts(
     prefetched_channels: dict[str, dict] | None = None,
 ):
     sub_id, user_id, username, title, period, last_scraped, failure_count, last_post_id = sub[:8]
+    scheduled_at = sub[8] if len(sub) > 8 else None
     title_safe = html.escape(title) if title else "Канал"
 
     async with semaphore:
         try:
             settings = resolve_digest_settings(user_id, period)
-            next_send_str = serialize_datetime(get_next_digest_time(period, local_now(), settings))
+            next_send_base = digest_edition.next_send_base(local_now(), scheduled_at)
+            next_send_str = serialize_datetime(get_next_digest_time(period, next_send_base, settings))
             prefetched = (prefetched_channels or {}).get(normalize_channel_username(username))
             if prefetched is not None:
                 if prefetched.get("error") is not None:
@@ -4342,7 +4366,7 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
         await message.answer("📭 За последние 24 часа новых постов ни в одном из каналов не было.")
         return
 
-    await deliver_digest(user_id, "Твоя тестовая утренняя газета", sections)
+    await deliver_digest(user_id, "Твоя газета за последние 24 часа", sections, group_by_period=False)
 
 
 EMAIL_CODE_TTL_MINUTES = 15
@@ -5017,9 +5041,240 @@ async def check_messages():
         await asyncio.sleep(30)
 
 
+async def process_user_edition(
+    user_id: int,
+    subs: list,
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore,
+    now_str: str,
+    prefetched_channels: dict[str, dict],
+) -> dict[str, int]:
+    """Collect and deliver one edition of the day for a user.
+
+    The edition may mix periods (daily + weekly/monthly on the same day) but goes out as a
+    single delivery. Execution records, cursors and failure accounting stay per period.
+    """
+    stats = {"failures": 0, "delivered_users": 0, "delivered_posts": 0}
+    by_period: dict[str, list] = {}
+    for sub in subs:
+        by_period.setdefault(sub[4], []).append(sub)
+    periods = sorted(by_period, key=lambda p: digest_edition.PERIOD_RANK.get(p, 0))
+    executions = {
+        period: record_digest_execution_start(
+            user_id,
+            period,
+            min((sub[8] for sub in by_period[period] if len(sub) > 8 and sub[8]), default=now_str),
+        )
+        for period in periods
+    }
+
+    try:
+        results = await asyncio.gather(
+            *(fetch_subscription_posts(sub, session, semaphore, now_str, prefetched_channels) for sub in subs),
+            return_exceptions=True,
+        )
+
+        report = {
+            period: {"sections": [], "successful": [], "errors": [], "failed": 0, "partial": 0, "temporary": False}
+            for period in periods
+        }
+        for sub, result in zip(subs, results):
+            period_report = report[sub[4]]
+            if isinstance(result, BaseException):
+                stats["failures"] += 1
+                period_report["failed"] += 1
+                period_report["temporary"] = True
+                logger.error(
+                    "Изолирована необработанная ошибка чтения для пользователя %s (%s)",
+                    user_id,
+                    sub[4],
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+                continue
+            if result["status"] == "error":
+                stats["failures"] += 1
+                period_report["failed"] += 1
+                period_report["errors"].append(result)
+                if not result["is_permanent"]:
+                    period_report["temporary"] = True
+                continue
+
+            period_report["successful"].append(result)
+            if result.get("is_partial"):
+                period_report["partial"] += 1
+            if result["posts"]:
+                period_report["sections"].append(
+                    {
+                        "sub_id": result["sub_id"],
+                        "period": result["period"],
+                        "title": result["title"] or "Канал",
+                        "username": result["username"],
+                        "posts": result["posts"],
+                        "omitted_count": result.get("omitted_count", 0),
+                    }
+                )
+                try:
+                    add_digest_posts(user_id, result["username"], result["title"], result["posts"])
+                except Exception:
+                    logger.exception("Не удалось сохранить посты в базу знаний")
+
+        edition_sections = digest_edition.dedupe_edition_sections(
+            [section for period in periods for section in report[period]["sections"]]
+        )
+        delivery_error: TelegramAPIError | None = None
+        if edition_sections:
+            try:
+                await deliver_digest(user_id, None, edition_sections)
+                reset_user_alert_consecutive_failures(user_id)
+                stats["delivered_users"] += 1
+                stats["delivered_posts"] += sum(len(section["posts"]) for section in edition_sections)
+            except TelegramAPIError as exc:
+                delivery_error = exc
+                logger.exception("Не удалось отправить дайджест пользователю %s (%s)", user_id, ",".join(periods))
+
+        for period in periods:
+            stats["failures"] += _finish_period_execution(
+                executions[period], by_period[period], report[period], delivery_error, now_str
+            )
+            if report[period]["temporary"]:
+                logger.info(
+                    "Для пользователя %s (%s) чтение части каналов будет повторено позже.",
+                    user_id,
+                    period,
+                )
+    except Exception as exc:
+        for period in periods:
+            stats["failures"] += len(by_period[period])
+            record_digest_execution_finish(
+                executions[period],
+                status="failed",
+                posts_count=0,
+                channels_count=len(by_period[period]),
+                channels_failed=len(by_period[period]),
+                channels_partial=0,
+                error_message=str(exc),
+            )
+        logger.exception(
+            "Изолирована ошибка обработки дайджеста пользователя %s; продолжаю со следующим пользователем",
+            user_id,
+        )
+    return stats
+
+
+def _finish_period_execution(
+    execution_id: int,
+    period_subs: list,
+    period_report: dict,
+    delivery_error: TelegramAPIError | None,
+    now_str: str,
+) -> int:
+    """Move cursors and close the execution of one period; returns extra failures to count."""
+    sections = period_report["sections"]
+    successful = period_report["successful"]
+    channels_failed = period_report["failed"]
+    channels_partial = period_report["partial"]
+
+    if sections and delivery_error is None:
+        for result in successful:
+            if result["posts"]:
+                update_subscription_time(
+                    result["sub_id"],
+                    result["last_scraped_str"],
+                    result["next_send_str"],
+                    result["last_post_id"],
+                )
+            else:
+                update_subscription_schedule(result["sub_id"], result["next_send_str"], now_str)
+        record_digest_execution_finish(
+            execution_id,
+            status="partial" if (channels_failed > 0 or channels_partial > 0) else "delivered",
+            posts_count=sum(len(section["posts"]) for section in sections),
+            channels_count=len(period_subs),
+            channels_failed=channels_failed,
+            channels_partial=channels_partial,
+        )
+        return 0
+
+    if sections:
+        is_permanent, error_text = classify_telegram_send_error(delivery_error)
+        retries_exhausted = False
+        for result in successful:
+            original = next((item for item in period_subs if item[0] == result["sub_id"]), None)
+            new_failure_count = (original[6] if original else 0) + 1
+            if new_failure_count >= MAX_DIGEST_RETRIES:
+                retries_exhausted = True
+            mark_subscription_delivery_error(
+                result["sub_id"],
+                error_text,
+                now_str,
+                new_failure_count,
+                is_permanent or new_failure_count >= MAX_DIGEST_RETRIES,
+            )
+        record_digest_execution_finish(
+            execution_id,
+            status="failed" if (is_permanent or retries_exhausted) else "retrying",
+            posts_count=0,
+            channels_count=len(period_subs),
+            channels_failed=len(period_subs),
+            channels_partial=channels_partial,
+            error_message=error_text,
+        )
+        return len(successful)
+
+    for result in successful:
+        update_subscription_schedule(result["sub_id"], result["next_send_str"], now_str)
+    if channels_failed == 0:
+        record_digest_execution_finish(
+            execution_id,
+            status="empty",
+            posts_count=0,
+            channels_count=len(period_subs),
+            channels_failed=0,
+            channels_partial=channels_partial,
+        )
+    else:
+        all_permanent = (
+            channels_failed == len(period_subs)
+            and len(period_report["errors"]) == channels_failed
+            and all(error.get("is_permanent", False) for error in period_report["errors"])
+        )
+        record_digest_execution_finish(
+            execution_id,
+            status="failed" if all_permanent else "retrying",
+            posts_count=0,
+            channels_count=len(period_subs),
+            channels_failed=channels_failed,
+            channels_partial=channels_partial,
+            error_message="Не удалось прочитать каналы",
+        )
+    return 0
+
+
+def plan_due_editions(due_subs: list, now: datetime) -> tuple[dict[int, list], int]:
+    """Group due subscriptions into one edition per user for today.
+
+    Juniors due before the senior period's time are deferred to it (persisted, so they
+    stop occupying the due batch); later-today subscriptions are pulled into the edition.
+    Returns ({user_id: edition subscriptions}, number of deferred subscriptions).
+    """
+    day_end = digest_edition.local_day_end(now)
+    editions: dict[int, list] = {}
+    deferred = 0
+    for user_id in dict.fromkeys(sub[1] for sub in due_subs):
+        user_subs = get_user_subscriptions_due_until(user_id, day_end)
+        defer_until, edition_subs = digest_edition.plan_daily_edition(user_subs, now)
+        if defer_until is not None:
+            deferred += defer_subscriptions([sub[0] for sub in edition_subs], serialize_datetime(defer_until))
+            continue
+        if edition_subs:
+            editions[user_id] = edition_subs
+    return editions, deferred
+
+
 async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore) -> int:
     cycle_started_at = time.monotonic()
-    now_str = serialize_datetime(utc_now())
+    now = utc_now()
+    now_str = serialize_datetime(now)
     due_total = count_due_subscriptions(now_str)
     due_subs = get_due_subscriptions(now_str, DIGEST_DUE_BATCH_SIZE)
     if not due_subs:
@@ -5031,14 +5286,20 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
         )
         return 0
 
+    editions, deferred_count = plan_due_editions(due_subs, now)
+    edition_subs = [sub for subs in editions.values() for sub in subs]
     logger.info(
-        "🔄 Начинаю проверку %s/%s due-дайджестов (batch_limit=%s, next_send_at <= %s)",
+        "🔄 Начинаю проверку %s/%s due-дайджестов (batch_limit=%s, next_send_at <= %s): "
+        "выпусков %s, подписок в них %s, отложено до старшего выпуска %s",
         len(due_subs),
         due_total,
         DIGEST_DUE_BATCH_SIZE,
         now_str,
+        len(editions),
+        len(edition_subs),
+        deferred_count,
     )
-    prefetched_channels = await prefetch_due_channels(due_subs, session, semaphore)
+    prefetched_channels = await prefetch_due_channels(edition_subs, session, semaphore) if edition_subs else {}
     fetched_posts_count = sum(
         len(result["posts"])
         for result in prefetched_channels.values()
@@ -5050,201 +5311,19 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
     failures_count = 0
     delivered_users_count = 0
     delivered_posts_count = 0
-    user_period_subs: dict[tuple[int, str], list] = {}
-    for sub in due_subs:
-        u_id = sub[1]
-        prd = sub[4]
-        user_period_subs.setdefault((u_id, prd), []).append(sub)
 
-    for (user_id, period), subs in user_period_subs.items():
-        scheduled_at = subs[0][8] if len(subs[0]) > 8 and subs[0][8] else now_str
-        execution_id = record_digest_execution_start(user_id, period, scheduled_at)
-        try:
-            sections: list[dict] = []
-            user_has_temporary_failures = False
-            successful_subscriptions: list[dict] = []
-            channels_failed = 0
-            channels_partial = 0
-
-            results = await asyncio.gather(
-                *(
-                    fetch_subscription_posts(
-                        sub,
-                        session,
-                        semaphore,
-                        now_str,
-                        prefetched_channels,
-                    )
-                    for sub in subs
-                ),
-                return_exceptions=True,
-            )
-
-            for result in results:
-                if isinstance(result, BaseException):
-                    failures_count += 1
-                    channels_failed += 1
-                    user_has_temporary_failures = True
-                    logger.error(
-                        "Изолирована необработанная ошибка чтения для пользователя %s (%s)",
-                        user_id,
-                        period,
-                        exc_info=(type(result), result, result.__traceback__),
-                    )
-                    continue
-                if result["status"] == "error":
-                    failures_count += 1
-                    channels_failed += 1
-                    if not result["is_permanent"]:
-                        user_has_temporary_failures = True
-                    continue
-
-                successful_subscriptions.append(result)
-                if result.get("is_partial"):
-                    channels_partial += 1
-                if result["posts"]:
-                    sections.append(
-                        {
-                            "sub_id": result["sub_id"],
-                            "period": result["period"],
-                            "title": result["title"] or "Канал",
-                            "posts": result["posts"],
-                        }
-                    )
-                    try:
-                        add_digest_posts(
-                            user_id,
-                            result["username"],
-                            result["title"],
-                            result["posts"],
-                        )
-                    except Exception:
-                        logger.exception("Не удалось сохранить посты в базу знаний")
-
-            if sections:
-                try:
-                    await deliver_digest(user_id, "Твоя утренняя газета", sections)
-                    reset_user_alert_consecutive_failures(user_id)
-                    delivered_users_count += 1
-                    delivered_posts_count += sum(len(section["posts"]) for section in sections)
-                    for result in successful_subscriptions:
-                        if result["posts"]:
-                            update_subscription_time(
-                                result["sub_id"],
-                                result["last_scraped_str"],
-                                result["next_send_str"],
-                                result["last_post_id"],
-                            )
-                        else:
-                            update_subscription_schedule(
-                                result["sub_id"],
-                                result["next_send_str"],
-                                now_str,
-                            )
-                    exec_status = "partial" if (channels_failed > 0 or channels_partial > 0) else "delivered"
-                    record_digest_execution_finish(
-                        execution_id,
-                        status=exec_status,
-                        posts_count=sum(len(s["posts"]) for s in sections),
-                        channels_count=len(subs),
-                        channels_failed=channels_failed,
-                        channels_partial=channels_partial,
-                    )
-                except TelegramAPIError as exc:
-                    failures_count += len(successful_subscriptions)
-                    is_permanent, error_text = classify_telegram_send_error(exc)
-                    retries_exhausted = False
-                    for result in successful_subscriptions:
-                        original = next((item for item in subs if item[0] == result["sub_id"]), None)
-                        failure_count = original[6] if original else 0
-                        new_failure_count = failure_count + 1
-                        if new_failure_count >= MAX_DIGEST_RETRIES:
-                            retries_exhausted = True
-                        mark_subscription_delivery_error(
-                            result["sub_id"],
-                            error_text,
-                            now_str,
-                            new_failure_count,
-                            is_permanent or new_failure_count >= MAX_DIGEST_RETRIES,
-                        )
-                    exec_status = "failed" if (is_permanent or retries_exhausted) else "retrying"
-                    record_digest_execution_finish(
-                        execution_id,
-                        status=exec_status,
-                        posts_count=0,
-                        channels_count=len(subs),
-                        channels_failed=len(subs),
-                        channels_partial=channels_partial,
-                        error_message=error_text,
-                    )
-                    logger.exception("Не удалось отправить дайджест пользователю %s (%s)", user_id, period)
-            else:
-                if channels_failed == 0:
-                    for result in successful_subscriptions:
-                        update_subscription_schedule(
-                            result["sub_id"],
-                            result["next_send_str"],
-                            now_str,
-                        )
-                    record_digest_execution_finish(
-                        execution_id,
-                        status="empty",
-                        posts_count=0,
-                        channels_count=len(subs),
-                        channels_failed=0,
-                        channels_partial=channels_partial,
-                    )
-                else:
-                    all_permanent = all(
-                        r.get("is_permanent", False)
-                        for r in results
-                        if isinstance(r, dict) and r.get("status") == "error"
-                    ) and channels_failed == len(subs)
-                    exec_status = "failed" if all_permanent else "retrying"
-                    record_digest_execution_finish(
-                        execution_id,
-                        status=exec_status,
-                        posts_count=0,
-                        channels_count=len(subs),
-                        channels_failed=channels_failed,
-                        channels_partial=channels_partial,
-                        error_message="Не удалось прочитать каналы",
-                    )
-                    for result in successful_subscriptions:
-                        update_subscription_schedule(
-                            result["sub_id"],
-                            result["next_send_str"],
-                            now_str,
-                        )
-
-            if user_has_temporary_failures:
-                logger.info(
-                    "Для пользователя %s (%s) чтение части каналов будет повторено позже.",
-                    user_id,
-                    period,
-                )
-        except Exception as exc:
-            failures_count += len(subs)
-            record_digest_execution_finish(
-                execution_id,
-                status="failed",
-                posts_count=0,
-                channels_count=len(subs),
-                channels_failed=len(subs),
-                channels_partial=0,
-                error_message=str(exc),
-            )
-            logger.exception(
-                "Изолирована ошибка обработки дайджеста пользователя %s (%s); продолжаю со следующим пользователем",
-                user_id,
-                period,
-            )
+    for user_id, subs in editions.items():
+        stats = await process_user_edition(user_id, subs, session, semaphore, now_str, prefetched_channels)
+        failures_count += stats["failures"]
+        delivered_users_count += stats["delivered_users"]
+        delivered_posts_count += stats["delivered_posts"]
 
     logger.info(
-        "digest_cycle due_total=%s processed=%s backlog=%s channels=%s channel_failures=%s "
+        "digest_cycle due_total=%s processed=%s deferred=%s backlog=%s channels=%s channel_failures=%s "
         "fetched_posts=%s delivered_users=%s delivered_posts=%s subscription_failures=%s duration_ms=%s",
         due_total,
-        len(due_subs),
+        len(edition_subs),
+        deferred_count,
         max(due_total - len(due_subs), 0),
         len(prefetched_channels),
         channel_failures_count,

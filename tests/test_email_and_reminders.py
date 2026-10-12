@@ -337,7 +337,8 @@ class DigestRoutingTests(unittest.TestCase):
 
     def test_failed_email_falls_back_to_telegram_with_note(self):
         _, _, telegram = self.run_delivery({"daily"}, email_ok=False)
-        self.assertEqual(self.titles(telegram.call_args.args[2]), ["W", "D"])
+        # Email part falls back to Telegram; the edition is re-ordered juniors-first.
+        self.assertEqual(self.titles(telegram.call_args.args[2]), ["D", "W"])
         self.assertIn("почту", telegram.call_args.args[3])
 
     def test_empty_digest_is_not_delivered(self):
