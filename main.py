@@ -112,6 +112,15 @@ from telegraph_publisher import describe_counts, publish_digest
 from time_parser import parse_reminder_time
 from digest_alerts import build_digest_alert_keyboard, process_pending_digest_alerts
 from watchdog import WATCHDOG_CHECK_INTERVAL_SECONDS, run_watchdog_loop
+from bot_help import (
+    BOT_COMMANDS,
+    HELP_TEXT,
+    SETTINGS_TEXT,
+    WELCOME_TEXT,
+    build_help_keyboard,
+    build_main_menu_keyboard,
+    build_settings_keyboard,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -1320,15 +1329,6 @@ async def handle_digest_deep_link(message: types.Message, payload: str) -> bool:
     return False
 
 
-WELCOME_TEXT = (
-    "Привет! Я готов.\n\n"
-    "1️⃣ Перешли мне любое сообщение, чтобы отложить его или сохранить в базу знаний.\n"
-    "2️⃣ Перешли пост из открытого канала или пришли ссылку на него (t.me/…, @ник), чтобы подписаться на дайджест.\n"
-    "3️⃣ Напиши /list для задач, /list_digest для дайджестов или /saved для Избранного.\n"
-    "4️⃣ Доставленное напоминание можно отложить кнопкой «⏰ Отложить» или ответить на него текстом: "
-    "«завтра 11», «24/09 в 9», «через 2 дня».\n"
-    "5️⃣ Дайджесты можно получать на почту вместо Telegram — /email."
-)
 
 
 async def push_screen(state: FSMContext, screen_name: str, **kwargs):
@@ -1411,16 +1411,16 @@ async def render_screen(chat_id: int, screen: dict, target: types.Message | type
     else:
         await state.clear()
         if isinstance(target, types.CallbackQuery):
-            await target.message.answer(WELCOME_TEXT)
+            await target.message.answer(WELCOME_TEXT, reply_markup=build_main_menu_keyboard())
             await target.answer()
         else:
-            await target.answer(WELCOME_TEXT)
+            await target.answer(WELCOME_TEXT, reply_markup=build_main_menu_keyboard())
 
 
-@dp.message(Command("home"), StateFilter("*"))
+@dp.message(Command("home", "cancel"), StateFilter("*"))
 async def cmd_home(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer(WELCOME_TEXT, parse_mode="HTML")
+    await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=build_main_menu_keyboard())
 
 
 @dp.message(Command("back"), StateFilter("*"))
@@ -1430,16 +1430,16 @@ async def cmd_back(message: types.Message, state: FSMContext):
         await render_screen(message.chat.id, prev, message, state)
     else:
         await state.clear()
-        await message.answer(WELCOME_TEXT, parse_mode="HTML")
+        await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=build_main_menu_keyboard())
 
 
 @dp.callback_query(F.data == "flow_home")
 async def callback_home(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     try:
-        await callback.message.edit_text(WELCOME_TEXT, parse_mode="HTML")
+        await callback.message.edit_text(WELCOME_TEXT, parse_mode="HTML", reply_markup=build_main_menu_keyboard())
     except TelegramAPIError:
-        await callback.message.answer(WELCOME_TEXT, parse_mode="HTML")
+        await callback.message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=build_main_menu_keyboard())
         try:
             await callback.message.delete()
         except TelegramAPIError:
@@ -1455,9 +1455,9 @@ async def callback_back(callback: types.CallbackQuery, state: FSMContext):
     else:
         await state.clear()
         try:
-            await callback.message.edit_text(WELCOME_TEXT, parse_mode="HTML")
+            await callback.message.edit_text(WELCOME_TEXT, parse_mode="HTML", reply_markup=build_main_menu_keyboard())
         except TelegramAPIError:
-            await callback.message.answer(WELCOME_TEXT, parse_mode="HTML")
+            await callback.message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=build_main_menu_keyboard())
             try:
                 await callback.message.delete()
             except TelegramAPIError:
@@ -1470,73 +1470,58 @@ async def cmd_start(message: types.Message, state: FSMContext, command: CommandO
     await state.clear()
     if command.args and await handle_digest_deep_link(message, command.args.strip()):
         return
-    keyboard = []
-    if email_digest.is_enabled():
-        keyboard.append([InlineKeyboardButton(text="📧 Дайджест на почту", callback_data="email_menu")])
-    keyboard.append([InlineKeyboardButton(text="⚙️ Время и пояс", callback_data="prefs_menu")])
-    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
-    await message.answer(WELCOME_TEXT, reply_markup=markup)
+    await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=build_main_menu_keyboard())
 
 
-@dp.message(Command("help"))
+@dp.message(Command("help"), StateFilter("*"))
 async def cmd_help(message: types.Message, state: FSMContext):
     await state.clear()
-    help_text = (
-        "ℹ️ <b>Справка по командам бота:</b>\n\n"
-        "🟢 <b>Основные команды:</b>\n"
-        "/start — Перезапустить бота\n"
-        "/help — Показать эту справку\n"
-        "/home — Сбросить текущее действие и вернуться в главное меню\n"
-        "/back — Вернуться на один шаг назад во всех меню\n"
-        "/prefs — ⚙️ Настройки времени и часового пояса\n\n"
-        "📅 <b>Напоминания (Задачи):</b>\n"
-        "/list — Список напоминаний с фильтром по тегам\n"
-        "💡 <i>Перешлите любое сообщение или напишите текст, чтобы запланировать его.</i>\n"
-        "💡 <i>В меню напоминания можно перенести время, сменить тег, перенести в закладки или удалить.</i>\n\n"
-        "✍️ <b>Быстрые команды (ответом на доставленное напоминание):</b>\n"
-        "Ответьте на сообщение напоминания одной из команд:\n"
-        "• <code>/morning</code> — на ближайшее утро (по вашим часам)\n"
-        "• <code>/day</code> — на ближайший день (по вашим часам)\n"
-        "• <code>/evening</code> — на ближайший вечер (по вашим часам)\n"
-        "• <code>/later</code> (или <code>/l</code>) — отложить на 3 часа\n"
-        "• <code>/at 24.09 18:30</code> — отложить на точное время\n"
-        "• или просто ответьте текстом: <i>завтра 11</i>, <i>24/09 в 9</i>, <i>через 2 дня</i>, <i>в пятницу в 10</i>\n"
-        "• <code>/save</code> (или <code>/s</code>) — сохранить в базу знаний\n"
-        "• <code>/delete</code> (или <code>/d</code>) — удалить напоминание\n\n"
-        "📁 <b>База знаний (Закладки):</b>\n"
-        "/saved — Открыть базу знаний с удобными папками и страницами\n"
-        "💡 <i>Вы можете переносить закладки в другие категории, превращать в задачи или удалять через меню действий.</i>\n\n"
-        "📡 <b>Подписки и Дайджесты:</b>\n"
-        "/list_digest — Посмотреть и настроить мои подписки\n"
-        "/test_digest — Мгновенно собрать дайджест по подпискам за 24ч\n"
-        "/check — Проверить, что все каналы читаются\n"
-        "/email — Получать дайджесты на почту вместо Telegram (по типам)\n"
-        "💡 <i>Перешлите пост из открытого канала или пришлите ссылку на него (t.me/канал, t.me/s/канал, @канал), чтобы подписаться.</i>\n"
-        "💡 <i>В «Мои подписки» можно ставить каналы на паузу, раскладывать по папкам и спрашивать ИИ про частоту постинга и саммари.</i>\n"
-        "ℹ️ <i>Большие дайджесты (4+ постов) приходят одной ссылкой на Telegraph.</i>\n\n"
-        "💾 <b>Бэкап и перенос:</b>\n"
-        "/export — Выгрузить напоминания, закладки и подписки в JSON\n"
-        "/import — Загрузить JSON-файл, чтобы восстановить данные"
+    await message.answer(HELP_TEXT, parse_mode="HTML", reply_markup=build_help_keyboard())
+
+
+@dp.callback_query(F.data == "help_full")
+async def callback_help(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await edit_or_answer(callback, HELP_TEXT, reply_markup=build_help_keyboard())
+    await callback.answer()
+
+
+@dp.message(Command("settings"), StateFilter("*"))
+async def cmd_settings(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        SETTINGS_TEXT,
+        parse_mode="HTML",
+        reply_markup=build_settings_keyboard(email_digest.is_enabled()),
     )
-    await message.answer(help_text, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "settings_menu")
+async def callback_settings(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await edit_or_answer(callback, SETTINGS_TEXT, reply_markup=build_settings_keyboard(email_digest.is_enabled()))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "menu_rem")
+async def callback_menu_reminders(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if not get_user_messages(callback.message.chat.id):
+        await callback.answer("📭 Напоминаний нет. Перешли сообщение или напиши текст — отложу его.", show_alert=True)
+        return
+    await push_screen(state, "rem_list", tag=None, page=1)
+    await render_rem_list_screen(callback.message.chat.id, None, 1, callback, state)
+
+
+@dp.callback_query(F.data == "menu_kb")
+async def callback_menu_bookmarks(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await push_screen(state, "kb_tags")
+    await render_kb_tags_screen(callback.message.chat.id, callback, state)
 
 
 async def set_bot_commands(bot: Bot):
-    commands = [
-        types.BotCommand(command="start", description="Начать работу"),
-        types.BotCommand(command="help", description="ℹ️ Справка по всем командам"),
-        types.BotCommand(command="prefs", description="⚙️ Время и пояс"),
-        types.BotCommand(command="list", description="📅 Мои напоминания"),
-        types.BotCommand(command="list_digest", description="📡 Мои подписки"),
-        types.BotCommand(command="saved", description="📁 База знаний (закладки)"),
-        types.BotCommand(command="test_digest", description="⏳ Собрать дайджест за 24ч"),
-        types.BotCommand(command="check", description="🔎 Проверить подписки"),
-        types.BotCommand(command="email", description="📧 Дайджест на почту"),
-        types.BotCommand(command="export", description="📤 Экспорт данных (JSON)"),
-        types.BotCommand(command="import", description="📥 Импорт данных (JSON)"),
-        types.BotCommand(command="home", description="🏠 В главное меню"),
-        types.BotCommand(command="back", description="🔙 Шаг назад"),
-    ]
+    commands = [types.BotCommand(command=name, description=text) for name, text in BOT_COMMANDS]
     await bot.set_my_commands(commands)
 
 
