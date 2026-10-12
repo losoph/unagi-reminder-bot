@@ -118,8 +118,31 @@ def _build_post_node(post: dict, max_chars: int | None = None) -> dict:
     return {"tag": "p", "children": children or [" "]}
 
 
-def build_content(sections: list[dict]) -> list:
-    """Convert digest sections into Telegraph Node objects (plain text, no HTML)."""
+def _build_actions_node(actions: dict) -> dict | None:
+    """«🚫 Отписаться · ↪️ Перенести: в ежедневный · в ежемесячный» under a channel."""
+    children: list = []
+    unsubscribe_url = actions.get("unsubscribe")
+    if unsubscribe_url:
+        children.append({"tag": "a", "attrs": {"href": unsubscribe_url}, "children": ["🚫 Отписаться"]})
+    moves = [(label, url) for label, url in actions.get("move") or [] if url]
+    if moves:
+        if children:
+            children.append(" · ")
+        children.append("↪️ Перенести: ")
+        for index, (label, url) in enumerate(moves):
+            if index:
+                children.append(" · ")
+            children.append({"tag": "a", "attrs": {"href": url}, "children": [label]})
+    return {"tag": "p", "children": children} if children else None
+
+
+def build_content(sections: list[dict], *, with_actions: bool = False) -> list:
+    """Convert digest sections into Telegraph Node objects (plain text, no HTML).
+
+    ``with_actions`` adds per-channel «Отписаться / Перенести» links from
+    ``section["actions"]``. Only for private delivery (email): a Telegraph page is
+    public and must not carry subscription controls.
+    """
     nodes: list = _build_summary(sections)
     for section in sections:
         title = section.get("title") or "Канал"
@@ -137,6 +160,10 @@ def build_content(sections: list[dict]) -> list:
                     {"tag": "a", "attrs": {"href": ch_url}, "children": [f"▫️ ещё {post_str} в канале"]}
                 ],
             })
+        if with_actions and section.get("actions"):
+            actions_node = _build_actions_node(section["actions"])
+            if actions_node:
+                nodes.append(actions_node)
         nodes.append({"tag": "hr"})
     return nodes
 

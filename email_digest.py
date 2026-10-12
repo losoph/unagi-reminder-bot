@@ -160,13 +160,20 @@ def build_digest_email(
     *,
     telegraph_url: str | None = None,
     manage_url: str | None = None,
+    settings_url: str | None = None,
 ) -> tuple[str, str]:
-    """Return (html, plain_text) bodies for a digest."""
-    body = render_nodes(build_content(sections))
+    """Return (html, plain_text) bodies for a digest.
+
+    ``section["actions"]`` (optional) adds per-channel «Отписаться / Перенести» deep links:
+    ``{"unsubscribe": url, "move": [(label, url), ...]}``.
+    """
+    body = render_nodes(build_content(sections, with_actions=True))
     top = ""
     if telegraph_url:
         top = f'<p style="{_TAG_STYLES["p"]}">📖 {_link(telegraph_url, "Открыть в Telegraph")}</p>'
     footer = "Дайджест из Telegram-бота Unagi."
+    if settings_url:
+        footer += f" {_link(settings_url, 'Настройки подписок')}"
     if manage_url:
         footer += f" {_link(manage_url, 'Получать в Telegram вместо почты')}"
     html_body = (
@@ -200,7 +207,15 @@ def build_digest_email(
 
             post_str = plural_ru(omitted_count, "пост", "поста", "постов")
             lines.append(f"- ещё {post_str}: https://t.me/{ch_user}")
+        actions = section.get("actions") or {}
+        if actions.get("unsubscribe"):
+            lines.append(f"Отписаться: {actions['unsubscribe']}")
+        for label, url in actions.get("move") or []:
+            if url:
+                lines.append(f"Перенести {label}: {url}")
         lines.append("")
+    if settings_url:
+        lines.append(f"Настройки подписок: {settings_url}")
     if manage_url:
         lines.append(f"Получать в Telegram вместо почты: {manage_url}")
     return html_body, "\n".join(lines)

@@ -1043,12 +1043,38 @@ async def send_telegram_digest(user_id: int, title_plain: str, sections: list[di
     await send_digest_chunks(user_id, render_digest_lines(title_plain, sections))
 
 
+def build_section_actions(section: dict) -> dict | None:
+    """Deep links «Отписаться» and «Перенести в …» for one channel of an emailed digest.
+
+    Same payloads as the links in a Telegram digest (du_/dm_), so a tap in the letter opens
+    the bot and acts at once. None when the bot username is unknown.
+    """
+    sub_id = section.get("sub_id")
+    if sub_id is None:
+        return None
+    unsubscribe_url = build_bot_deep_link(f"du_{sub_id}")
+    if not unsubscribe_url:
+        return None
+    moves = [
+        (f"в {_PERIOD_TITLES[period].lower()}", build_bot_deep_link(f"dm_{sub_id}_{period}"))
+        for period in ("daily", "weekly", "monthly")
+        if period != section.get("period")
+    ]
+    return {"unsubscribe": unsubscribe_url, "move": moves}
+
+
 async def send_digest_email(address: str, title_plain: str, sections: list[dict]) -> bool:
     """Email delivery of a digest; never raises."""
     try:
         title = f"{title_plain} — {local_now().strftime('%d.%m.%Y')}"
         manage_url = build_bot_deep_link("em_off")
-        html_body, text_body = email_digest.build_digest_email(title, sections, manage_url=manage_url)
+        email_sections = [{**section, "actions": build_section_actions(section)} for section in sections]
+        html_body, text_body = email_digest.build_digest_email(
+            title,
+            email_sections,
+            manage_url=manage_url,
+            settings_url=build_bot_deep_link("ds"),
+        )
         return await email_digest.send_email(address, title, text_body, html_body, unsubscribe_url=manage_url)
     except Exception:
         logger.exception("Email digest to %s failed", address.split("@", 1)[-1])

@@ -83,6 +83,72 @@ class DigestEmailRenderingTests(unittest.TestCase):
         self.assertIn("- Пост\n  https://t.me/second/7", text_body)
 
 
+class EmailChannelActionsTests(unittest.TestCase):
+    """«Отписаться / Перенести» под каждым каналом — только в письме, не на публичной Telegraph-странице."""
+
+    ACTIONS = {
+        "unsubscribe": "https://t.me/bot?start=du_5",
+        "move": [("в еженедельный", "https://t.me/bot?start=dm_5_weekly"), ("в ежемесячный", "https://t.me/bot?start=dm_5_monthly")],
+    }
+
+    def sections(self):
+        return [{**SECTIONS[1], "sub_id": 5, "period": "daily", "actions": self.ACTIONS}]
+
+    def test_email_renders_actions_in_html_and_text(self):
+        html_body, text_body = email_digest.build_digest_email(
+            "Газета", self.sections(), settings_url="https://t.me/bot?start=ds"
+        )
+        checker = TagBalanceChecker()
+        checker.feed(html_body)
+        checker.close()
+        self.assertEqual(checker.errors, [])
+        for url in ("https://t.me/bot?start=du_5", "https://t.me/bot?start=dm_5_weekly",
+                    "https://t.me/bot?start=dm_5_monthly", "https://t.me/bot?start=ds"):
+            self.assertIn(url, checker.hrefs)
+        self.assertIn("🚫 Отписаться", html_body)
+        self.assertIn("Перенести", html_body)
+        self.assertIn("Отписаться: https://t.me/bot?start=du_5", text_body)
+        self.assertIn("Перенести в еженедельный: https://t.me/bot?start=dm_5_weekly", text_body)
+
+    def test_telegraph_page_has_no_actions(self):
+        from telegraph_publisher import build_content
+
+        rendered = repr(build_content(self.sections()))
+        self.assertNotIn("du_5", rendered)
+        self.assertNotIn("Отписаться", rendered)
+
+    def test_section_actions_use_bot_deep_links(self):
+        with mock.patch.object(main, "BOT_USERNAME", "unagi_bot"):
+            actions = main.build_section_actions({"sub_id": 7, "period": "weekly"})
+        self.assertEqual(actions["unsubscribe"], "https://t.me/unagi_bot?start=du_7")
+        self.assertEqual(
+            actions["move"],
+            [
+                ("в ежедневный", "https://t.me/unagi_bot?start=dm_7_daily"),
+                ("в ежемесячный", "https://t.me/unagi_bot?start=dm_7_monthly"),
+            ],
+        )
+        for _, url in actions["move"]:
+            self.assertLessEqual(len(url.split("start=", 1)[1]), 64)
+
+    def test_section_actions_need_bot_username(self):
+        with mock.patch.object(main, "BOT_USERNAME", ""):
+            self.assertIsNone(main.build_section_actions({"sub_id": 7, "period": "weekly"}))
+
+    def test_send_digest_email_adds_actions(self):
+        sent = mock.AsyncMock(return_value=True)
+        with mock.patch.object(main, "BOT_USERNAME", "unagi_bot"), \
+                mock.patch.object(email_digest, "send_email", sent):
+            ok = asyncio.run(main.send_digest_email(
+                "a@example.com", "Газета", [{"sub_id": 9, "period": "daily", "title": "K", "posts": SECTIONS[1]["posts"]}]
+            ))
+        self.assertTrue(ok)
+        html_body = sent.call_args.args[3]
+        self.assertIn("https://t.me/unagi_bot?start=du_9", html_body)
+        self.assertIn("https://t.me/unagi_bot?start=dm_9_weekly", html_body)
+        self.assertIn("https://t.me/unagi_bot?start=ds", html_body)
+
+
 class PluralTests(unittest.TestCase):
     def test_russian_plural_forms(self):
         from telegraph_publisher import describe_counts
