@@ -1,13 +1,25 @@
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 
 from scraper import ChannelFetchError, get_latest_posts
 
 logger = logging.getLogger(__name__)
+
+FEED_METRICS_STALE_THRESHOLDS: dict[str, float] = {
+    "day": 1800.0,       # 30 min
+    "daily": 1800.0,
+    "день": 1800.0,
+    "week": 10800.0,     # 3 h
+    "weekly": 10800.0,
+    "неделя": 10800.0,
+    "month": 43200.0,    # 12 h
+    "monthly": 43200.0,
+    "месяц": 43200.0,
+}
 
 
 class HybridChannelSource:
@@ -21,6 +33,7 @@ class HybridChannelSource:
         self.web_fallback = os.getenv("MTPROTO_WEB_FALLBACK", "true").lower() in {"1", "true", "yes"}
         self.fetch_limit = max(20, int(os.getenv("MTPROTO_FETCH_LIMIT", "1000")))
         self._client = None
+        self.account_id: int | None = None
 
         if self.mode not in {"auto", "mtproto", "web"}:
             raise ValueError("CHANNEL_SOURCE must be one of: auto, mtproto, web")
@@ -57,6 +70,7 @@ class HybridChannelSource:
             if not await self._client.is_user_authorized():
                 raise RuntimeError("TELEGRAM_USER_SESSION is not authorized")
             me = await self._client.get_me()
+            self.account_id = getattr(me, "id", None)
             logger.info("Channel source: MTProto user %s", getattr(me, "id", "unknown"))
         except Exception:
             if self._client is not None:
@@ -124,9 +138,15 @@ class HybridChannelSource:
         except Exception:
             logger.debug("Failed to update subscriber count for @%s", clean_username, exc_info=True)
 
+        found_channel_id = None
         try:
             async for message in self._client.iter_messages(clean_username, limit=self.fetch_limit):
                 inspected += 1
+                if found_channel_id is None:
+                    peer_id = getattr(message, "peer_id", None)
+                    cid = getattr(peer_id, "channel_id", None)
+                    if cid is not None:
+                        found_channel_id = cid
                 post_time = message.date
                 if post_time.tzinfo is None:
                     post_time = post_time.replace(tzinfo=timezone.utc)
@@ -146,6 +166,14 @@ class HybridChannelSource:
                 reactions_total, reactions_json = self._extract_reactions(message)
                 metrics_at = datetime.now(timezone.utc)
 
+                fwd_from = getattr(message, "fwd_from", None)
+                fwd_from_channel_id = None
+                fwd_from_post_id = None
+                if fwd_from is not None:
+                    from_id = getattr(fwd_from, "from_id", None)
+                    fwd_from_channel_id = getattr(from_id, "channel_id", None)
+                    fwd_from_post_id = getattr(fwd_from, "channel_post", None)
+
                 posts.append(
                     {
                         "id": message.id,
@@ -158,8 +186,18 @@ class HybridChannelSource:
                         "forwards": forwards,
                         "replies": replies,
                         "metrics_at": metrics_at,
+                        "fwd_from_channel_id": fwd_from_channel_id,
+                        "fwd_from_post_id": fwd_from_post_id,
                     }
                 )
+
+            if found_channel_id is not None:
+                try:
+                    from data.database import update_channel_id
+
+                    update_channel_id(clean_username, found_channel_id)
+                except Exception:
+                    logger.debug("Failed to update channel_id for @%s", clean_username, exc_info=True)
         except Exception as exc:
             try:
                 from telethon.errors import (
@@ -188,6 +226,103 @@ class HybridChannelSource:
         posts.reverse()
         logger.info("MTProto channel @%s produced %s new posts", clean_username, len(posts))
         return posts
+
+    async def refresh_metrics(
+        self,
+        channel_username: str,
+        post_ids: list[int],
+        *,
+        period: str | None = None,
+        stale_threshold_seconds: float | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """Обновить views, forwards, replies, metrics_at для постов канала через GetMessagesViewsRequest.
+
+        Батчами по <=100 сообщений.
+        Обновляет только посты, metrics_at которых старше порога.
+        При ошибках (в т.ч. FloodWait) логирует WARNING и прекращает обновление этого канала.
+        Без MTProto (web) — обновление пропускается (возвращает 0).
+        """
+        if self._client is None or not callable(self._client):
+            return 0
+        if not post_ids:
+            return 0
+
+        clean_username = channel_username.lstrip("@")
+        from data.database import get_stale_metric_post_ids, update_post_metrics, utc_now
+
+        now_dt = now or utc_now()
+        threshold: float | None = None
+        if stale_threshold_seconds is not None:
+            threshold = stale_threshold_seconds
+        elif period:
+            threshold = FEED_METRICS_STALE_THRESHOLDS.get(period.lower(), 1800.0)
+
+        if threshold is not None:
+            cutoff = now_dt - timedelta(seconds=threshold)
+            stale_ids = get_stale_metric_post_ids(clean_username, post_ids, cutoff)
+        else:
+            stale_ids = list(post_ids)
+
+        if not stale_ids:
+            return 0
+
+        batch_size = 100
+        total_updated = 0
+
+        for i in range(0, len(stale_ids), batch_size):
+            batch = stale_ids[i : i + batch_size]
+            try:
+                from telethon.tl.functions.messages import GetMessagesViewsRequest
+
+                req = GetMessagesViewsRequest(peer=clean_username, id=batch, increment=False)
+                result = await self._client(req)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to refresh metrics for @%s: %s; aborting refresh for this channel",
+                    clean_username,
+                    exc,
+                )
+                break
+
+            views_list = getattr(result, "views", None)
+            if views_list is None and isinstance(result, list):
+                views_list = result
+            elif views_list is None:
+                views_list = []
+
+            metrics_to_update = []
+            for post_id, v in zip(batch, views_list):
+                if isinstance(v, dict):
+                    v_views = v.get("views")
+                    v_forwards = v.get("forwards")
+                    v_replies = v.get("replies")
+                else:
+                    v_views = getattr(v, "views", None)
+                    v_forwards = getattr(v, "forwards", None)
+                    replies_obj = getattr(v, "replies", None)
+                    if replies_obj is not None:
+                        if isinstance(replies_obj, int):
+                            v_replies = replies_obj
+                        else:
+                            v_replies = getattr(replies_obj, "replies", None)
+                    else:
+                        v_replies = None
+                metrics_to_update.append(
+                    {
+                        "post_id": post_id,
+                        "views": v_views,
+                        "forwards": v_forwards,
+                        "replies": v_replies,
+                        "metrics_at": now_dt,
+                    }
+                )
+
+            if metrics_to_update:
+                update_post_metrics(clean_username, metrics_to_update)
+                total_updated += len(metrics_to_update)
+
+        return total_updated
 
     async def fetch(
         self,

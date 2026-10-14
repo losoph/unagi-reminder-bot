@@ -332,6 +332,8 @@ def init_db():
                 forwards INTEGER,
                 replies INTEGER,
                 metrics_at DATETIME,
+                fwd_from_channel_id INTEGER,
+                fwd_from_post_id INTEGER,
                 PRIMARY KEY (channel_username, post_id)
             )
             '''
@@ -341,7 +343,9 @@ def init_db():
             CREATE TABLE IF NOT EXISTS channels (
                 channel_username TEXT PRIMARY KEY,
                 subscribers_count INTEGER,
-                subscribers_updated_at DATETIME
+                subscribers_updated_at DATETIME,
+                channel_id INTEGER,
+                feed_backfilled_at DATETIME
             )
             '''
         )
@@ -521,6 +525,10 @@ def init_db():
             "ALTER TABLE channel_posts ADD COLUMN metrics_at DATETIME",
             "ALTER TABLE channels ADD COLUMN last_scanned_at DATETIME",
             "ALTER TABLE channels ADD COLUMN last_scanned_post_id INTEGER",
+            "ALTER TABLE channel_posts ADD COLUMN fwd_from_channel_id INTEGER",
+            "ALTER TABLE channel_posts ADD COLUMN fwd_from_post_id INTEGER",
+            "ALTER TABLE channels ADD COLUMN channel_id INTEGER",
+            "ALTER TABLE channels ADD COLUMN feed_backfilled_at DATETIME",
             "ALTER TABLE user_alert_settings ADD COLUMN last_alert_sent_at DATETIME",
             "ALTER TABLE user_alert_settings ADD COLUMN consecutive_failures INTEGER DEFAULT 0",
         ):
@@ -1296,6 +1304,148 @@ def get_channel_scan_cursor(channel_username: str) -> tuple[str | None, int | No
         return row["last_scanned_at"], row["last_scanned_post_id"]
 
 
+def update_channel_id(channel_username: str, channel_id: int) -> None:
+    normalized = normalize_channel_username(channel_username)
+    with get_connection() as conn:
+        conn.execute(
+            '''
+            INSERT INTO channels (channel_username, channel_id)
+            VALUES (?, ?)
+            ON CONFLICT(channel_username) DO UPDATE SET
+                channel_id = COALESCE(excluded.channel_id, channels.channel_id)
+            ''',
+            (normalized, channel_id),
+        )
+        conn.commit()
+
+
+def get_channel_id(channel_username: str) -> int | None:
+    normalized = normalize_channel_username(channel_username)
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT channel_id FROM channels WHERE channel_username = ?",
+            (normalized,),
+        ).fetchone()
+        return row["channel_id"] if row and row["channel_id"] is not None else None
+
+
+def set_channel_feed_backfilled_at(
+    channel_username: str,
+    backfilled_at: datetime | str | None,
+) -> None:
+    normalized = normalize_channel_username(channel_username)
+    if isinstance(backfilled_at, datetime):
+        val = serialize_datetime(backfilled_at)
+    else:
+        val = backfilled_at
+    with get_connection() as conn:
+        conn.execute(
+            '''
+            INSERT INTO channels (channel_username, feed_backfilled_at)
+            VALUES (?, ?)
+            ON CONFLICT(channel_username) DO UPDATE SET
+                feed_backfilled_at = COALESCE(excluded.feed_backfilled_at, channels.feed_backfilled_at)
+            ''',
+            (normalized, val),
+        )
+        conn.commit()
+
+
+def get_channel_feed_backfilled_at(channel_username: str) -> str | None:
+    normalized = normalize_channel_username(channel_username)
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT feed_backfilled_at FROM channels WHERE channel_username = ?",
+            (normalized,),
+        ).fetchone()
+        return row["feed_backfilled_at"] if row else None
+
+
+def update_post_metrics(channel_username: str, metrics: list[dict]) -> int:
+    """Обновить views, forwards, replies, metrics_at для постов канала.
+
+    Реакции не затрагиваются (инвариант T21).
+    metrics: список словарей с post_id, views, forwards, replies, metrics_at.
+    """
+    normalized = normalize_channel_username(channel_username)
+    if not metrics:
+        return 0
+    rows = []
+    for m in metrics:
+        pid = m.get("post_id") if m.get("post_id") is not None else m.get("id")
+        if pid is None:
+            continue
+        m_at = m.get("metrics_at")
+        if isinstance(m_at, datetime):
+            m_at_str = serialize_datetime(m_at)
+        elif isinstance(m_at, str):
+            m_at_str = m_at
+        else:
+            m_at_str = serialize_datetime(utc_now())
+        rows.append((
+            m.get("views"),
+            m.get("forwards"),
+            m.get("replies"),
+            m_at_str,
+            normalized,
+            int(pid),
+        ))
+    if not rows:
+        return 0
+    with get_connection() as conn:
+        before = conn.total_changes
+        conn.executemany(
+            '''
+            UPDATE channel_posts
+            SET views = COALESCE(?, views),
+                forwards = COALESCE(?, forwards),
+                replies = COALESCE(?, replies),
+                metrics_at = ?
+            WHERE channel_username = ? AND post_id = ?
+            ''',
+            rows,
+        )
+        changed = conn.total_changes - before
+        conn.commit()
+    return changed
+
+
+def get_stale_metric_post_ids(
+    channel_username: str,
+    post_ids: list[int],
+    cutoff: datetime | str,
+) -> list[int]:
+    """Вернуть из post_ids только те id, у которых metrics_at IS NULL или <= cutoff."""
+    normalized = normalize_channel_username(channel_username)
+    if not post_ids:
+        return []
+    cutoff_str = serialize_datetime(cutoff) if isinstance(cutoff, datetime) else str(cutoff)
+    chunk_size = 500
+    found: dict[int, str | None] = {}
+    with get_connection() as conn:
+        for i in range(0, len(post_ids), chunk_size):
+            chunk = post_ids[i : i + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f'''
+                SELECT post_id, metrics_at FROM channel_posts
+                WHERE channel_username = ? AND post_id IN ({placeholders})
+                ''',
+                (normalized, *chunk),
+            ).fetchall()
+            for r in rows:
+                found[r["post_id"]] = r["metrics_at"]
+    stale = []
+    for pid in post_ids:
+        if pid not in found:
+            stale.append(pid)
+        else:
+            m_at = found[pid]
+            if not m_at or m_at <= cutoff_str:
+                stale.append(pid)
+    return stale
+
+
 def get_channel_backlog_count(
     channel_username: str,
     last_post_id: int | None = None,
@@ -1370,6 +1520,8 @@ def upsert_channel_posts(channel_username: str, posts: list[dict], source: str) 
             post.get("forwards"),
             post.get("replies"),
             serialize_datetime(post["metrics_at"]) if post.get("metrics_at") else None,
+            post.get("fwd_from_channel_id"),
+            post.get("fwd_from_post_id"),
         )
         for post in posts
         if post.get("id") is not None
@@ -1382,9 +1534,10 @@ def upsert_channel_posts(channel_username: str, posts: list[dict], source: str) 
             '''
             INSERT INTO channel_posts (
                 channel_username, post_id, post_text, post_link, post_time, source, created_at,
-                views, reactions_total, reactions_json, forwards, replies, metrics_at
+                views, reactions_total, reactions_json, forwards, replies, metrics_at,
+                fwd_from_channel_id, fwd_from_post_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_username, post_id) DO UPDATE SET
                 post_text = excluded.post_text,
                 post_link = excluded.post_link,
@@ -1395,7 +1548,9 @@ def upsert_channel_posts(channel_username: str, posts: list[dict], source: str) 
                 reactions_json = CASE WHEN excluded.metrics_at IS NOT NULL THEN excluded.reactions_json ELSE channel_posts.reactions_json END,
                 forwards = CASE WHEN excluded.metrics_at IS NOT NULL THEN excluded.forwards ELSE channel_posts.forwards END,
                 replies = CASE WHEN excluded.metrics_at IS NOT NULL THEN excluded.replies ELSE channel_posts.replies END,
-                metrics_at = CASE WHEN excluded.metrics_at IS NOT NULL THEN excluded.metrics_at ELSE channel_posts.metrics_at END
+                metrics_at = CASE WHEN excluded.metrics_at IS NOT NULL THEN excluded.metrics_at ELSE channel_posts.metrics_at END,
+                fwd_from_channel_id = COALESCE(excluded.fwd_from_channel_id, channel_posts.fwd_from_channel_id),
+                fwd_from_post_id = COALESCE(excluded.fwd_from_post_id, channel_posts.fwd_from_post_id)
             ''',
             rows,
         )
@@ -2892,10 +3047,14 @@ def get_feed_candidate_posts(
                 cp.forwards,
                 cp.replies,
                 cp.metrics_at,
+                cp.fwd_from_channel_id,
+                cp.fwd_from_post_id,
+                c.channel_id,
                 fs.channel_title,
                 fs.tag
             FROM channel_posts cp
             JOIN feed_subscriptions fs ON fs.channel_username = cp.channel_username
+            LEFT JOIN channels c ON c.channel_username = cp.channel_username
             WHERE fs.user_id = ?
               AND fs.is_paused = 0
               AND cp.post_time > ?
@@ -2930,6 +3089,9 @@ def get_feed_candidate_posts(
             "replies": row["replies"],
             "metrics_at": row["metrics_at"],
             "source": row["source"],
+            "channel_id": row["channel_id"],
+            "fwd_from_channel_id": row["fwd_from_channel_id"],
+            "fwd_from_post_id": row["fwd_from_post_id"],
         })
     return result
 

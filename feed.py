@@ -5,8 +5,11 @@ This module provides the aiogram Router for /feed, channel management, tags, and
 Never imports main to avoid circular dependencies (pattern T14b).
 """
 
+import asyncio
+from datetime import datetime, timedelta
 import html
 import logging
+import os
 from typing import Any
 
 from aiogram import F, Router, types
@@ -20,14 +23,22 @@ from data.database import (
     add_feed_subscription,
     count_feed_subscriptions,
     delete_feed_subscription,
+    get_channel_feed_backfilled_at,
+    get_channel_scan_cursor,
     get_feed_subscription,
     get_subscription_by_id,
     list_feed_subscriptions,
     list_feed_tags,
     normalize_channel_username,
     normalize_feed_tag,
+    parse_db_datetime,
+    serialize_datetime,
+    set_channel_feed_backfilled_at,
     set_feed_paused,
     set_feed_tag,
+    update_channel_scan_cursor,
+    upsert_channel_posts,
+    utc_now,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,26 +48,168 @@ router = Router(name="feed")
 _bot: Any = None
 _channel_source: Any = None
 _backfill_hook: Any = None
+_fetch_semaphore: asyncio.Semaphore | None = None
+_backfill_tasks: dict[str, asyncio.Task] = {}
+_user_build_locks: dict[int, asyncio.Lock] = {}
 
 
-def configure(bot: Any = None, channel_source: Any = None, backfill_hook: Any = None) -> None:
-    """Inject bot, channel source and backfill hook without importing main."""
-    global _bot, _channel_source, _backfill_hook
+def get_fetch_semaphore() -> asyncio.Semaphore:
+    """Return shared fetch semaphore with DIGEST_FETCH_CONCURRENCY limit."""
+    global _fetch_semaphore
+    if _fetch_semaphore is None:
+        concurrency = int(os.getenv("DIGEST_FETCH_CONCURRENCY", "5"))
+        _fetch_semaphore = asyncio.Semaphore(concurrency)
+    return _fetch_semaphore
+
+
+def get_user_build_lock(user_id: int) -> asyncio.Lock:
+    """Ensure at most one feed build per user concurrently."""
+    if user_id not in _user_build_locks:
+        _user_build_locks[user_id] = asyncio.Lock()
+    return _user_build_locks[user_id]
+
+
+def configure(
+    bot: Any = None,
+    channel_source: Any = None,
+    backfill_hook: Any = None,
+    fetch_semaphore: Any = None,
+) -> None:
+    """Inject bot, channel source, backfill hook and semaphore without importing main."""
+    global _bot, _channel_source, _backfill_hook, _fetch_semaphore
     if bot is not None:
         _bot = bot
     if channel_source is not None:
         _channel_source = channel_source
     if backfill_hook is not None:
         _backfill_hook = backfill_hook
+    if fetch_semaphore is not None:
+        _fetch_semaphore = fetch_semaphore
 
 
-def schedule_channel_backfill(channel_username: str) -> None:
+async def ingest_window(
+    channels: list[str] | set[str],
+    window_start: datetime | str,
+    *,
+    now: datetime | None = None,
+    is_backfill: bool = False,
+    channel_source: Any = None,
+    web_session: Any = None,
+) -> dict[str, list[dict]]:
+    """Load posts for channels within the given window.
+
+    marker = max(window_start, cursor) if cursor exists and history is backfilled,
+             else max(window_start, now - 30 days).
+    Cursor is advanced only if there are no holes (rule 1.7).
+    """
+    cs = channel_source if channel_source is not None else _channel_source
+    if cs is None:
+        logger.warning("ingest_window called without channel_source")
+        return {}
+
+    now_dt = now or utc_now()
+    if isinstance(window_start, str):
+        window_start_dt = parse_db_datetime(window_start)
+    else:
+        window_start_dt = window_start
+
+    sem = get_fetch_semaphore()
+    thirty_days_ago = now_dt - timedelta(days=30)
+
+    async def _ingest_one(raw_channel: str) -> tuple[str, list[dict]]:
+        clean_username = normalize_channel_username(raw_channel)
+        if not clean_username:
+            return raw_channel, []
+
+        backfilled_at = get_channel_feed_backfilled_at(clean_username)
+        cursor_str, _ = get_channel_scan_cursor(clean_username)
+
+        if backfilled_at is not None and cursor_str is not None:
+            cursor_dt = parse_db_datetime(cursor_str)
+            marker_dt = max(window_start_dt, cursor_dt)
+        else:
+            marker_dt = max(window_start_dt, thirty_days_ago)
+
+        marker_str = serialize_datetime(marker_dt)
+
+        try:
+            async with sem:
+                posts, source_name = await cs.fetch(clean_username, marker_str, web_session=web_session)
+        except Exception as exc:
+            logger.warning("Failed to fetch posts for feed channel @%s: %s", clean_username, exc)
+            return clean_username, []
+
+        try:
+            upsert_channel_posts(clean_username, posts, source_name)
+        except Exception as exc:
+            logger.warning("Failed to upsert channel posts for @%s: %s", clean_username, exc)
+            return clean_username, posts
+
+        # Mark backfilled if full 30-day window was fetched
+        if is_backfill or marker_dt <= thirty_days_ago:
+            try:
+                set_channel_feed_backfilled_at(clean_username, now_dt)
+            except Exception as exc:
+                logger.debug("Failed to set feed_backfilled_at for @%s: %s", clean_username, exc)
+
+        # Rule 1.7: Cursor movement without holes
+        if posts:
+            max_time = max(p["time"] for p in posts)
+            max_id = max((p["id"] for p in posts if p.get("id") is not None), default=None)
+            if cursor_str is not None:
+                cursor_dt = parse_db_datetime(cursor_str)
+                if marker_dt <= cursor_dt:
+                    # No hole: we fetched from <= cursor_dt up to now
+                    update_channel_scan_cursor(clean_username, max_time, max_id)
+                else:
+                    # Hole: marker_dt > cursor_dt. Rule 1.7: cursor must NOT be touched!
+                    pass
+            else:
+                # cursor_str is None: only advance cursor if full 30-day backfill
+                if is_backfill or marker_dt <= thirty_days_ago:
+                    update_channel_scan_cursor(clean_username, max_time, max_id)
+
+        return clean_username, posts
+
+    results = await asyncio.gather(*(_ingest_one(ch) for ch in channels))
+    return dict(results)
+
+
+def schedule_channel_backfill(channel_username: str) -> asyncio.Task | None:
     """Schedule background ingestion for a newly added feed channel (T21)."""
+    clean_username = normalize_channel_username(channel_username)
+    if not clean_username:
+        return None
+
     if _backfill_hook:
         try:
-            _backfill_hook(channel_username)
+            return _backfill_hook(clean_username)
         except Exception:
-            logger.exception("Failed to invoke channel backfill hook for @%s", channel_username)
+            logger.exception("Failed to invoke channel backfill hook for @%s", clean_username)
+            return None
+
+    existing = _backfill_tasks.get(clean_username)
+    if existing is not None and not existing.done():
+        logger.debug("Backfill already in progress for @%s", clean_username)
+        return existing
+
+    async def _runner():
+        try:
+            now = utc_now()
+            window_start = now - timedelta(days=30)
+            await ingest_window([clean_username], window_start, now=now, is_backfill=True)
+        except Exception as exc:
+            logger.warning("Background backfill failed for @%s: %s", clean_username, exc)
+        finally:
+            _backfill_tasks.pop(clean_username, None)
+
+    try:
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(_runner())
+        _backfill_tasks[clean_username] = task
+        return task
+    except RuntimeError:
+        return None
 
 
 class FeedTagState(StatesGroup):
