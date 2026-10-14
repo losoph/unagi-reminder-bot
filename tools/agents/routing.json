@@ -1,32 +1,99 @@
 {
   "candidates": {
-    "agy": ["gemini-3.8-flash-high", "gemini-3.8-pro"],
-    "opencode": ["Tokenn/gpt-6.1-sol", "Tokenn/gpt-5.6-sol"]
+    "agy": [
+      "gemini-3.8-flash-low",
+      "gemini-3.8-flash-medium",
+      "gemini-3.8-flash-high",
+      "claude-sonnet-4-6",
+      "claude-opus-4-6-thinking",
+      "gpt-oss-120b-medium"
+    ],
+    "opencode": [
+      "Tokenn/gpt-6.1-sol",
+      "Tokenn/gpt-6-sol",
+      "Tokenn/gpt-5.6-sol",
+      "Tokenn/codex-5.3",
+      "Tokenn/gpt-5.5",
+      "Tokenn/claude-opus-5",
+      "Tokenn/claude-opus-4-8",
+      "Tokenn/claude-sonnet-5",
+      "Tokenn/gemini-3.1-pro-preview",
+      "Tokenn/gemini-3.6-flash",
+      "Tokenn/gemini-3.5-flash"
+    ]
   },
   "tasks": {
     "executor-complex": {
-      "agy": {"model": "gemini-3.8-pro", "effort": "high", "reason": "Сложная реализация требует сильного рассуждения."},
-      "opencode": {"model": "Tokenn/gpt-6.1-sol", "effort": "high", "reason": "Сложная реализация требует сильного рассуждения."}
+      "agy": {
+        "model": "gemini-3.8-flash-high",
+        "effort": "high",
+        "reason": "Сложная реализация требует сильного рассуждения."
+      },
+      "opencode": {
+        "model": "Tokenn/gpt-6.1-sol",
+        "effort": "high",
+        "reason": "Сложная реализация требует сильного рассуждения."
+      }
     },
     "executor-ux": {
-      "agy": {"model": "gemini-3.8-flash-high", "effort": "medium", "reason": "Итеративная UX-задача с умеренной сложностью."},
-      "opencode": {"model": "Tokenn/gpt-6.1-sol", "effort": "medium", "reason": "UX требует сбалансированного решения."}
+      "agy": {
+        "model": "gemini-3.8-flash-high",
+        "effort": "medium",
+        "reason": "Итеративная UX-задача с умеренной сложностью."
+      },
+      "opencode": {
+        "model": "Tokenn/gpt-6.1-sol",
+        "effort": "medium",
+        "reason": "UX требует сбалансированного решения."
+      }
     },
     "review": {
-      "agy": {"model": "gemini-3.8-pro", "effort": "high", "reason": "Проверка должна охватывать сценарии и границы."},
-      "opencode": {"model": "Tokenn/gpt-6.1-sol", "effort": "high", "reason": "Независимое ревью с тщательной проверкой."}
+      "agy": {
+        "model": "gemini-3.8-flash-high",
+        "effort": "high",
+        "reason": "Проверка должна охватывать сценарии и границы."
+      },
+      "opencode": {
+        "model": "Tokenn/gpt-6.1-sol",
+        "effort": "high",
+        "reason": "Независимое ревью с тщательной проверкой."
+      }
     },
     "adversarial-review": {
-      "agy": {"model": "gemini-3.8-pro", "effort": "high", "reason": "Враждебное ревью ищет обходы и крайние случаи."},
-      "opencode": {"model": "Tokenn/gpt-6.1-sol", "effort": "high", "reason": "Враждебное ревью ищет обходы и крайние случаи."}
+      "agy": {
+        "model": "claude-sonnet-4-6",
+        "effort": "high",
+        "reason": "Враждебное ревью ищет обходы и крайние случаи."
+      },
+      "opencode": {
+        "model": "Tokenn/gpt-6.1-sol",
+        "effort": "high",
+        "reason": "Враждебное ревью ищет обходы и крайние случаи."
+      }
     },
     "docs": {
-      "agy": {"model": "gemini-3.8-flash-high", "effort": "low", "reason": "Документации достаточно быстрой недорогой модели."},
-      "opencode": {"model": "Tokenn/gpt-5.6-sol", "effort": "low", "reason": "Документация не требует максимального рассуждения."}
+      "agy": {
+        "model": "gemini-3.8-flash-medium",
+        "effort": "low",
+        "reason": "Документации достаточно быстрой недорогой модели."
+      },
+      "opencode": {
+        "model": "Tokenn/gpt-5.6-sol",
+        "effort": "low",
+        "reason": "Документация не требует максимального рассуждения."
+      }
     },
     "merge-audit": {
-      "agy": {"model": "gemini-3.8-pro", "effort": "high", "reason": "Аудит слияния требует проверки целостности."},
-      "opencode": {"model": "Tokenn/gpt-6.1-sol", "effort": "high", "reason": "Аудит слияния требует проверки целостности."}
+      "agy": {
+        "model": "claude-sonnet-4-6",
+        "effort": "high",
+        "reason": "Аудит слияния требует проверки целостности."
+      },
+      "opencode": {
+        "model": "Tokenn/gpt-6.1-sol",
+        "effort": "high",
+        "reason": "Аудит слияния требует проверки целостности."
+      }
     }
   }
 }

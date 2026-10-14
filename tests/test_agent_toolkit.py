@@ -51,10 +51,12 @@ class AgentToolkitTests(unittest.TestCase):
             env = os.environ | {"AGENT_ROUTE_LOG": str(log)}
             proc = self.run_cmd([str(TOOLS / "route.sh"), "agy", "docs", "Write docs"], env=env)
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn("model=gemini-3.8-flash-high effort=low", proc.stdout)
+            # Ожидание берётся из самой политики: тест проверяет механизм, а не конкретную модель.
+            expected = json.loads((TOOLS / "routing.json").read_text(encoding="utf-8"))["tasks"]["docs"]["agy"]
+            self.assertIn(f"model={expected['model']} effort={expected['effort']}", proc.stdout)
             row = json.loads(log.read_text(encoding="utf-8"))
             self.assertEqual(row["task_kind"], "docs")
-            self.assertEqual(row["model"], "gemini-3.8-flash-high")
+            self.assertEqual(row["model"], expected["model"])
             self.assertEqual(row["source"], "fallback")
 
     def test_route_rejects_external_model_and_falls_back(self):
