@@ -242,20 +242,20 @@ def _truncate_to_limit(content: list, max_bytes: int = _MAX_CONTENT_BYTES) -> li
     return content
 
 
-async def publish_digest(
+async def publish_page(
     title: str,
-    sections: list[dict],
+    nodes: list,
     *,
     session: aiohttp.ClientSession | None = None,
 ) -> str | None:
-    """Publish a digest to telegra.ph and return the page URL (or None on failure)."""
+    """Опубликовать готовые Telegraph-узлы и вернуть URL страницы."""
     global _ENV_TOKEN
     own_session = session is None
     if own_session:
         session = aiohttp.ClientSession(timeout=REQUEST_TIMEOUT)
     try:
         token = await _get_token(session)
-        content = _truncate_to_limit(build_content(sections))
+        content = _truncate_to_limit(nodes)
         payload = {
             "access_token": token,
             "title": (title or "Дайджест")[:256],
@@ -291,3 +291,13 @@ async def publish_digest(
     finally:
         if own_session and session is not None:
             await session.close()
+
+
+async def publish_digest(
+    title: str,
+    sections: list[dict],
+    *,
+    session: aiohttp.ClientSession | None = None,
+) -> str | None:
+    """Опубликовать дайджест, сохраняя прежние построение контента и поведение."""
+    return await publish_page(title, build_content(sections), session=session)
