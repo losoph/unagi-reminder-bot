@@ -98,7 +98,51 @@ class FeedRenderTests(unittest.TestCase):
 
     def test_post_count_and_channel_count_header(self):
         nodes = render_feed([item(1), item(2, channel="b")], period="week", now=NOW, channel_count=23)
-        self.assertEqual(nodes[0]["children"], ["2 постов из 23 каналов · отбор по охвату и пересылкам · окно 07.10–14.10"])
+        self.assertEqual(nodes[0]["children"], ["2 поста из 23 каналов · отбор по охвату и пересылкам · окно 07.10–14.10"])
+
+    def test_telegraph_text_is_not_html_escaped_and_counts_are_declined(self):
+        # Telegraph принимает текстовые узлы; буквальные &, < сохраняются, «1 пост из 1 канала».
+        entry = item(channel="lab")
+        entry.channel_title = "R&D <лаб>"
+        entry.tag = "R&D"
+        entry.post["channel_title"] = entry.channel_title
+        nodes = render_feed([entry], period="day", now=NOW)
+        self.assertIn("R&D <лаб>", repr(nodes))
+        self.assertNotIn("&amp;", repr(nodes))
+        self.assertNotIn("&lt;", repr(nodes))
+        self.assertEqual(nodes[0]["children"][0], "1 пост из 1 канала · отбор по охвату и пересылкам · окно 14.10")
+        self.assertIn("#R&D · 1", repr(nodes))
+
+    def test_timezone_changes_title_window_and_post_time(self):
+        # 2026-10-14 22:30 UTC = 15.10 01:30 Europe/Moscow; локальный день/окно должны перейти дату.
+        late = datetime(2026, 10, 14, 22, 30, tzinfo=timezone.utc)
+        entry = item()
+        entry.post["time"] = late
+        title = build_feed_title("day", late, tz="Europe/Moscow")
+        nodes = render_feed([entry], period="day", now=late, tz="Europe/Moscow")
+        self.assertEqual(title, "Лента за день · 15.10")
+        self.assertIn("15.10 01:30", repr(nodes))
+
+    def test_also_in_is_unique_per_channel_and_omits_primary(self):
+        # Даже если вход содержит повтор и канал самой карточки, в колонке связанные источники остаются уникальны.
+        entry = item(channel="a", also_in=[
+            {"channel_username": "a", "channel_title": "Основной", "link": "https://t.me/a/1"},
+            {"channel_username": "b", "channel_title": "B", "link": "https://t.me/b/2"},
+            {"channel_username": "b", "channel_title": "B2", "link": "https://t.me/b/3"},
+        ])
+        nodes = render_feed([entry], period="week", now=NOW)
+        self.assertEqual(repr(nodes).count("https://t.me/b/"), 1)
+        self.assertEqual(repr(nodes).count("https://t.me/a/1"), 1)
+
+    def test_russian_plural_forms(self):
+        # В составе «из N каналов»: 1 → родительный ед., 3/21/50 → нормативные формы.
+        expected = {1: "1 пост из 1 канала", 3: "3 поста из 3 каналов",
+                    21: "21 пост из 21 канала", 50: "50 постов из 50 каналов"}
+        for count, prefix in expected.items():
+            with self.subTest(count=count):
+                nodes = render_feed([item(index, channel=f"c{index}") for index in range(count)],
+                                    period="day", now=NOW, channel_count=count)
+                self.assertTrue(nodes[0]["children"][0].startswith(prefix))
 
     def test_publication_shared_and_digest_behavior_uses_nodes(self):
         response = SimpleNamespace(json=AsyncMock(return_value={"ok": True, "result": {"url": "https://telegra.ph/x"}}))
