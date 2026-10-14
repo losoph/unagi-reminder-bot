@@ -43,7 +43,8 @@ class FeedIngestAndMetricsTests(unittest.IsolatedAsyncioTestCase):
         database.DB_PATH = os.path.join(self.temp_dir.name, "test_feed_ingest.db")
         database.init_db()
 
-    def tearDown(self):
+    async def asyncTearDown(self):
+        await feed.cancel_backfill_tasks()
         database.DB_PATH = self.original_db_path
         self.temp_dir.cleanup()
 

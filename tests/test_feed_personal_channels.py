@@ -44,7 +44,8 @@ class FeedPersonalChannelsTests(unittest.IsolatedAsyncioTestCase):
         feed._personal_channels_cache.clear()
         feed._backfill_tasks.clear()
 
-    def tearDown(self):
+    async def asyncTearDown(self):
+        await feed.cancel_backfill_tasks()
         database.DB_PATH = self.original_db_path
         self.temp_dir.cleanup()
         feed._personal_channels_cache.clear()

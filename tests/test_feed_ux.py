@@ -21,8 +21,10 @@ class FeedUXTests(unittest.IsolatedAsyncioTestCase):
         database.DB_PATH = os.path.join(self.temp_dir.name, "test_feed_ux.db")
         database.init_db()
         self.storage = MemoryStorage()
+        feed._backfill_tasks.clear()
 
-    def tearDown(self):
+    async def asyncTearDown(self):
+        await feed.cancel_backfill_tasks()
         database.DB_PATH = self.original_db_path
         self.temp_dir.cleanup()
 

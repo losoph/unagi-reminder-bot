@@ -18,22 +18,42 @@ W_REPLIES = float(os.getenv("SCORE_W_REPLIES", "0.05"))
 W_FRESHNESS = float(os.getenv("SCORE_W_FRESHNESS", "0.15"))
 
 
-def get_channel_medians(channel_username: str, days: int = 30) -> dict:
+def get_channel_medians(
+    channel_username: str,
+    days: int = 30,
+    min_age_hours: int = 0,
+    *,
+    now: datetime | None = None,
+) -> dict:
     """Compute 30-day historical medians for channel metrics.
 
     Requires at least 3 posts to establish reliable medians (cold-start protection).
+    min_age_hours: exclude posts younger than this threshold (used by feed ranking).
     """
     normalized = normalize_channel_username(channel_username)
-    since = serialize_datetime(utc_now() - timedelta(days=days))
-    with get_connection() as conn:
-        rows = conn.execute(
-            '''
-            SELECT views, reactions_total, forwards, replies, post_time
-            FROM channel_posts
-            WHERE channel_username = ? AND post_time >= ?
-            ''',
-            (normalized, since),
-        ).fetchall()
+    now_dt = now if now is not None else utc_now()
+    since = serialize_datetime(now_dt - timedelta(days=days))
+    if min_age_hours > 0:
+        until = serialize_datetime(now_dt - timedelta(hours=min_age_hours))
+        with get_connection() as conn:
+            rows = conn.execute(
+                '''
+                SELECT views, reactions_total, forwards, replies, post_time
+                FROM channel_posts
+                WHERE channel_username = ? AND post_time >= ? AND post_time <= ?
+                ''',
+                (normalized, since, until),
+            ).fetchall()
+    else:
+        with get_connection() as conn:
+            rows = conn.execute(
+                '''
+                SELECT views, reactions_total, forwards, replies, post_time
+                FROM channel_posts
+                WHERE channel_username = ? AND post_time >= ?
+                ''',
+                (normalized, since),
+            ).fetchall()
 
     views_list = [r["views"] for r in rows if r["views"] is not None and r["views"] > 0]
     fwd_rates = [

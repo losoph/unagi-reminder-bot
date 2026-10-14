@@ -6,10 +6,14 @@ Never imports main to avoid circular dependencies (pattern T14b).
 """
 
 import asyncio
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+import hashlib
 import html
 import logging
 import os
+import time
 from typing import Any
 
 from aiogram import F, Router, types
@@ -17,7 +21,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 
 from data.database import (
     add_feed_subscription,
@@ -25,6 +29,8 @@ from data.database import (
     delete_feed_subscription,
     get_channel_feed_backfilled_at,
     get_channel_scan_cursor,
+    get_feed_candidate_posts,
+    get_feed_edition,
     get_feed_subscription,
     get_feed_subscription_by_username,
     get_feed_user_onboarding_shown,
@@ -34,6 +40,7 @@ from data.database import (
     normalize_channel_username,
     normalize_feed_tag,
     parse_db_datetime,
+    save_feed_edition,
     serialize_datetime,
     set_channel_feed_backfilled_at,
     set_feed_paused,
@@ -43,10 +50,19 @@ from data.database import (
     upsert_channel_posts,
     utc_now,
 )
+from feed_ranking import rank_feed
+from feed_render import _plural_channel, _plural_ru, build_feed_title, render_feed
+from ranking import get_channel_medians
+from telegraph_publisher import publish_page
+from user_prefs import user_tz
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="feed")
+
+FEED_CACHE_MINUTES = int(os.getenv("FEED_CACHE_MINUTES", "15"))
+FEED_MIN_INTERVAL_SECONDS = int(os.getenv("FEED_MIN_INTERVAL_SECONDS", "60"))
+FEED_BUILD_TIMEOUT_SECONDS = int(os.getenv("FEED_BUILD_TIMEOUT_SECONDS", "120"))
 
 _bot: Any = None
 _channel_source: Any = None
@@ -54,6 +70,73 @@ _backfill_hook: Any = None
 _fetch_semaphore: asyncio.Semaphore | None = None
 _backfill_tasks: dict[str, asyncio.Task] = {}
 _user_build_locks: dict[int, asyncio.Lock] = {}
+_last_build_time: dict[int, float] = {}
+_building_users: set[int] = set()
+
+
+@dataclass
+class FeedBuildResult:
+    status: str
+    telegraph_url: str | None = None
+    post_count: int = 0
+    channel_count: int = 0
+    cached: bool = False
+    error_message: str | None = None
+
+
+def compute_subs_hash(subs: list[Any]) -> str:
+    """Deterministic hash of user subscriptions, tags, and pause states."""
+    items = []
+    for s in subs:
+        if isinstance(s, dict):
+            ch = s.get("channel_username") or ""
+            tag = s.get("tag") or ""
+            paused = s.get("is_paused") or 0
+        else:
+            ch = s["channel_username"]
+            tag = s["tag"] if "tag" in s.keys() and s["tag"] else ""
+            paused = s["is_paused"] if "is_paused" in s.keys() else 0
+        items.append((str(ch).casefold(), str(tag).strip().casefold(), int(paused)))
+    items.sort()
+    serialized = repr(items).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()[:16]
+
+
+def format_feed_edition_message(period: str, post_count: int, channel_count: int, telegraph_url: str) -> str:
+    period_labels = {"day": "день", "week": "неделю", "month": "месяц"}
+    p_label = period_labels.get(period, period)
+    post_str = _plural_ru(post_count, "пост", "поста", "постов")
+    ch_str = _plural_channel(channel_count)
+    return (
+        f"📰 <b>Лента за {p_label} · {post_count} {post_str} из {channel_count} {ch_str}</b>\n\n"
+        f'📖 <a href="{telegraph_url}">Открыть</a>'
+    )
+
+
+def build_feed_period_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="☀️ День", callback_data="feed_period_day"),
+                InlineKeyboardButton(text="🗓 Неделя", callback_data="feed_period_week"),
+                InlineKeyboardButton(text="📆 Месяц", callback_data="feed_period_month"),
+            ],
+            [InlineKeyboardButton(text="🔙 К Ленте", callback_data="feed_main")],
+        ]
+    )
+
+
+def build_feed_edition_keyboard(user_id: int, period: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="☀️ День", callback_data="feed_period_day"),
+                InlineKeyboardButton(text="🗓 Неделя", callback_data="feed_period_week"),
+                InlineKeyboardButton(text="📆 Месяц", callback_data="feed_period_month"),
+            ],
+            [InlineKeyboardButton(text="🔙 К Ленте", callback_data="feed_main")],
+        ]
+    )
 
 
 def get_fetch_semaphore() -> asyncio.Semaphore:
@@ -130,8 +213,8 @@ async def ingest_window(
         if not clean_username:
             return raw_channel, []
 
-        backfilled_at = get_channel_feed_backfilled_at(clean_username)
-        cursor_str, _ = get_channel_scan_cursor(clean_username)
+        backfilled_at = await asyncio.to_thread(get_channel_feed_backfilled_at, clean_username)
+        cursor_str, _ = await asyncio.to_thread(get_channel_scan_cursor, clean_username)
 
         if backfilled_at is not None and cursor_str is not None:
             cursor_dt = parse_db_datetime(cursor_str)
@@ -149,7 +232,7 @@ async def ingest_window(
             return clean_username, []
 
         try:
-            upsert_channel_posts(clean_username, posts, source_name)
+            await asyncio.to_thread(upsert_channel_posts, clean_username, posts, source_name)
         except Exception as exc:
             logger.warning("Failed to upsert channel posts for @%s: %s", clean_username, exc)
             return clean_username, posts
@@ -157,7 +240,7 @@ async def ingest_window(
         # Mark backfilled if full 30-day window was fetched with MTProto
         if (is_backfill or marker_dt <= thirty_days_ago) and source_name == "mtproto":
             try:
-                set_channel_feed_backfilled_at(clean_username, now_dt)
+                await asyncio.to_thread(set_channel_feed_backfilled_at, clean_username, now_dt)
             except Exception as exc:
                 logger.debug("Failed to set feed_backfilled_at for @%s: %s", clean_username, exc)
 
@@ -169,14 +252,14 @@ async def ingest_window(
                 cursor_dt = parse_db_datetime(cursor_str)
                 if marker_dt <= cursor_dt:
                     # No hole: we fetched from <= cursor_dt up to now
-                    update_channel_scan_cursor(clean_username, max_time, max_id)
+                    await asyncio.to_thread(update_channel_scan_cursor, clean_username, max_time, max_id)
                 else:
                     # Hole: marker_dt > cursor_dt. Rule 1.7: cursor must NOT be touched!
                     pass
             else:
                 # cursor_str is None: only advance cursor if full 30-day backfill
                 if is_backfill or marker_dt <= thirty_days_ago:
-                    update_channel_scan_cursor(clean_username, max_time, max_id)
+                    await asyncio.to_thread(update_channel_scan_cursor, clean_username, max_time, max_id)
 
         return clean_username, posts
 
@@ -510,10 +593,418 @@ async def cb_feed_help(callback: types.CallbackQuery):
     await callback.answer()
 
 
+async def build_feed_edition(
+    user_id: int,
+    period: str,
+    *,
+    subs: list[dict] | None = None,
+    active_subs: list[dict] | None = None,
+    subs_hash: str | None = None,
+    ignore_rate_limit: bool = False,
+    now: datetime | None = None,
+) -> FeedBuildResult:
+    """Orchestrate on-demand feed edition generation with caching and concurrency control (T24)."""
+    if period not in ("day", "week", "month"):
+        return FeedBuildResult(status="error", error_message=f"Неизвестный период: {period}")
+
+    if subs is None:
+        raw_subs = await asyncio.to_thread(list_feed_subscriptions, user_id, include_paused=True)
+        subs = [dict(s) for s in raw_subs]
+    else:
+        subs = [dict(s) if not isinstance(s, dict) else s for s in subs]
+
+    if not subs:
+        return FeedBuildResult(status="empty_channels", error_message="У тебя пока нет каналов в Ленте.")
+
+    if active_subs is None:
+        active_subs = [s for s in subs if not s.get("is_paused")]
+    else:
+        active_subs = [dict(s) if not isinstance(s, dict) else s for s in active_subs]
+
+    if not active_subs:
+        return FeedBuildResult(status="all_paused", error_message="Все твои каналы в Ленте на паузе.")
+
+    if subs_hash is None:
+        subs_hash = compute_subs_hash(subs)
+
+    # 1. Check cache (FEED_CACHE_MINUTES)
+    cached = await asyncio.to_thread(
+        get_feed_edition, user_id, period, subs_hash, FEED_CACHE_MINUTES * 60
+    )
+    if cached is not None:
+        logger.info(
+            "feed_build user=%s period=%s channels=%d candidates=0 clusters=0 items=%d refreshed=0 cache=hit duration_ms=0",
+            user_id,
+            period,
+            cached.get("channel_count", 0),
+            cached.get("post_count", 0),
+        )
+        return FeedBuildResult(
+            status="ok",
+            telegraph_url=cached["telegraph_url"],
+            post_count=cached["post_count"],
+            channel_count=cached["channel_count"],
+            cached=True,
+        )
+
+    # 2. Rate limit (unless ignored)
+    now_ts = time.time()
+    last_time = _last_build_time.get(user_id, 0.0)
+    if not ignore_rate_limit and (now_ts - last_time < FEED_MIN_INTERVAL_SECONDS):
+        return FeedBuildResult(status="rate_limited", error_message="Подожди минуту")
+
+    # 3. Concurrency check
+    lock = get_user_build_lock(user_id)
+    if lock.locked() or user_id in _building_users:
+        return FeedBuildResult(
+            status="already_building",
+            error_message="⏳ Сборка уже выполняется, пожалуйста, подожди...",
+        )
+
+    async with lock:
+        _building_users.add(user_id)
+        start_mono = time.monotonic()
+        now_dt = now or utc_now()
+
+        if period == "day":
+            window_start = now_dt - timedelta(days=1)
+        elif period == "week":
+            window_start = now_dt - timedelta(days=7)
+        elif period == "month":
+            window_start = now_dt - timedelta(days=30)
+        window_end = now_dt
+
+        active_usernames = [s["channel_username"] for s in active_subs]
+
+        async def _run_pipeline():
+            # Ingest window for active channels
+            await ingest_window(active_usernames, window_start, now=now_dt)
+
+            # Get candidate posts
+            candidates = await asyncio.to_thread(
+                get_feed_candidate_posts, user_id, window_start, window_end
+            )
+            if not candidates:
+                duration_ms = int((time.monotonic() - start_mono) * 1000)
+                logger.info(
+                    "feed_build user=%s period=%s channels=%d candidates=0 clusters=0 items=0 refreshed=0 cache=miss duration_ms=%d",
+                    user_id,
+                    period,
+                    len(active_usernames),
+                    duration_ms,
+                )
+                period_in_words = {"day": "день", "week": "неделю", "month": "месяц"}.get(period, period)
+                return FeedBuildResult(
+                    status="empty_posts",
+                    error_message=f"За {period_in_words} в каналах Ленты постов не было.",
+                )
+
+            # Refresh metrics
+            channel_post_ids: dict[str, list[int]] = defaultdict(list)
+            for p in candidates:
+                channel_post_ids[p["channel_username"]].append(p["post_id"])
+
+            total_refreshed = 0
+            if _channel_source is not None:
+                for ch_u, p_ids in channel_post_ids.items():
+                    try:
+                        refreshed = await _channel_source.refresh_metrics(
+                            ch_u, p_ids, period=period, now=now_dt
+                        )
+                        total_refreshed += refreshed
+                    except Exception as e:
+                        logger.warning("Failed to refresh metrics for @%s: %s", ch_u, e)
+
+            if total_refreshed > 0:
+                candidates = await asyncio.to_thread(
+                    get_feed_candidate_posts, user_id, window_start, window_end
+                )
+
+            # Historical medians with min_age_hours=24
+            unique_channels = {p["channel_username"] for p in candidates}
+            medians_by_channel = {}
+            for u_chan in unique_channels:
+                med = await asyncio.to_thread(
+                    get_channel_medians, u_chan, min_age_hours=24, now=now_dt
+                )
+                medians_by_channel[u_chan] = med
+                medians_by_channel[u_chan.lower()] = med
+
+            # Rank feed
+            items = rank_feed(candidates, medians_by_channel, period, now_dt)
+            if not items:
+                duration_ms = int((time.monotonic() - start_mono) * 1000)
+                logger.info(
+                    "feed_build user=%s period=%s channels=%d candidates=%d clusters=0 items=0 refreshed=%d cache=miss duration_ms=%d",
+                    user_id,
+                    period,
+                    len(unique_channels),
+                    len(candidates),
+                    total_refreshed,
+                    duration_ms,
+                )
+                period_in_words = {"day": "день", "week": "неделю", "month": "месяц"}.get(period, period)
+                return FeedBuildResult(
+                    status="empty_posts",
+                    error_message=f"За {period_in_words} в каналах Ленты постов не было.",
+                )
+
+            # User timezone
+            tz = await asyncio.to_thread(user_tz, user_id)
+
+            # Telegraph render and publish
+            title = build_feed_title(period, now_dt, tz=tz)
+            has_web = any(p.get("source") == "web" for p in candidates)
+            nodes = render_feed(
+                items,
+                period=period,
+                now=now_dt,
+                channel_count=len(unique_channels),
+                has_web_source=has_web,
+                tz=tz,
+            )
+
+            telegraph_url = await publish_page(title, nodes)
+            if not telegraph_url:
+                logger.error("Telegraph publishing failed for user=%s period=%s", user_id, period)
+                return FeedBuildResult(
+                    status="error",
+                    error_message="❌ Не удалось опубликовать выпуск в Telegraph. Попробуй позже.",
+                )
+
+            # Save to cache
+            await asyncio.to_thread(
+                save_feed_edition,
+                user_id=user_id,
+                period=period,
+                window_start=window_start,
+                window_end=window_end,
+                subs_hash=subs_hash,
+                telegraph_url=telegraph_url,
+                post_count=len(items),
+                channel_count=len(unique_channels),
+            )
+
+            _last_build_time[user_id] = time.time()
+            duration_ms = int((time.monotonic() - start_mono) * 1000)
+            logger.info(
+                "feed_build user=%s period=%s channels=%d candidates=%d clusters=%d items=%d refreshed=%d cache=miss duration_ms=%d",
+                user_id,
+                period,
+                len(unique_channels),
+                len(candidates),
+                len(items),
+                len(items),
+                total_refreshed,
+                duration_ms,
+            )
+
+            return FeedBuildResult(
+                status="ok",
+                telegraph_url=telegraph_url,
+                post_count=len(items),
+                channel_count=len(unique_channels),
+                cached=False,
+            )
+
+        try:
+            if hasattr(asyncio, "timeout"):
+                async with asyncio.timeout(FEED_BUILD_TIMEOUT_SECONDS):
+                    return await _run_pipeline()
+            else:
+                return await asyncio.wait_for(_run_pipeline(), timeout=FEED_BUILD_TIMEOUT_SECONDS)
+        except (TimeoutError, asyncio.TimeoutError):
+            duration_ms = int((time.monotonic() - start_mono) * 1000)
+            logger.warning(
+                "feed_build timeout user=%s period=%s duration_ms=%d",
+                user_id,
+                period,
+                duration_ms,
+            )
+            return FeedBuildResult(
+                status="timeout",
+                error_message="⚠️ Сборка заняла слишком много времени. Попробуй позже или выбери меньший период.",
+            )
+        except Exception as exc:
+            duration_ms = int((time.monotonic() - start_mono) * 1000)
+            logger.warning(
+                "feed_build failed user=%s period=%s duration_ms=%d: %s",
+                user_id,
+                period,
+                duration_ms,
+                exc,
+            )
+            return FeedBuildResult(
+                status="error",
+                error_message="⚠️ Не удалось собрать Ленту. Попробуй позже.",
+            )
+        finally:
+            _building_users.discard(user_id)
+
+
 @router.callback_query(F.data.startswith("feed_period_"))
-async def cb_feed_period_stub(callback: types.CallbackQuery):
-    """Placeholder for period building (fully implemented in T24)."""
-    await callback.answer("⏳ Сборка Ленты будет подключена в T24.", show_alert=True)
+async def cb_feed_period(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    try:
+        period = callback.data.split("_")[2]
+    except (IndexError, ValueError):
+        await callback.answer("❌ Неверный период.")
+        return
+
+    if period not in ("day", "week", "month"):
+        await callback.answer("❌ Неверный период.")
+        return
+
+    # 1. Quick concurrency check
+    lock = get_user_build_lock(user_id)
+    if lock.locked() or user_id in _building_users:
+        await callback.answer("⏳ Сборка уже выполняется, пожалуйста, подожди...", show_alert=True)
+        return
+
+    # 2. Check subscriptions
+    raw_subs = await asyncio.to_thread(list_feed_subscriptions, user_id, include_paused=True)
+    subs = [dict(s) for s in raw_subs]
+    if not subs:
+        text = (
+            "ℹ️ <b>У тебя пока нет каналов в Ленте</b>\n\n"
+            "Добавь каналы пересылкой постов, ссылкой на канал (например, <code>@durov</code>) "
+            "или через «➕ Из моих подписок»."
+        )
+        is_owner = is_session_owner(user_id)
+        kb = build_feed_main_keyboard(0, show_personal_btn=is_owner)
+        if callback.message:
+            try:
+                await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            except TelegramAPIError:
+                pass
+        await callback.answer()
+        return
+
+    active_subs = [s for s in subs if not s.get("is_paused")]
+    if not active_subs:
+        text = (
+            "ℹ️ <b>Все твои каналы в Ленте на паузе</b>\n\n"
+            "Возобнови подписки в «📋 Каналы Ленты», чтобы собрать выпуск."
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"📋 Каналы Ленты ({len(subs)})", callback_data="feed_channels_0")],
+                [InlineKeyboardButton(text="🔙 К Ленте", callback_data="feed_main")],
+            ]
+        )
+        if callback.message:
+            try:
+                await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            except TelegramAPIError:
+                pass
+        await callback.answer()
+        return
+
+    # 3. Check cache
+    subs_hash = compute_subs_hash(subs)
+    cached = await asyncio.to_thread(
+        get_feed_edition, user_id, period, subs_hash, FEED_CACHE_MINUTES * 60
+    )
+    if cached is not None:
+        logger.info(
+            "feed_build user=%s period=%s channels=%d candidates=0 clusters=0 items=%d refreshed=0 cache=hit duration_ms=0",
+            user_id,
+            period,
+            cached.get("channel_count", 0),
+            cached.get("post_count", 0),
+        )
+        text = format_feed_edition_message(
+            period, cached["post_count"], cached["channel_count"], cached["telegraph_url"]
+        )
+        kb = build_feed_edition_keyboard(user_id, period)
+        if callback.message:
+            try:
+                await callback.message.edit_text(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                    link_preview_options=LinkPreviewOptions(is_disabled=False),
+                )
+            except TelegramAPIError:
+                pass
+        await callback.answer()
+        return
+
+    # 4. Check rate limit
+    now_ts = time.time()
+    last_time = _last_build_time.get(user_id, 0.0)
+    if now_ts - last_time < FEED_MIN_INTERVAL_SECONDS:
+        await callback.answer("Подожди минуту", show_alert=True)
+        return
+
+    # 5. Show progress
+    period_names = {"day": "день", "week": "неделю", "month": "месяц"}
+    p_name = period_names.get(period, period)
+    if callback.message:
+        try:
+            await callback.message.edit_text(f"⏳ Собираю Ленту за {p_name}…")
+        except TelegramAPIError:
+            pass
+    await callback.answer()
+
+    # 6. Execute build
+    res = await build_feed_edition(
+        user_id,
+        period,
+        subs=subs,
+        active_subs=active_subs,
+        subs_hash=subs_hash,
+    )
+
+    if res.status == "ok":
+        text = format_feed_edition_message(
+            period, res.post_count, res.channel_count, res.telegraph_url
+        )
+        kb = build_feed_edition_keyboard(user_id, period)
+        if callback.message:
+            try:
+                await callback.message.edit_text(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                    link_preview_options=LinkPreviewOptions(is_disabled=False),
+                )
+            except TelegramAPIError:
+                if _bot:
+                    await _bot.send_message(
+                        user_id,
+                        text,
+                        parse_mode="HTML",
+                        reply_markup=kb,
+                        link_preview_options=LinkPreviewOptions(is_disabled=False),
+                    )
+    elif res.status == "empty_posts":
+        empty_text = f"За {p_name} в каналах Ленты постов не было."
+        kb = build_feed_period_keyboard()
+        if callback.message:
+            try:
+                await callback.message.edit_text(empty_text, reply_markup=kb)
+            except TelegramAPIError:
+                pass
+    elif res.status == "timeout":
+        err_text = (
+            "⚠️ <b>Не удалось собрать Ленту</b>\n\n"
+            "Сборка заняла слишком много времени. Попробуй позже или выбери меньший период."
+        )
+        kb = build_feed_period_keyboard()
+        if callback.message:
+            try:
+                await callback.message.edit_text(err_text, parse_mode="HTML", reply_markup=kb)
+            except TelegramAPIError:
+                pass
+    else:
+        err_text = res.error_message or "⚠️ Не удалось собрать Ленту. Попробуй позже."
+        kb = build_feed_period_keyboard()
+        if callback.message:
+            try:
+                await callback.message.edit_text(err_text, parse_mode="HTML", reply_markup=kb)
+            except TelegramAPIError:
+                pass
 
 
 # ---------------------------------------------------------------------------
