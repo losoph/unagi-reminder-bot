@@ -143,8 +143,11 @@ bot = Bot(token=BOT_TOKEN, session=bot_session)
 dp = Dispatcher()
 import reminders_ux
 import user_prefs
+import feed
 dp.include_router(reminders_ux.router)
 dp.include_router(user_prefs.router)
+dp.include_router(feed.router)
+feed.configure(bot=bot, channel_source=channel_source)
 from time_utils import (  # noqa: E402
     _DAY_PART_HOURS,
     TIME_TEXT_EXAMPLES,
@@ -399,7 +402,10 @@ def build_digest_channel_actions(sub_id: int, current_period: str, is_paused: bo
             InlineKeyboardButton(text="🕒 Изменить время", callback_data=f"dsch_{current_period}"),
             toggle,
         ],
-        [InlineKeyboardButton(text="📁 Папка", callback_data=f"dtag_{sub_id}")],
+        [
+            InlineKeyboardButton(text="📁 Папка", callback_data=f"dtag_{sub_id}"),
+            InlineKeyboardButton(text="📰 В Ленту", callback_data=f"feed_copy_{sub_id}"),
+        ],
     ]
     move_buttons = []
     for period in ("daily", "weekly", "monthly"):
@@ -4671,6 +4677,7 @@ async def setup_digest(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="📅 Раз в день", callback_data="period_daily")],
         [InlineKeyboardButton(text="🗓 Раз в неделю", callback_data="period_weekly")],
         [InlineKeyboardButton(text="📊 Раз в месяц", callback_data="period_monthly")],
+        [InlineKeyboardButton(text="📰 В Ленту (без расписания)", callback_data="feed_add")],
     ]
     await callback_message.edit_text(
         "Как часто присылать новые посты из этого канала?",

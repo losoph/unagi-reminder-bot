@@ -34,6 +34,10 @@ HELP_TEXT = (
     "• /save (/s) — в закладки · /delete (/d) — удалить\n\n"
     "📁 <b>Закладки</b>\n"
     "/saved — база знаний по папкам: перенос между папками, превращение в напоминание, удаление\n\n"
+    "📰 <b>Лента</b>\n"
+    "/feed — единая подборка главного из каналов за день, неделю или месяц на странице Telegraph\n"
+    "• Добавление канала: кнопка «📰 В Ленту» при пересылке поста или из карточки дайджеста\n"
+    "• Управление каналами, тегами разделов и паузой — в меню /feed\n\n"
     "📡 <b>Дайджесты каналов</b>\n"
     "/list_digest — подписки и расписание: время ежедневного, еженедельного и ежемесячного "
     "выпуска, папки, пауза, перенос между выпусками, отписка, ИИ-анализ каналов, тех. алерты\n"
@@ -69,6 +73,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("help", "ℹ️ Полная справка"),
     ("list", "📅 Мои напоминания"),
     ("saved", "📁 Закладки"),
+    ("feed", "📰 Лента каналов"),
     ("list_digest", "📡 Подписки и расписание дайджестов"),
     ("test_digest", "⏳ Выпуск за 24 ч прямо сейчас"),
     ("check", "🔎 Проверить каналы"),
@@ -91,9 +96,12 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="📡 Дайджесты", callback_data="digest_settings"),
-                InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings_menu"),
+                InlineKeyboardButton(text="📰 Лента", callback_data="feed_main"),
             ],
-            [InlineKeyboardButton(text="ℹ️ Полная справка", callback_data="help_full")],
+            [
+                InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings_menu"),
+                InlineKeyboardButton(text="ℹ️ Полная справка", callback_data="help_full"),
+            ],
         ]
     )
 
