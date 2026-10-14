@@ -14,6 +14,7 @@ DIGEST_POST_RETENTION_DAYS = int(os.getenv("DIGEST_POST_RETENTION_DAYS", "30"))
 MAX_ERROR_TEXT_LENGTH = int(os.getenv("MAX_ERROR_TEXT_LENGTH", "800"))
 CHANNEL_BACKLOG_MAX = int(os.getenv("CHANNEL_BACKLOG_MAX", "500"))
 CHANNEL_DELIVERY_BATCH_SIZE = int(os.getenv("CHANNEL_DELIVERY_BATCH_SIZE", "50"))
+MAX_FEED_CHANNELS = int(os.getenv("MAX_FEED_CHANNELS", "100"))
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "bot_data.db"))
@@ -581,6 +582,54 @@ def init_db():
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_digest_alerts_user_sent ON digest_alerts(user_id, sent_at)"
+        )
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS feed_subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                channel_username TEXT NOT NULL,
+                channel_title TEXT,
+                tag TEXT,
+                is_paused INTEGER DEFAULT 0,
+                created_at DATETIME NOT NULL,
+                UNIQUE(user_id, channel_username)
+            )
+            '''
+        )
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS feed_editions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                period TEXT NOT NULL,
+                window_start DATETIME NOT NULL,
+                window_end DATETIME NOT NULL,
+                subs_hash TEXT NOT NULL,
+                telegraph_url TEXT NOT NULL,
+                post_count INTEGER,
+                channel_count INTEGER,
+                created_at DATETIME NOT NULL
+            )
+            '''
+        )
+        for statement in (
+            "ALTER TABLE feed_subscriptions ADD COLUMN tag TEXT",
+            "ALTER TABLE feed_subscriptions ADD COLUMN is_paused INTEGER DEFAULT 0",
+        ):
+            try:
+                cursor.execute(statement)
+            except sqlite3.OperationalError:
+                pass
+
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_feed_subscriptions_user ON feed_subscriptions(user_id, is_paused)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_feed_editions_lookup ON feed_editions(user_id, period, subs_hash, created_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_channel_posts_channel_time ON channel_posts(channel_username, post_time)"
         )
 
         _migrate_legacy_local_timestamps_to_utc(cursor)
@@ -1788,6 +1837,15 @@ def export_user_data(user_id) -> dict:
             ''',
             (user_id,),
         ).fetchall()
+        feed_subscriptions = conn.execute(
+            '''
+            SELECT channel_username, channel_title, tag, is_paused
+            FROM feed_subscriptions
+            WHERE user_id = ?
+            ORDER BY channel_username
+            ''',
+            (user_id,),
+        ).fetchall()
 
     return {
         "reminders": [dict(row) for row in reminders],
@@ -1795,6 +1853,7 @@ def export_user_data(user_id) -> dict:
         "subscriptions": [dict(row) for row in subscriptions],
         "digest_settings": [dict(row) for row in digest_settings],
         "prefs": get_user_prefs(user_id),
+        "feed": [dict(row) for row in feed_subscriptions],
     }
 
 
@@ -2611,3 +2670,338 @@ def delete_user_email(user_id: int) -> None:
     with get_connection() as conn:
         conn.execute("DELETE FROM user_emails WHERE user_id = ?", (user_id,))
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Лента (Feed) — подписки, кеш и кандидаты
+# ---------------------------------------------------------------------------
+
+
+def normalize_feed_tag(tag: str | None) -> str | None:
+    """Нормализовать тег Ленты: обрезка пробелов, <=24 символов, без переводов строк."""
+    if not isinstance(tag, str):
+        return None
+    cleaned = tag.replace("\r", " ").replace("\n", " ").strip()
+    cleaned = cleaned.lstrip("#").strip()
+    if not cleaned:
+        return None
+    return cleaned[:24]
+
+
+def count_feed_subscriptions(user_id: int, include_paused: bool = True) -> int:
+    """Количество подписок Ленты пользователя."""
+    with get_connection() as conn:
+        if include_paused:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM feed_subscriptions WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM feed_subscriptions WHERE user_id = ? AND is_paused = 0",
+                (user_id,),
+            ).fetchone()
+    return row[0] if row else 0
+
+
+def add_feed_subscription(
+    user_id: int,
+    channel_username: str,
+    channel_title: str | None = None,
+    tag: str | None = None,
+) -> int:
+    """Добавить канал в Ленту (идемпотентно по UNIQUE(user_id, channel_username))."""
+    normalized_username = normalize_channel_username(channel_username)
+    if not normalized_username:
+        raise ValueError("Invalid channel username")
+    normalized_tag = normalize_feed_tag(tag)
+    created_at = serialize_datetime(utc_now())
+
+    with get_connection() as conn:
+        existing = conn.execute(
+            "SELECT id, channel_title, tag FROM feed_subscriptions WHERE user_id = ? AND channel_username = ?",
+            (user_id, normalized_username),
+        ).fetchone()
+
+        if existing:
+            sub_id = existing["id"]
+            new_title = channel_title if channel_title is not None else existing["channel_title"]
+            new_tag = normalized_tag if tag is not None else existing["tag"]
+            conn.execute(
+                "UPDATE feed_subscriptions SET channel_title = ?, tag = ? WHERE id = ?",
+                (new_title, new_tag, sub_id),
+            )
+            conn.commit()
+            return sub_id
+
+        current_count = conn.execute(
+            "SELECT COUNT(*) FROM feed_subscriptions WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()[0]
+        if current_count >= MAX_FEED_CHANNELS:
+            raise ValueError(f"Превышен лимит каналов Ленты ({MAX_FEED_CHANNELS})")
+
+        cursor = conn.execute(
+            '''
+            INSERT INTO feed_subscriptions (user_id, channel_username, channel_title, tag, is_paused, created_at)
+            VALUES (?, ?, ?, ?, 0, ?)
+            ''',
+            (user_id, normalized_username, channel_title, normalized_tag, created_at),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def list_feed_subscriptions(user_id: int, include_paused: bool = True) -> list[sqlite3.Row]:
+    """Список подписок Ленты пользователя."""
+    with get_connection() as conn:
+        if include_paused:
+            rows = conn.execute(
+                '''
+                SELECT id, user_id, channel_username, channel_title, tag, is_paused, created_at
+                FROM feed_subscriptions
+                WHERE user_id = ?
+                ORDER BY id ASC
+                ''',
+                (user_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                '''
+                SELECT id, user_id, channel_username, channel_title, tag, is_paused, created_at
+                FROM feed_subscriptions
+                WHERE user_id = ? AND is_paused = 0
+                ORDER BY id ASC
+                ''',
+                (user_id,),
+            ).fetchall()
+    return rows
+
+
+get_feed_subscriptions = list_feed_subscriptions
+
+
+def get_feed_subscription(user_id: int, sub_id: int) -> sqlite3.Row | None:
+    """Получить подписку Ленты по id."""
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT id, user_id, channel_username, channel_title, tag, is_paused, created_at
+            FROM feed_subscriptions
+            WHERE user_id = ? AND id = ?
+            ''',
+            (user_id, sub_id),
+        ).fetchone()
+    return row
+
+
+def get_feed_subscription_by_username(user_id: int, channel_username: str) -> sqlite3.Row | None:
+    """Получить подписку Ленты по username."""
+    normalized = normalize_channel_username(channel_username)
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT id, user_id, channel_username, channel_title, tag, is_paused, created_at
+            FROM feed_subscriptions
+            WHERE user_id = ? AND channel_username = ?
+            ''',
+            (user_id, normalized),
+        ).fetchone()
+    return row
+
+
+def set_feed_tag(user_id: int, sub_id: int, tag: str | None) -> bool:
+    """Установить или сбросить тег подписки Ленты."""
+    normalized = normalize_feed_tag(tag)
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE feed_subscriptions SET tag = ? WHERE user_id = ? AND id = ?",
+            (normalized, user_id, sub_id),
+        )
+        conn.commit()
+    return cursor.rowcount > 0
+
+
+def set_feed_paused(user_id: int, sub_id: int, is_paused: bool) -> bool:
+    """Поставить подписку Ленты на паузу или снять с паузы."""
+    val = 1 if is_paused else 0
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE feed_subscriptions SET is_paused = ? WHERE user_id = ? AND id = ?",
+            (val, user_id, sub_id),
+        )
+        conn.commit()
+    return cursor.rowcount > 0
+
+
+set_feed_subscription_paused = set_feed_paused
+
+
+def delete_feed_subscription(user_id: int, sub_id: int) -> bool:
+    """Удалить подписку из Ленты."""
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM feed_subscriptions WHERE user_id = ? AND id = ?",
+            (user_id, sub_id),
+        )
+        conn.commit()
+    return cursor.rowcount > 0
+
+
+def list_feed_tags(user_id: int) -> list[str]:
+    """Список уникальных тегов пользователя в алфавитном порядке."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            '''
+            SELECT DISTINCT tag
+            FROM feed_subscriptions
+            WHERE user_id = ? AND tag IS NOT NULL AND tag != ''
+            ORDER BY tag COLLATE NOCASE
+            ''',
+            (user_id,),
+        ).fetchall()
+    return [row[0] for row in rows if row[0]]
+
+
+get_feed_tags = list_feed_tags
+
+
+def get_feed_candidate_posts(
+    user_id: int,
+    window_start: datetime | str,
+    window_end: datetime | str,
+) -> list[dict]:
+    """Выбрать посты каналов активных подписок Ленты за окно [window_start, window_end] с текстом."""
+    w_start = serialize_datetime(window_start) if isinstance(window_start, datetime) else str(window_start)
+    w_end = serialize_datetime(window_end) if isinstance(window_end, datetime) else str(window_end)
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            '''
+            SELECT
+                cp.channel_username,
+                cp.post_id,
+                cp.post_text,
+                cp.post_link,
+                cp.post_time,
+                cp.source,
+                cp.created_at,
+                cp.views,
+                cp.reactions_total,
+                cp.reactions_json,
+                cp.forwards,
+                cp.replies,
+                cp.metrics_at,
+                fs.channel_title,
+                fs.tag
+            FROM channel_posts cp
+            JOIN feed_subscriptions fs ON fs.channel_username = cp.channel_username
+            WHERE fs.user_id = ?
+              AND fs.is_paused = 0
+              AND cp.post_time > ?
+              AND cp.post_time <= ?
+              AND cp.post_text IS NOT NULL
+              AND TRIM(cp.post_text) != ''
+            ORDER BY cp.post_time DESC, cp.channel_username, cp.post_id
+            ''',
+            (user_id, w_start, w_end),
+        ).fetchall()
+
+    result = []
+    for row in rows:
+        post_time_raw = row["post_time"]
+        pt = parse_db_datetime(post_time_raw) if isinstance(post_time_raw, str) else post_time_raw
+        result.append({
+            "id": row["post_id"],
+            "post_id": row["post_id"],
+            "channel_username": row["channel_username"],
+            "channel_title": row["channel_title"],
+            "tag": row["tag"],
+            "text": row["post_text"],
+            "post_text": row["post_text"],
+            "link": row["post_link"],
+            "post_link": row["post_link"],
+            "time": pt,
+            "post_time": pt,
+            "views": row["views"],
+            "reactions_total": row["reactions_total"],
+            "reactions_json": row["reactions_json"],
+            "forwards": row["forwards"],
+            "replies": row["replies"],
+            "metrics_at": row["metrics_at"],
+            "source": row["source"],
+        })
+    return result
+
+
+def save_feed_edition(
+    user_id: int,
+    period: str,
+    window_start: datetime | str,
+    window_end: datetime | str,
+    subs_hash: str,
+    telegraph_url: str,
+    post_count: int,
+    channel_count: int,
+) -> int:
+    """Сохранить запись о собранном выпуске Ленты в кеш."""
+    w_start = serialize_datetime(window_start) if isinstance(window_start, datetime) else str(window_start)
+    w_end = serialize_datetime(window_end) if isinstance(window_end, datetime) else str(window_end)
+    created_at = serialize_datetime(utc_now())
+    with get_connection() as conn:
+        cursor = conn.execute(
+            '''
+            INSERT INTO feed_editions (
+                user_id, period, window_start, window_end, subs_hash, telegraph_url,
+                post_count, channel_count, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                user_id,
+                period,
+                w_start,
+                w_end,
+                subs_hash,
+                telegraph_url,
+                post_count,
+                channel_count,
+                created_at,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_feed_edition(
+    user_id: int,
+    period: str,
+    subs_hash: str,
+    max_age_seconds: int | None = 900,
+) -> dict | None:
+    """Получить свежий выпуск Ленты из кеша (по умолчанию до 15 минут)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT id, user_id, period, window_start, window_end, subs_hash, telegraph_url,
+                   post_count, channel_count, created_at
+            FROM feed_editions
+            WHERE user_id = ? AND period = ? AND subs_hash = ?
+            ORDER BY id DESC
+            LIMIT 1
+            ''',
+            (user_id, period, subs_hash),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    if max_age_seconds is not None:
+        created_dt = parse_db_datetime(row["created_at"])
+        if (utc_now() - created_dt).total_seconds() > max_age_seconds:
+            return None
+
+    return dict(row)
+
+
+get_feed_edition_cache = get_feed_edition

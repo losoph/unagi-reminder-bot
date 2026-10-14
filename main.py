@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 
 from data.database import (
     add_digest_posts,
+    add_feed_subscription,
     add_message,
     add_saved_message,
     add_subscription,
@@ -88,6 +89,7 @@ from data.database import (
     start_email_verification,
     set_all_subscriptions_paused,
     set_email_period,
+    set_feed_paused,
     set_subscription_paused,
     set_subscription_tag,
     set_user_alerts_enabled,
@@ -172,13 +174,14 @@ DIGEST_TELEGRAPH_THRESHOLD = int(os.getenv("DIGEST_TELEGRAPH_THRESHOLD", "4"))
 TELEGRAM_PREVIEW_CHARS = int(os.getenv("TELEGRAM_PREVIEW_CHARS", "300"))
 # Лимиты на импорт, чтобы один файл не положил бота.
 MAX_IMPORT_SUBSCRIPTIONS = int(os.getenv("MAX_IMPORT_SUBSCRIPTIONS", "300"))
+MAX_IMPORT_FEED = int(os.getenv("MAX_IMPORT_FEED", "200"))
 MAX_IMPORT_BOOKMARKS = int(os.getenv("MAX_IMPORT_BOOKMARKS", "1000"))
 MAX_IMPORT_REMINDERS = int(os.getenv("MAX_IMPORT_REMINDERS", "500"))
 MAX_IMPORT_FILE_BYTES = int(os.getenv("MAX_IMPORT_FILE_BYTES", str(2 * 1024 * 1024)))
 AI_DAILY_LIMIT = ai_assistant.AI_DAILY_LIMIT
 # Средняя скорость чтения для оценки времени прочтения постов канала.
 READING_WORDS_PER_MINUTE = 180
-EXPORT_VERSION = 1
+EXPORT_VERSION = 2
 
 USER_FACING_ERROR = "Что-то пошло не так. Попробуй ещё раз позже."
 
@@ -3341,9 +3344,11 @@ async def _send_export(user_id: int):
     }
     raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     filename = f"unagi_export_{user_id}_{local_now().strftime('%Y%m%d_%H%M')}.json"
+    feed_count = len(data.get("feed") or [])
     caption = (
         "📤 <b>Экспорт данных Unagi</b>\n"
         f"• Подписки: {len(data['subscriptions'])}\n"
+        f"• Лента: {feed_count}\n"
         f"• Закладки: {len(data['bookmarks'])}\n"
         f"• Напоминания: {len(data['reminders'])}\n\n"
         "Чтобы восстановить — отправь команду /import и пришли этот файл."
@@ -3405,11 +3410,12 @@ def _import_user_payload(user_id: int, payload) -> str:
         return "❌ Неверный формат файла."
 
     subscriptions = payload.get("subscriptions") or []
+    feed = payload.get("feed") or []
     bookmarks = payload.get("bookmarks") or []
     reminders = payload.get("reminders") or []
     digest_settings = payload.get("digest_settings") or []
     now = local_now()
-    added_subs = added_bms = added_rems = 0
+    added_subs = added_feed = added_bms = added_rems = 0
 
     for setting in digest_settings[:10]:
         period = setting.get("period")
@@ -3450,6 +3456,23 @@ def _import_user_payload(user_id: int, payload) -> str:
             added_subs += 1
         except Exception:
             logger.exception("Import: failed to add subscription")
+
+    for item in feed[:MAX_IMPORT_FEED]:
+        username = normalize_channel_username(item.get("channel_username") or "")
+        if not username:
+            continue
+        try:
+            sub_id = add_feed_subscription(
+                user_id,
+                username,
+                channel_title=item.get("channel_title") or username,
+                tag=item.get("tag"),
+            )
+            if item.get("is_paused") and sub_id:
+                set_feed_paused(user_id, sub_id, True)
+            added_feed += 1
+        except Exception:
+            logger.exception("Import: failed to add feed subscription")
 
     for bookmark in bookmarks[:MAX_IMPORT_BOOKMARKS]:
         text = bookmark.get("full_text")
@@ -3495,6 +3518,7 @@ def _import_user_payload(user_id: int, payload) -> str:
     return (
         "✅ <b>Импорт завершён</b>\n"
         f"• Подписки: +{added_subs}\n"
+        f"• Лента: +{added_feed}\n"
         f"• Закладки: +{added_bms}\n"
         f"• Напоминания: +{added_rems}\n\n"
         "Открой /list_digest, /saved или /list, чтобы проверить."
