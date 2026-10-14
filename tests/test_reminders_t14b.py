@@ -41,7 +41,7 @@ class RemindersT14bReviewFixTests(unittest.IsolatedAsyncioTestCase):
         rem_id = database.add_message(
             user_id=chat_id,
             message_id=123,
-            send_at="2026-10-15 10:00:00",
+            send_at=(datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
             text_preview="Задача для теста",
             full_text="Полный текст задачи для теста",
         )
@@ -87,7 +87,7 @@ class RemindersT14bReviewFixTests(unittest.IsolatedAsyncioTestCase):
         rem_id = database.add_message(
             user_id=user_id,
             message_id=None,
-            send_at="2026-10-10 00:00:00",
+            send_at=(datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S"),
             text_preview=raw_text[:37],
             source_name=source_name,
             full_text=raw_text,

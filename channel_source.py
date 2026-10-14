@@ -447,7 +447,18 @@ class HybridChannelSource:
                     }
                 )
         except Exception as exc:
-            logger.warning("Failed to list personal channels: %s", exc)
+            wait_s = getattr(exc, "seconds", None)
+            if wait_s is not None:
+                logger.warning(
+                    "Failed to list personal channels: %s (wait %ss)",
+                    type(exc).__name__,
+                    wait_s,
+                )
+            else:
+                logger.warning(
+                    "Failed to list personal channels: %s",
+                    type(exc).__name__,
+                )
             return []
 
         # Sort: unread_count DESC, then date DESC

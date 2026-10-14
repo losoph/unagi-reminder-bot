@@ -26,6 +26,7 @@ from data.database import (
     get_channel_feed_backfilled_at,
     get_channel_scan_cursor,
     get_feed_subscription,
+    get_feed_subscription_by_username,
     get_feed_user_onboarding_shown,
     get_subscription_by_id,
     list_feed_subscriptions,
@@ -460,6 +461,17 @@ async def cb_feed_add_personal(callback: types.CallbackQuery):
     target_chan = channels[idx]
     username = target_chan["username"]
     title = target_chan["title"]
+
+    existing = get_feed_subscription_by_username(user_id, username)
+    if existing:
+        await callback.answer("уже в Ленте")
+        kb = build_personal_channels_keyboard(user_id, channels)
+        if callback.message:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=kb)
+            except TelegramAPIError:
+                pass
+        return
 
     try:
         add_feed_subscription(user_id, username, channel_title=title)

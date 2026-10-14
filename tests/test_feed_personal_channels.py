@@ -76,7 +76,7 @@ class FeedPersonalChannelsTests(unittest.IsolatedAsyncioTestCase):
     async def test_list_personal_channels_filters_and_sorts(self):
         """list_personal_channels keeps broadcast channels with username, <=30d, unread DESC, max 20."""
         source = HybridChannelSource()
-        now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
 
         dialogs = [
             # 1. Valid channel, unread=40, active 2 days ago
@@ -187,7 +187,7 @@ class FeedPersonalChannelsTests(unittest.IsolatedAsyncioTestCase):
                 entity=SimpleNamespace(broadcast=True, megagroup=False, username="my_chan"),
                 title="My Channel",
                 unread_count=5,
-                date=datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc),
+                date=datetime.now(timezone.utc) - timedelta(hours=1),
             )
         ])
         source._client = client
@@ -233,7 +233,7 @@ class FeedPersonalChannelsTests(unittest.IsolatedAsyncioTestCase):
                 entity=SimpleNamespace(broadcast=True, megagroup=False, username="onboard_chan"),
                 title="Onboard Channel",
                 unread_count=7,
-                date=datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc),
+                date=datetime.now(timezone.utc) - timedelta(hours=1),
             )
         ])
         source._client = client
@@ -282,7 +282,7 @@ class FeedPersonalChannelsTests(unittest.IsolatedAsyncioTestCase):
                 entity=SimpleNamespace(broadcast=True, megagroup=False, username="target_chan"),
                 title="Target Channel",
                 unread_count=12,
-                date=datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc),
+                date=datetime.now(timezone.utc) - timedelta(hours=1),
             )
         ])
         source._client = client
@@ -330,7 +330,7 @@ class FeedPersonalChannelsTests(unittest.IsolatedAsyncioTestCase):
                 entity=SimpleNamespace(broadcast=True, megagroup=False, username="cached_chan"),
                 title="Cached Channel",
                 unread_count=1,
-                date=datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc),
+                date=datetime.now(timezone.utc) - timedelta(hours=1),
             )
         ])
         source._client = client
