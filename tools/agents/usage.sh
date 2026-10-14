@@ -8,6 +8,8 @@ python3 - "$agy_log" "$oc_log" "$routes" <<'PY'
 import json, os, sys
 agy_path, oc_path, route_path = sys.argv[1:]
 routes = {}
+jev_cost = 0.0
+jev_seen = False
 if os.path.isfile(route_path):
     with open(route_path, encoding="utf-8") as stream:
         for line in stream:
@@ -15,7 +17,12 @@ if os.path.isfile(route_path):
                 item = json.loads(line)
             except ValueError:
                 continue
-            routes[item.get("title", "")] = item.get("model", "")
+            routes[(item.get("title", ""), item.get("agent", ""))] = item.get("model", "")
+            if item.get("source") == "jev" or (item.get("meta") or {}).get("router") == "jev":
+                jev_seen = True
+                cost = (item.get("meta") or {}).get("cost")
+                if isinstance(cost, (int, float)):
+                    jev_cost += cost
 
 def read(path):
     if not path or not os.path.isfile(path):
@@ -48,6 +55,8 @@ for event in read(oc_path):
     values = [v for v in usage.values() if isinstance(v, (int, float))]
     rows.append({"agent": "opencode", "title": title, "model": event.get("model") or part.get("model") or "", "input_tokens": usage.get("input", 0) or usage.get("inputTokens", 0), "output_tokens": usage.get("output", 0) or usage.get("outputTokens", 0), "total_tokens": usage.get("total", sum(values)), "cost": part.get("cost")})
 for row in rows:
-    selected = routes.get(row["title"], "")
+    selected = routes.get((row["title"], row["agent"]), routes.get((row["title"], ""), ""))
     print("agent={agent} title={title} selected_model={selected} actual_model={model} input={input_tokens} output={output_tokens} total={total_tokens} cost={cost}".format(selected=selected or "-", **row))
+if jev_seen:
+    print(f"jev_decisions cost={jev_cost:.8f}")
 PY
