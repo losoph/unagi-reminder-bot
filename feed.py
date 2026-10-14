@@ -58,9 +58,13 @@ _user_build_locks: dict[int, asyncio.Lock] = {}
 def get_fetch_semaphore() -> asyncio.Semaphore:
     """Return shared fetch semaphore with DIGEST_FETCH_CONCURRENCY limit."""
     global _fetch_semaphore
-    if _fetch_semaphore is None:
-        concurrency = int(os.getenv("DIGEST_FETCH_CONCURRENCY", "5"))
-        _fetch_semaphore = asyncio.Semaphore(concurrency)
+    if _fetch_semaphore is not None:
+        return _fetch_semaphore
+    if _channel_source is not None and hasattr(_channel_source, "fetch_semaphore"):
+        _fetch_semaphore = _channel_source.fetch_semaphore
+        return _fetch_semaphore
+    concurrency = int(os.getenv("DIGEST_FETCH_CONCURRENCY", "5"))
+    _fetch_semaphore = asyncio.Semaphore(concurrency)
     return _fetch_semaphore
 
 
@@ -83,6 +87,8 @@ def configure(
         _bot = bot
     if channel_source is not None:
         _channel_source = channel_source
+        if hasattr(channel_source, "fetch_semaphore"):
+            _fetch_semaphore = channel_source.fetch_semaphore
     if backfill_hook is not None:
         _backfill_hook = backfill_hook
     if fetch_semaphore is not None:
@@ -147,8 +153,8 @@ async def ingest_window(
             logger.warning("Failed to upsert channel posts for @%s: %s", clean_username, exc)
             return clean_username, posts
 
-        # Mark backfilled if full 30-day window was fetched
-        if is_backfill or marker_dt <= thirty_days_ago:
+        # Mark backfilled if full 30-day window was fetched with MTProto
+        if (is_backfill or marker_dt <= thirty_days_ago) and source_name == "mtproto":
             try:
                 set_channel_feed_backfilled_at(clean_username, now_dt)
             except Exception as exc:
@@ -212,6 +218,17 @@ def schedule_channel_backfill(channel_username: str) -> asyncio.Task | None:
         return task
     except RuntimeError:
         return None
+
+
+async def cancel_backfill_tasks() -> None:
+    """Cancel and await all pending background backfill tasks during shutdown."""
+    tasks = list(_backfill_tasks.values())
+    if not tasks:
+        return
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _backfill_tasks.clear()
 
 
 class FeedTagState(StatesGroup):
@@ -280,18 +297,19 @@ def build_feed_main_keyboard(total_channels: int, show_personal_btn: bool = Fals
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_feed_channel_actions(sub_id: int, is_paused: bool) -> InlineKeyboardMarkup:
+def build_feed_channel_actions(sub_id: int, is_paused: bool, page: int = 0) -> InlineKeyboardMarkup:
+    page_suffix = f":{page}" if page > 0 else ""
     toggle_btn = (
-        InlineKeyboardButton(text="▶️ Возобновить", callback_data=f"feed_resume:{sub_id}")
+        InlineKeyboardButton(text="▶️ Возобновить", callback_data=f"feed_resume:{sub_id}{page_suffix}")
         if is_paused
-        else InlineKeyboardButton(text="⏸ Пауза", callback_data=f"feed_pause:{sub_id}")
+        else InlineKeyboardButton(text="⏸ Пауза", callback_data=f"feed_pause:{sub_id}{page_suffix}")
     )
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🏷 Тег", callback_data=f"ftag:{sub_id}")],
+            [InlineKeyboardButton(text="🏷 Тег", callback_data=f"ftag:{sub_id}{page_suffix}")],
             [toggle_btn],
-            [InlineKeyboardButton(text="🗑 Убрать из Ленты", callback_data=f"feed_del:{sub_id}")],
-            [InlineKeyboardButton(text="🔙 К списку", callback_data="feed_channels_0")],
+            [InlineKeyboardButton(text="🗑 Убрать из Ленты", callback_data=f"feed_del:{sub_id}{page_suffix}")],
+            [InlineKeyboardButton(text="🔙 К списку", callback_data=f"feed_channels_{page}")],
         ]
     )
 
@@ -517,12 +535,13 @@ async def cb_feed_channels(callback: types.CallbackQuery, state: FSMContext):
     else:
         text = f"📋 <b>Каналы Ленты ({total})</b>\nВыбери канал для управления:"
         buttons = []
+        page_suffix = f":{page}" if page > 0 else ""
         for s in page_subs:
             title = s["channel_title"] or s["channel_username"]
             tag_str = f" · #{s['tag']}" if s["tag"] else ""
             status_prefix = "⏸ " if s["is_paused"] else ""
             btn_text = f"📰 {status_prefix}{title}{tag_str}"
-            buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"feed_ch:{s['id']}")])
+            buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"feed_ch:{s['id']}{page_suffix}")])
 
         nav_row = []
         if page > 0:
@@ -547,8 +566,10 @@ async def cb_feed_channels(callback: types.CallbackQuery, state: FSMContext):
 async def cb_feed_channel_card(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     user_id = callback.from_user.id
+    parts = callback.data.split(":")
     try:
-        sub_id = int(callback.data.split(":")[1])
+        sub_id = int(parts[1])
+        page = int(parts[2]) if len(parts) > 2 else 0
     except (IndexError, ValueError):
         await callback.answer("❌ Некорректные данные.")
         return
@@ -567,7 +588,7 @@ async def cb_feed_channel_card(callback: types.CallbackQuery, state: FSMContext)
         f"🏷 Раздел: {tag_str}\n"
         f"Статус: {status_str}"
     )
-    kb = build_feed_channel_actions(sub_id, bool(sub["is_paused"]))
+    kb = build_feed_channel_actions(sub_id, bool(sub["is_paused"]), page=page)
 
     if callback.message:
         try:
@@ -580,8 +601,10 @@ async def cb_feed_channel_card(callback: types.CallbackQuery, state: FSMContext)
 @router.callback_query(F.data.startswith("feed_pause:"))
 async def cb_feed_pause(callback: types.CallbackQuery):
     user_id = callback.from_user.id
+    parts = callback.data.split(":")
     try:
-        sub_id = int(callback.data.split(":")[1])
+        sub_id = int(parts[1])
+        page = int(parts[2]) if len(parts) > 2 else 0
     except (IndexError, ValueError):
         await callback.answer("❌ Некорректные данные.")
         return
@@ -598,7 +621,7 @@ async def cb_feed_pause(callback: types.CallbackQuery):
             f"🏷 Раздел: {tag_str}\n"
             "Статус: ⏸ На паузе"
         )
-        kb = build_feed_channel_actions(sub_id, True)
+        kb = build_feed_channel_actions(sub_id, True, page=page)
         try:
             await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         except TelegramAPIError:
@@ -608,8 +631,10 @@ async def cb_feed_pause(callback: types.CallbackQuery):
 @router.callback_query(F.data.startswith("feed_resume:"))
 async def cb_feed_resume(callback: types.CallbackQuery):
     user_id = callback.from_user.id
+    parts = callback.data.split(":")
     try:
-        sub_id = int(callback.data.split(":")[1])
+        sub_id = int(parts[1])
+        page = int(parts[2]) if len(parts) > 2 else 0
     except (IndexError, ValueError):
         await callback.answer("❌ Некорректные данные.")
         return
@@ -626,7 +651,7 @@ async def cb_feed_resume(callback: types.CallbackQuery):
             f"🏷 Раздел: {tag_str}\n"
             "Статус: ✅ Активен"
         )
-        kb = build_feed_channel_actions(sub_id, False)
+        kb = build_feed_channel_actions(sub_id, False, page=page)
         try:
             await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         except TelegramAPIError:
@@ -636,14 +661,24 @@ async def cb_feed_resume(callback: types.CallbackQuery):
 @router.callback_query(F.data.startswith("feed_del:"))
 async def cb_feed_delete(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
+    parts = callback.data.split(":")
     try:
-        sub_id = int(callback.data.split(":")[1])
+        sub_id = int(parts[1])
+        page = int(parts[2]) if len(parts) > 2 else 0
     except (IndexError, ValueError):
         await callback.answer("❌ Некорректные данные.")
         return
 
     delete_feed_subscription(user_id, sub_id)
     await callback.answer("🗑 Канал убран из Ленты")
+
+    subs = list_feed_subscriptions(user_id, include_paused=True)
+    page_size = 8
+    total = len(subs)
+    if page > 0 and (page * page_size) >= total:
+        page = max(0, page - 1)
+
+    callback.data = f"feed_channels_{page}"
     await cb_feed_channels(callback, state)
 
 
@@ -655,8 +690,10 @@ async def cb_feed_delete(callback: types.CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("ftag:"))
 async def cb_feed_tag_menu(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
+    parts = callback.data.split(":")
     try:
-        sub_id = int(callback.data.split(":")[1])
+        sub_id = int(parts[1])
+        page = int(parts[2]) if len(parts) > 2 else 0
     except (IndexError, ValueError):
         await callback.answer("❌ Некорректные данные.")
         return
@@ -668,7 +705,7 @@ async def cb_feed_tag_menu(callback: types.CallbackQuery, state: FSMContext):
 
     existing_tags = list_feed_tags(user_id)[:8]
     await state.set_state(FeedTagState.waiting_for_tag)
-    await state.update_data(tag_sub_id=sub_id, tag_choices=existing_tags)
+    await state.update_data(tag_sub_id=sub_id, tag_choices=existing_tags, page=page)
 
     buttons = []
     # Up to 8 existing tags in 2 columns
@@ -681,9 +718,10 @@ async def cb_feed_tag_menu(callback: types.CallbackQuery, state: FSMContext):
     if row:
         buttons.append(row)
 
+    page_suffix = f":{page}" if page > 0 else ""
     buttons.append([InlineKeyboardButton(text="✏️ Новый тег", callback_data="ftag_new")])
     buttons.append([InlineKeyboardButton(text="🚫 Без тега", callback_data="ftag_clear")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"feed_ch:{sub_id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"feed_ch:{sub_id}{page_suffix}")])
 
     title_safe = html.escape(sub["channel_title"] or sub["channel_username"])
     text = (
@@ -716,6 +754,8 @@ async def cb_feed_tag_pick(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     sub_id = data.get("tag_sub_id")
     choices = data.get("tag_choices") or []
+    page = data.get("page", 0)
+    page_suffix = f":{page}" if page > 0 else ""
 
     if sub_id is None or not (0 <= idx < len(choices)):
         await callback.answer("❌ Тег не найден.")
@@ -727,7 +767,7 @@ async def cb_feed_tag_pick(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer(f"✅ Установлен тег #{tag}")
 
     # Return to channel card
-    callback.data = f"feed_ch:{sub_id}"
+    callback.data = f"feed_ch:{sub_id}{page_suffix}"
     await cb_feed_channel_card(callback, state)
 
 
@@ -736,13 +776,15 @@ async def cb_feed_tag_clear(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     data = await state.get_data()
     sub_id = data.get("tag_sub_id")
+    page = data.get("page", 0)
+    page_suffix = f":{page}" if page > 0 else ""
     if sub_id:
         set_feed_tag(user_id, sub_id, None)
     await state.clear()
     await callback.answer("✅ Тег снят")
 
     if sub_id:
-        callback.data = f"feed_ch:{sub_id}"
+        callback.data = f"feed_ch:{sub_id}{page_suffix}"
         await cb_feed_channel_card(callback, state)
 
 
@@ -750,6 +792,8 @@ async def cb_feed_tag_clear(callback: types.CallbackQuery, state: FSMContext):
 async def cb_feed_tag_new(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     sub_id = data.get("tag_sub_id")
+    page = data.get("page", 0)
+    page_suffix = f":{page}" if page > 0 else ""
 
     text = (
         "✏️ <b>Ввод нового тега</b>\n\n"
@@ -757,7 +801,7 @@ async def cb_feed_tag_new(callback: types.CallbackQuery, state: FSMContext):
         "⚠️ Тег виден на странице Ленты в Telegraph — её может открыть любой, у кого есть ссылка."
     )
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data=f"feed_ch:{sub_id}")]]
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data=f"feed_ch:{sub_id}{page_suffix}")]]
     )
     if callback.message:
         try:
@@ -783,10 +827,14 @@ async def process_feed_tag_text(message: types.Message, state: FSMContext):
         await message.answer("❌ Данные канала утеряны. Открой /feed заново.")
         return
 
-    set_feed_tag(message.chat.id, sub_id, tag)
+    from_user_id = getattr(message.from_user, "id", None) if message.from_user else None
+    user_id = from_user_id if isinstance(from_user_id, int) else message.chat.id
+    set_feed_tag(user_id, sub_id, tag)
+    page = data.get("page", 0)
+    page_suffix = f":{page}" if page > 0 else ""
     await state.clear()
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="📰 К карточке канала", callback_data=f"feed_ch:{sub_id}")]]
+        inline_keyboard=[[InlineKeyboardButton(text="📰 К карточке канала", callback_data=f"feed_ch:{sub_id}{page_suffix}")]]
     )
     await message.answer(f"✅ Установлен тег <b>#{html.escape(tag)}</b>", parse_mode="HTML", reply_markup=kb)
 

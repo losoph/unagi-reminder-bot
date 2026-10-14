@@ -421,12 +421,12 @@ class FeedIngestAndMetricsTests(unittest.IsolatedAsyncioTestCase):
         channel = "backfill_chan"
         now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
 
-        # Digest had a cursor from 1 hour ago, but history is NOT backfilled yet
-        database.update_channel_scan_cursor(channel, now - timedelta(hours=1), 10)
+        # Digest had a cursor from 2 hours ago, but history is NOT backfilled yet
+        database.update_channel_scan_cursor(channel, now - timedelta(hours=2), 10)
         self.assertIsNone(database.get_channel_feed_backfilled_at(channel))
 
         # Feed loads for month (30d ago) without backfill flag yet:
-        # It should query from 30 days ago, not 1 hour ago!
+        # It should query from 30 days ago, not 2 hours ago!
         captured_markers = []
 
         async def fake_fetch(username, marker_str, **kwargs):
@@ -439,17 +439,17 @@ class FeedIngestAndMetricsTests(unittest.IsolatedAsyncioTestCase):
         thirty_days_ago = now - timedelta(days=30)
         await feed.ingest_window([channel], window_start=thirty_days_ago, now=now, channel_source=source)
 
-        # Verify marker was 30 days ago (ignoring 1h cursor!)
+        # Verify marker was 30 days ago (ignoring 2h cursor!)
         self.assertEqual(database.parse_db_datetime(captured_markers[0]), thirty_days_ago)
 
         # feed_backfilled_at is now set!
         self.assertIsNotNone(database.get_channel_feed_backfilled_at(channel))
 
         # Next time: backfilled is set, so marker = max(window_start, cursor)
-        database.update_channel_scan_cursor(channel, now - timedelta(hours=2), 15)
+        database.update_channel_scan_cursor(channel, now - timedelta(hours=1), 15)
         await feed.ingest_window([channel], window_start=thirty_days_ago, now=now, channel_source=source)
-        # Should use max(30d ago, 2h ago) = 2h ago
-        self.assertEqual(database.parse_db_datetime(captured_markers[1]), now - timedelta(hours=2))
+        # Should use max(30d ago, 1h ago) = 1h ago
+        self.assertEqual(database.parse_db_datetime(captured_markers[1]), now - timedelta(hours=1))
 
     async def test_schedule_channel_backfill_deduplication(self):
         """schedule_channel_backfill deduplicates simultaneous requests for the same channel."""

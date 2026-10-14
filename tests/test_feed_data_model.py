@@ -60,8 +60,8 @@ class FeedDataModelTests(unittest.TestCase):
         self.assertEqual(sub_id_1, sub_id_2)
         subs = database.list_feed_subscriptions(201)
         self.assertEqual(len(subs), 1)
-        self.assertEqual(subs[0]["channel_title"], "New Title")
-        self.assertEqual(subs[0]["tag"], "it")
+        self.assertEqual(subs[0]["channel_title"], "Old Title")
+        self.assertEqual(subs[0]["tag"], "tech")
         self.assertEqual(subs[0]["channel_username"], "techchannel")
 
     def test_feed_limit_max_channels(self):

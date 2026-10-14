@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -34,9 +35,21 @@ class HybridChannelSource:
         self.fetch_limit = max(20, int(os.getenv("MTPROTO_FETCH_LIMIT", "1000")))
         self._client = None
         self.account_id: int | None = None
+        self._fetch_semaphore = None
 
         if self.mode not in {"auto", "mtproto", "web"}:
             raise ValueError("CHANNEL_SOURCE must be one of: auto, mtproto, web")
+
+    @property
+    def fetch_semaphore(self) -> asyncio.Semaphore:
+        if self._fetch_semaphore is None:
+            concurrency = int(os.getenv("DIGEST_FETCH_CONCURRENCY", "5"))
+            self._fetch_semaphore = asyncio.Semaphore(concurrency)
+        return self._fetch_semaphore
+
+    @fetch_semaphore.setter
+    def fetch_semaphore(self, sem: asyncio.Semaphore) -> None:
+        self._fetch_semaphore = sem
 
     @property
     def mtproto_configured(self) -> bool:
@@ -290,6 +303,15 @@ class HybridChannelSource:
                 views_list = result
             elif views_list is None:
                 views_list = []
+
+            if len(views_list) != len(batch):
+                logger.warning(
+                    "Length mismatch in GetMessagesViewsRequest for @%s: expected %d, got %d; aborting refresh for this channel",
+                    clean_username,
+                    len(batch),
+                    len(views_list),
+                )
+                break
 
             metrics_to_update = []
             for post_id, v in zip(batch, views_list):

@@ -198,7 +198,7 @@ class RemindersT18Tests(unittest.TestCase):
         self.assertIn("⏰ Перенести", btn_texts_no)
 
     def test_source_url_database_roundtrip(self):
-        future = database.serialize_datetime(self.now + timedelta(days=2))
+        future = database.serialize_datetime(database.utc_now() + timedelta(days=2))
         url = "https://t.me/mychannel/42"
         row_id = database.add_message(
             user_id=888,
@@ -216,7 +216,7 @@ class RemindersT18Tests(unittest.TestCase):
         # Reschedule retains source_url
         database.mark_as_sent(row_id, delivered_message_id=999)
         new_row_id = database.replace_sent_reminder_with_pending(
-            888, row_id, message_id=42, send_at=database.serialize_datetime(self.now + timedelta(days=3))
+            888, row_id, message_id=42, send_at=database.serialize_datetime(database.utc_now() + timedelta(days=3))
         )
         rescheduled_row = database.get_reminder_by_id(888, new_row_id)
         self.assertEqual(rescheduled_row["source_url"], url)

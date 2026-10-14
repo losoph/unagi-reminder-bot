@@ -53,6 +53,34 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def normalize_feed_datetime(val: datetime | str) -> str:
+    """Normalize datetime or string to DB_DATETIME_FORMAT UTC string.
+
+    Accepts timezone-aware datetime or string in DB_DATETIME_FORMAT / ISO format.
+    Raises ValueError on naive datetime or invalid format.
+    """
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            raise ValueError(f"Datetime must be timezone-aware: {val}")
+        return serialize_datetime(val)
+    if isinstance(val, str):
+        val_clean = val.strip()
+        try:
+            dt = datetime.strptime(val_clean, DB_DATETIME_FORMAT).replace(tzinfo=UTC)
+            return serialize_datetime(dt)
+        except ValueError:
+            pass
+        try:
+            dt = datetime.fromisoformat(val_clean)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            return serialize_datetime(dt)
+        except ValueError:
+            pass
+        raise ValueError(f"Invalid datetime format: {val}")
+    raise ValueError(f"Expected datetime or str, got {type(val)}")
+
+
 def normalize_channel_username(channel_username: str) -> str:
     if isinstance(channel_username, str):
         return channel_username.lstrip('@').lower()
@@ -643,9 +671,6 @@ def init_db():
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_feed_editions_lookup ON feed_editions(user_id, period, subs_hash, created_at)"
-        )
-        cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_channel_posts_channel_time ON channel_posts(channel_username, post_time)"
         )
 
         _migrate_legacy_local_timestamps_to_utc(cursor)
@@ -1282,18 +1307,27 @@ def update_channel_scan_cursor(
     last_scanned_post_id: int | None = None,
 ) -> None:
     normalized = normalize_channel_username(channel_username)
-    if isinstance(last_scanned_at, datetime):
-        scanned_str = serialize_datetime(last_scanned_at)
+    if last_scanned_at is not None:
+        scanned_str = normalize_feed_datetime(last_scanned_at)
     else:
-        scanned_str = last_scanned_at
+        scanned_str = None
     with get_connection() as conn:
         conn.execute(
             '''
             INSERT INTO channels (channel_username, last_scanned_at, last_scanned_post_id)
             VALUES (?, ?, ?)
             ON CONFLICT(channel_username) DO UPDATE SET
-                last_scanned_at = COALESCE(excluded.last_scanned_at, channels.last_scanned_at),
-                last_scanned_post_id = COALESCE(excluded.last_scanned_post_id, channels.last_scanned_post_id)
+                last_scanned_at = CASE
+                    WHEN channels.last_scanned_at IS NULL THEN excluded.last_scanned_at
+                    WHEN excluded.last_scanned_at IS NULL THEN channels.last_scanned_at
+                    WHEN excluded.last_scanned_at > channels.last_scanned_at THEN excluded.last_scanned_at
+                    ELSE channels.last_scanned_at
+                END,
+                last_scanned_post_id = CASE
+                    WHEN excluded.last_scanned_at IS NOT NULL AND (channels.last_scanned_at IS NULL OR excluded.last_scanned_at > channels.last_scanned_at) THEN excluded.last_scanned_post_id
+                    WHEN excluded.last_scanned_at IS NOT NULL AND excluded.last_scanned_at = channels.last_scanned_at THEN MAX(COALESCE(excluded.last_scanned_post_id, 0), COALESCE(channels.last_scanned_post_id, 0))
+                    ELSE channels.last_scanned_post_id
+                END
             ''',
             (normalized, scanned_str, last_scanned_post_id),
         )
@@ -2718,6 +2752,13 @@ def cleanup_old_records(now_str: str) -> dict[str, int]:
             """,
             (now_str,),
         ).rowcount
+        feed_editions_deleted = conn.execute(
+            """
+            DELETE FROM feed_editions
+            WHERE created_at < datetime(?, '-2 days')
+            """,
+            (now_str,),
+        ).rowcount
         conn.commit()
 
     return {
@@ -2729,6 +2770,7 @@ def cleanup_old_records(now_str: str) -> dict[str, int]:
         "digest_executions_deleted": digest_executions_deleted,
         "digest_alerts_deleted": digest_alerts_deleted,
         "ai_usage_deleted": ai_usage_deleted,
+        "feed_editions_deleted": feed_editions_deleted,
     }
 
 
@@ -2848,7 +2890,20 @@ def normalize_feed_tag(tag: str | None) -> str | None:
     cleaned = cleaned.lstrip("#").strip()
     if not cleaned:
         return None
-    return cleaned[:24]
+    cleaned = cleaned[:24]
+    dangling_chars = {
+        "\u200d",
+        "\ufe0f",
+        "\U0001f3fb",
+        "\U0001f3fc",
+        "\U0001f3fd",
+        "\U0001f3fe",
+        "\U0001f3ff",
+    }
+    while cleaned and cleaned[-1] in dangling_chars:
+        cleaned = cleaned[:-1]
+    cleaned = cleaned.strip()
+    return cleaned or None
 
 
 def count_feed_subscriptions(user_id: int, include_paused: bool = True) -> int:
@@ -2881,38 +2936,36 @@ def add_feed_subscription(
     created_at = serialize_datetime(utc_now())
 
     with get_connection() as conn:
-        existing = conn.execute(
-            "SELECT id, channel_title, tag FROM feed_subscriptions WHERE user_id = ? AND channel_username = ?",
-            (user_id, normalized_username),
-        ).fetchone()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = conn.execute(
+                "SELECT id, channel_title, tag FROM feed_subscriptions WHERE user_id = ? AND channel_username = ?",
+                (user_id, normalized_username),
+            ).fetchone()
 
-        if existing:
-            sub_id = existing["id"]
-            new_title = channel_title if channel_title is not None else existing["channel_title"]
-            new_tag = normalized_tag if tag is not None else existing["tag"]
-            conn.execute(
-                "UPDATE feed_subscriptions SET channel_title = ?, tag = ? WHERE id = ?",
-                (new_title, new_tag, sub_id),
+            if existing:
+                conn.commit()
+                return existing["id"]
+
+            current_count = conn.execute(
+                "SELECT COUNT(*) FROM feed_subscriptions WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()[0]
+            if current_count >= MAX_FEED_CHANNELS:
+                raise ValueError(f"Превышен лимит каналов Ленты ({MAX_FEED_CHANNELS})")
+
+            cursor = conn.execute(
+                '''
+                INSERT INTO feed_subscriptions (user_id, channel_username, channel_title, tag, is_paused, created_at)
+                VALUES (?, ?, ?, ?, 0, ?)
+                ''',
+                (user_id, normalized_username, channel_title, normalized_tag, created_at),
             )
             conn.commit()
-            return sub_id
-
-        current_count = conn.execute(
-            "SELECT COUNT(*) FROM feed_subscriptions WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()[0]
-        if current_count >= MAX_FEED_CHANNELS:
-            raise ValueError(f"Превышен лимит каналов Ленты ({MAX_FEED_CHANNELS})")
-
-        cursor = conn.execute(
-            '''
-            INSERT INTO feed_subscriptions (user_id, channel_username, channel_title, tag, is_paused, created_at)
-            VALUES (?, ?, ?, ?, 0, ?)
-            ''',
-            (user_id, normalized_username, channel_title, normalized_tag, created_at),
-        )
-        conn.commit()
-        return cursor.lastrowid
+            return cursor.lastrowid
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def list_feed_subscriptions(user_id: int, include_paused: bool = True) -> list[sqlite3.Row]:
@@ -3035,8 +3088,8 @@ def get_feed_candidate_posts(
     window_end: datetime | str,
 ) -> list[dict]:
     """Выбрать посты каналов активных подписок Ленты за окно [window_start, window_end] с текстом."""
-    w_start = serialize_datetime(window_start) if isinstance(window_start, datetime) else str(window_start)
-    w_end = serialize_datetime(window_end) if isinstance(window_end, datetime) else str(window_end)
+    w_start = normalize_feed_datetime(window_start)
+    w_end = normalize_feed_datetime(window_end)
 
     with get_connection() as conn:
         rows = conn.execute(
@@ -3115,8 +3168,8 @@ def save_feed_edition(
     channel_count: int,
 ) -> int:
     """Сохранить запись о собранном выпуске Ленты в кеш."""
-    w_start = serialize_datetime(window_start) if isinstance(window_start, datetime) else str(window_start)
-    w_end = serialize_datetime(window_end) if isinstance(window_end, datetime) else str(window_end)
+    w_start = normalize_feed_datetime(window_start)
+    w_end = normalize_feed_datetime(window_end)
     created_at = serialize_datetime(utc_now())
     with get_connection() as conn:
         cursor = conn.execute(

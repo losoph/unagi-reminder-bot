@@ -53,6 +53,7 @@ from data.database import (
     get_digest_posts,
     get_digest_settings,
     get_email_delivery,
+    get_feed_subscription_by_username,
     get_user_email,
     delete_subscription,
     get_channel_posts_since,
@@ -3049,7 +3050,7 @@ async def cmd_check(message: types.Message, state: FSMContext):
         return
 
     status_msg = await message.answer("🔎 Проверяю доступность каналов...")
-    semaphore = asyncio.Semaphore(DIGEST_FETCH_CONCURRENCY)
+    semaphore = channel_source.fetch_semaphore
     old_marker = serialize_datetime(utc_now() - timedelta(days=3650))
 
     async with create_telegram_http_session() as session:
@@ -3422,6 +3423,7 @@ def _import_user_payload(user_id: int, payload) -> str:
     digest_settings = payload.get("digest_settings") or []
     now = local_now()
     added_subs = added_feed = added_bms = added_rems = 0
+    already_in_feed = 0
 
     for setting in digest_settings[:10]:
         period = setting.get("period")
@@ -3468,6 +3470,9 @@ def _import_user_payload(user_id: int, payload) -> str:
         if not username:
             continue
         try:
+            if get_feed_subscription_by_username(user_id, username):
+                already_in_feed += 1
+                continue
             sub_id = add_feed_subscription(
                 user_id,
                 username,
@@ -3521,10 +3526,14 @@ def _import_user_payload(user_id: int, payload) -> str:
         except Exception:
             logger.exception("Import: failed to add reminder")
 
+    feed_line = f"• Лента: +{added_feed}"
+    if already_in_feed:
+        feed_line += f" (уже были в Ленте: {already_in_feed})"
+
     return (
         "✅ <b>Импорт завершён</b>\n"
         f"• Подписки: +{added_subs}\n"
-        f"• Лента: +{added_feed}\n"
+        f"{feed_line}\n"
         f"• Закладки: +{added_bms}\n"
         f"• Напоминания: +{added_rems}\n\n"
         "Открой /list_digest, /saved или /list, чтобы проверить."
@@ -4351,7 +4360,7 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
     await message.answer("⏳ Собираю единый дайджест за последние 24 часа...")
     now_tz = local_now()
     last_24h_str = serialize_datetime(now_tz - timedelta(days=1))
-    semaphore = asyncio.Semaphore(DIGEST_FETCH_CONCURRENCY)
+    semaphore = channel_source.fetch_semaphore
 
     async with create_telegram_http_session() as session:
         async def load_posts(subscription) -> tuple[int, str, str | None, str, list[dict]]:
@@ -5370,7 +5379,7 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
 
 
 async def check_digests():
-    semaphore = asyncio.Semaphore(DIGEST_FETCH_CONCURRENCY)
+    semaphore = channel_source.fetch_semaphore
     logger.info(
         "📬 Сервис дайджестов запущен (проверка каждые %d сек / %d мин)",
         DIGEST_CHECK_INTERVAL_SECONDS,
@@ -5438,6 +5447,7 @@ async def main():
         for task in background_tasks:
             task.cancel()
         await asyncio.gather(*background_tasks, return_exceptions=True)
+        await feed.cancel_backfill_tasks()
         await channel_source.close()
 
 
