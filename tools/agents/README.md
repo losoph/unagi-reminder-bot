@@ -50,7 +50,19 @@ tools/agents/usage.sh
 
 ## Маршрутизация моделей и затраты
 
-`routing.json` задаёт перечень кандидатов и политику для видов `executor-complex`, `executor-ux`, `review`, `adversarial-review`, `docs`, `merge-audit`. `route.sh <agy|opencode> <task-kind> [description]` выводит `model=... effort=... reason=...` и добавляет JSON-событие в `$AGENT_ROUTE_LOG` (по умолчанию `.agents/routes.ndjson`). Внешний `AGENT_ROUTER_CMD` получает JSON задачи через stdin и JSON-ответ; в окружении доступен `AGENT_ROUTE_CANDIDATES`. Модель ответа обязана входить в allowlist из `routing.json`; при ошибке или таймауте в 10 секунд выбирается локальная политика.
+`routing.json` задаёт перечень кандидатов и статическую политику для видов `executor-complex`, `executor-ux`, `review`, `adversarial-review`, `docs`, `merge-audit`. `route.sh <agy|opencode|claude> <task-kind> [description]` выводит `model=... effort=... reason=...` и добавляет JSON-событие в `$AGENT_ROUTE_LOG` (по умолчанию `.agents/routes.ndjson`). Внешний `AGENT_ROUTER_CMD` получает JSON задачи через stdin и JSON-ответ; в окружении доступен `AGENT_ROUTE_CANDIDATES`.
+
+### Выбор модели на задачу через Jev
+
+Чтобы включить динамический выбор, задайте `OPENROUTER_API_KEY` (или `TYPESAFE_API_KEY`) и не устанавливайте `AGENT_ROUTER=static`. Доступны настройки `JEV_URL`, `JEV_MODEL`, `JEV_TIMEOUT` (10 секунд по умолчанию) и `JEV_MIN_CONFIDENCE` (0.4). Решение выдаётся в двух строках, включая `meta=` с вероятностями, уверенностью, стоимостью и задержкой. Например:
+
+```sh
+OPENROUTER_API_KEY="$OPENROUTER_API_KEY" tools/agents/route.sh opencode executor-complex 'Реализовать многофайловую задачу' --dry-run
+```
+
+Jev решает вопрос один раз на задачу, а не на каждый запрос к исполнителю: повторные вызовы исполнителя используют ту же выбранную модель, а кэширование промптов продолжает работать. При недоступности сервиса, низкой уверенности или рекомендации эскалации применяется неизменённая статическая политика; причина сохраняется как `fallback_reason`. `--dry-run` показывает результат и не пишет журнал маршрутов. Стоимость решений хранится отдельно в `meta.cost` и выводится `usage.sh` строкой `jev_decisions`.
+
+Используйте только API и ключ OpenRouter. Сторонний сайт thejevai.com и опубликованные на нём адрес API/инструкции по ключам к этой интеграции не относятся; не отправляйте туда ключ OpenRouter. Стоимость одного решения зависит от тарифа и длины описания, обычно она мала, но каждое обращение оплачивается отдельно.
 
 `usage.sh` суммирует доступные токены agy (`result.usage`) и opencode (`step_finish`), используя `$AGY_LOG_DIR/session.ndjson`, `$OC_LOG` и журнал маршрутов. Совпадение выбора модели с затратами выполняется по `title`; задавайте одинаковый title в маршрутизации и запуске, иначе выбранная модель будет `-`. Поддержка полей usage зависит от версии CLI и схемы его событий.
 

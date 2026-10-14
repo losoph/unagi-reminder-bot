@@ -48,7 +48,7 @@ class AgentToolkitTests(unittest.TestCase):
     def test_route_uses_policy_and_appends_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "routes.ndjson"
-            env = os.environ | {"AGENT_ROUTE_LOG": str(log)}
+            env = os.environ | {"AGENT_ROUTE_LOG": str(log), "AGENT_ROUTER": "static"}
             proc = self.run_cmd([str(TOOLS / "route.sh"), "agy", "docs", "Write docs"], env=env)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             # Ожидание берётся из самой политики: тест проверяет механизм, а не конкретную модель.
