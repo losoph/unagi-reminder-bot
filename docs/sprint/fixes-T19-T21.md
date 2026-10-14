@@ -30,3 +30,15 @@ T19b — правки по ревью T19/T20 (agy, первым коммито�
     len(views) != len(batch) — WARNING и прекратить обновление канала (не сопоставлять со сдвигом).
 13. Задачи фоновой подгрузки (feed._backfill_tasks) не отменяются при остановке бота: отменить и
     дождаться в shutdown рядом с остальными фоновыми задачами main.
+
+Этап 2б — сделать первым коммитом «fix: замечания ревью T24b и тесты с датами (T24b-fix)»:
+14. channel_source.list_personal_channels: при FloodWait и прочих ошибках логировать только тип
+    ошибки и секунды ожидания, без str(exc).
+15. feed.py: повторное «➕» по устаревшему списку для канала, уже стоящего в Ленте, — ответ
+    «уже в Ленте», без повторной подгрузки.
+16. tests/test_feed_personal_channels.py: test_add_personal_channel_by_index и
+    test_onboarding_shown_flag_for_owner падают при сдвиге часов на +30 суток (жёсткая дата активности
+    диалога против реального «сейчас»). Даты — от datetime.now(timezone.utc).
+17. tests/test_reminders_t14b.py: test_check_messages_escapes_html падает при сдвиге часов на −30 суток —
+    сделать даты относительными.
+Проверка 16–17: PYTHON=~/.venvs/unagi/bin/python tools/agents/time_shift_tests.sh — все сдвиги зелёные.
