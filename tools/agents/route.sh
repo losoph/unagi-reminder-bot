@@ -9,7 +9,11 @@ agent="$1" kind="$2"; shift 2
 dry_run=0
 args=()
 for arg in "$@"; do
-  if [ "$arg" = "--dry-run" ]; then dry_run=1; else args+=("$arg"); fi
+  case "$arg" in
+    --dry-run|--dry-run=true|--dry-run=1) dry_run=1 ;;
+    --*) echo "неизвестный аргумент: $arg" >&2; exit 2 ;;
+    *) args+=("$arg") ;;
+  esac
 done
 description="${args[*]:-}"
 case "$agent" in agy|opencode|claude) ;; *) echo "неподдерживаемый агент: $agent" >&2; exit 2;; esac
@@ -27,21 +31,26 @@ jev_status=3
 if [ "${AGENT_ROUTER:-}" != "static" ] && { [ -n "${OPENROUTER_API_KEY:-}" ] || [ -n "${TYPESAFE_API_KEY:-}" ]; }; then
   jev_enabled=1
 fi
-if [ "$jev_enabled" = 1 ] && [ -z "${AGENT_ROUTER_CMD:-}" ]; then
+if [ "${AGENT_ROUTER:-}" != "static" ] && [ -z "${AGENT_ROUTER_CMD:-}" ]; then
   jev_status=0
   response=""
-  printf '%s\n' "$task" | AGENT_ROUTING_POLICY="$POLICY" "$PYTHON" "$SCRIPT_DIR/routers/jev_decide.py" >"${TMPDIR:-/tmp}/jev-route-output-$$" 2>"${TMPDIR:-/tmp}/jev-route-error-$$" || jev_status=$?
-  response="$(cat "${TMPDIR:-/tmp}/jev-route-output-$$")"
-  rm -f "${TMPDIR:-/tmp}/jev-route-output-$$"
+  jev_output="$(mktemp "${TMPDIR:-/tmp}/jev-route-output.XXXXXX")" || exit 1
+  jev_error="$(mktemp "${TMPDIR:-/tmp}/jev-route-error.XXXXXX")" || { rm -f "$jev_output"; exit 1; }
+  cleanup_jev_files() { rm -f "$jev_output" "$jev_error"; }
+  trap cleanup_jev_files EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  printf '%s\n' "$task" | AGENT_ROUTING_POLICY="$POLICY" "$PYTHON" "$SCRIPT_DIR/routers/jev_decide.py" >"$jev_output" 2>"$jev_error" || jev_status=$?
+  response="$(cat "$jev_output")"
+  rm -f "$jev_output"
   if [ "$jev_status" = 0 ]; then
     parsed="$(printf '%s\n' "$response" | "$PYTHON" -c 'import json,sys; print(json.dumps({"model":sys.argv[1],"effort":sys.argv[2],"reason":"jev"}, ensure_ascii=False))' "$(sed -n '1s/^model=\([^ ]*\) effort=\([^ ]*\).*/\1/p' <<<"$response")" "$(sed -n '1s/^model=[^ ]* effort=\([^ ]*\).*/\1/p' <<<"$response")")"
     meta="$(sed -n 's/^meta=//p' <<<"$response" | tail -n 1)"
     ROUTER_STATUS="jev"
   fi
-  if [ "$jev_status" -ne 0 ] && [ "$jev_status" -ne 3 ]; then fallback_reason="jev_exit_${jev_status}:$(tr '\n' ' ' <"${TMPDIR:-/tmp}/jev-route-error-$$" | sed -E 's/(OPENROUTER_API_KEY|TYPESAFE_API_KEY|Bearer)[^ ]*/[REDACTED]/g' | cut -c1-240)"; fi
-  rm -f "${TMPDIR:-/tmp}/jev-route-error-$$"
-  if [ "$jev_status" = 3 ]; then fallback_reason=""; fi
-elif [ "${AGENT_ROUTER:-}" != "static" ] && [ "$jev_enabled" = 0 ] && [ -z "${OPENROUTER_API_KEY:-}${TYPESAFE_API_KEY:-}" ]; then
+  if [ "$jev_status" -ne 0 ] && [ "$jev_status" -ne 3 ]; then fallback_reason="jev_exit_${jev_status}:$(tr '\n' ' ' <"$jev_error" | sed -E 's/(OPENROUTER_API_KEY|TYPESAFE_API_KEY|Bearer)[^ ]*/[REDACTED]/g' | cut -c1-240)"; fi
+  if [ "$jev_status" = 3 ]; then fallback_reason="нет ключа OpenRouter"; fi
+elif [ "${AGENT_ROUTER:-}" != "static" ] && [ -z "${AGENT_ROUTER_CMD:-}" ] && [ "$jev_enabled" = 0 ] && [ -z "${OPENROUTER_API_KEY:-}${TYPESAFE_API_KEY:-}" ]; then
   ROUTER_STATUS="fallback"
   fallback_reason="нет ключа OpenRouter"
   jev_status=3

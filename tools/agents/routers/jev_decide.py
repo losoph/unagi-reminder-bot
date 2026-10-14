@@ -102,8 +102,13 @@ def decide(task, candidates):
         print("некорректная настройка таймаута или порога Jev", file=sys.stderr)
         return 4
     started = time.monotonic()
+    deadline = started + timeout
     response = None
     for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print("исчерпан общий таймаут Jev", file=sys.stderr)
+            return 5
         request = urllib.request.Request(
             url,
             data=body,
@@ -111,12 +116,18 @@ def decide(task, candidates):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as result:
+            with urllib.request.urlopen(request, timeout=remaining) as result:
                 response = json.loads(result.read())
             break
         except urllib.error.HTTPError as exc:
             if exc.code in (429, 529) and attempt < 2:
-                time.sleep(0.2 * (2**attempt))
+                pause = 0.2 * (2**attempt)
+                remaining = deadline - time.monotonic()
+                if remaining <= pause:
+                    time.sleep(max(remaining, 0))
+                    print("исчерпан общий таймаут Jev", file=sys.stderr)
+                    return 5
+                time.sleep(pause)
                 continue
             print(f"ошибка HTTP Jev: {exc.code}", file=sys.stderr)
             return 5

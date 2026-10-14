@@ -108,6 +108,13 @@ class JevRouterTests(unittest.TestCase):
         proc = self.invoke(timeout="0.05")
         self.assertEqual(proc.returncode, 5)
 
+    def test_timeout_covers_retries_and_backoff(self):
+        JevHandler.statuses = [429, 200]
+        JevHandler.delay = 0.15
+        proc = self.invoke(timeout="0.3")
+        self.assertEqual(proc.returncode, 5)
+        self.assertLess(len(JevHandler.requests), 2)
+
     def test_missing_key_skips_network(self):
         proc = self.invoke(key=None)
         self.assertEqual(proc.returncode, 3)
@@ -116,6 +123,20 @@ class JevRouterTests(unittest.TestCase):
     def test_empty_key_is_missing(self):
         proc = self.invoke(key="")
         self.assertEqual(proc.returncode, 3)
+
+    def test_route_cleans_temp_files_after_jev(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "routes.ndjson"
+            env = os.environ | {
+                "OPENROUTER_API_KEY": "test-secret",
+                "JEV_URL": self.url,
+                "AGENT_ROUTE_LOG": str(log),
+                "PYTHON": sys.executable,
+                "TMPDIR": tmp,
+            }
+            proc = subprocess.run([str(ROUTE), "agy", "docs", "--dry-run=1"], text=True, capture_output=True, env=env, check=False)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(list(Path(tmp).glob("jev-route-*")), [])
 
     def test_secret_never_reaches_output_or_route_log(self):
         secret = "fictional-secret-do-not-print"

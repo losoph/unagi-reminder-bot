@@ -45,6 +45,33 @@ class AgentToolkitTests(unittest.TestCase):
         self.assertIn("OC RUN END code=7 title=run-a", proc.stdout)
         self.assertIn("a.py", proc.stdout)
 
+    def test_route_dry_run_forms_and_rejects_unknown_options(self):
+        for option in ("--dry-run", "--dry-run=true", "--dry-run=1"):
+            with self.subTest(option=option), tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp) / "routes.ndjson"
+                env = os.environ | {"AGENT_ROUTE_LOG": str(log), "AGENT_ROUTER": "static"}
+                proc = self.run_cmd([str(TOOLS / "route.sh"), "agy", "docs", option], env=env)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertFalse(log.exists())
+
+        proc = self.run_cmd([str(TOOLS / "route.sh"), "agy", "docs", "--unknown"])
+        self.assertEqual(proc.returncode, 2)
+
+    def test_route_missing_key_is_logged_as_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "routes.ndjson"
+            env = os.environ | {
+                "AGENT_ROUTE_LOG": str(log),
+                "AGENT_ROUTER": "jev",
+                "OPENROUTER_API_KEY": "",
+                "TYPESAFE_API_KEY": "",
+            }
+            proc = self.run_cmd([str(TOOLS / "route.sh"), "agy", "docs"], env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            row = json.loads(log.read_text(encoding="utf-8"))
+            self.assertEqual(row["source"], "fallback")
+            self.assertEqual(row["fallback_reason"], "нет ключа OpenRouter")
+
     def test_route_uses_policy_and_appends_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "routes.ndjson"
