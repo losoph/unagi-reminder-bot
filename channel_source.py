@@ -349,3 +349,96 @@ class HybridChannelSource:
             await get_latest_posts(channel_username, last_scraped_at_str, session=web_session),
             "web",
         )
+
+    async def list_personal_channels(
+        self,
+        limit: int = 20,
+        *,
+        now: datetime | None = None,
+        exclude_usernames: set[str] | list[str] | None = None,
+    ) -> list[dict]:
+        """List owner's personal broadcast channels with public username.
+
+        Filters:
+        - Broadcast channels only (broadcast, not groups/megagroups)
+        - Public username
+        - Last message not older than 30 days
+        - Not in exclude_usernames
+        Sorted by unread_count DESC, then recent activity DESC.
+        Max `limit` channels (default 20).
+        On FloodWait or error: returns [] and logs WARNING.
+        DO NOT log dialog list or titles for privacy.
+        """
+        if self._client is None or not hasattr(self._client, "iter_dialogs"):
+            return []
+
+        from data.database import normalize_channel_username
+
+        now_dt = now or datetime.now(timezone.utc)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        cutoff = now_dt - timedelta(days=30)
+
+        excluded = {normalize_channel_username(u) for u in (exclude_usernames or []) if u}
+
+        candidates = []
+        try:
+            async for dialog in self._client.iter_dialogs(limit=300):
+                # Check broadcast channel (not group)
+                is_channel = getattr(dialog, "is_channel", False)
+                is_group = getattr(dialog, "is_group", False)
+                entity = getattr(dialog, "entity", None)
+                is_megagroup = getattr(entity, "megagroup", False) if entity else False
+                is_broadcast = getattr(entity, "broadcast", False) if entity else False
+
+                if not is_broadcast and (not is_channel or is_group or is_megagroup):
+                    continue
+
+                raw_username = getattr(entity, "username", None) or getattr(dialog, "username", None)
+                if not raw_username:
+                    continue
+
+                clean = normalize_channel_username(raw_username)
+                if not clean or clean in excluded:
+                    continue
+
+                dialog_date = getattr(dialog, "date", None)
+                if dialog_date is None:
+                    continue
+                if dialog_date.tzinfo is None:
+                    dialog_date = dialog_date.replace(tzinfo=timezone.utc)
+                else:
+                    dialog_date = dialog_date.astimezone(timezone.utc)
+
+                if dialog_date < cutoff:
+                    continue
+
+                unread_count = getattr(dialog, "unread_count", 0) or 0
+                title = getattr(dialog, "title", None) or getattr(dialog, "name", None) or clean
+
+                candidates.append(
+                    {
+                        "username": clean,
+                        "title": title,
+                        "unread_count": int(unread_count),
+                        "date": dialog_date,
+                    }
+                )
+        except Exception as exc:
+            logger.warning("Failed to list personal channels: %s", exc)
+            return []
+
+        # Sort: unread_count DESC, then date DESC
+        candidates.sort(key=lambda c: (-c["unread_count"], -c["date"].timestamp()))
+
+        result = [
+            {
+                "username": c["username"],
+                "title": c["title"],
+                "unread_count": c["unread_count"],
+            }
+            for c in candidates[:limit]
+        ]
+        # Privacy invariant: do NOT log channel names or titles
+        logger.debug("Discovered %d personal broadcast channels", len(result))
+        return result

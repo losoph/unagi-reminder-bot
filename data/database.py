@@ -621,6 +621,14 @@ def init_db():
             )
             '''
         )
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS feed_user_state (
+                user_id INTEGER PRIMARY KEY,
+                onboarding_shown_at DATETIME
+            )
+            '''
+        )
         for statement in (
             "ALTER TABLE feed_subscriptions ADD COLUMN tag TEXT",
             "ALTER TABLE feed_subscriptions ADD COLUMN is_paused INTEGER DEFAULT 0",
@@ -3167,3 +3175,34 @@ def get_feed_edition(
 
 
 get_feed_edition_cache = get_feed_edition
+
+
+def get_feed_user_onboarding_shown(user_id: int) -> bool:
+    """Проверить, был ли показан онбординг личных каналов пользователю."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT onboarding_shown_at FROM feed_user_state WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return bool(row and row["onboarding_shown_at"] is not None)
+
+
+def set_feed_user_onboarding_shown(user_id: int, shown_at: datetime | str | None = None) -> None:
+    """Установить отметку показа онбординга личных каналов."""
+    if shown_at is None:
+        val = serialize_datetime(utc_now())
+    elif isinstance(shown_at, datetime):
+        val = serialize_datetime(shown_at)
+    else:
+        val = str(shown_at)
+    with get_connection() as conn:
+        conn.execute(
+            '''
+            INSERT INTO feed_user_state (user_id, onboarding_shown_at)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                onboarding_shown_at = excluded.onboarding_shown_at
+            ''',
+            (user_id, val),
+        )
+        conn.commit()

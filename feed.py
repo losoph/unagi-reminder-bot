@@ -26,6 +26,7 @@ from data.database import (
     get_channel_feed_backfilled_at,
     get_channel_scan_cursor,
     get_feed_subscription,
+    get_feed_user_onboarding_shown,
     get_subscription_by_id,
     list_feed_subscriptions,
     list_feed_tags,
@@ -36,6 +37,7 @@ from data.database import (
     set_channel_feed_backfilled_at,
     set_feed_paused,
     set_feed_tag,
+    set_feed_user_onboarding_shown,
     update_channel_scan_cursor,
     upsert_channel_posts,
     utc_now,
@@ -220,26 +222,62 @@ class FeedTagState(StatesGroup):
 # Keyboards and Screen Builders
 # ---------------------------------------------------------------------------
 
+FEED_PERSONAL_CHANNELS_CACHE_SECONDS = 15 * 60
+_personal_channels_cache: dict[int, tuple[float, list[dict]]] = {}
 
-def build_feed_main_keyboard(total_channels: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="☀️ День", callback_data="feed_period_day"),
-                InlineKeyboardButton(text="🗓 Неделя", callback_data="feed_period_week"),
-                InlineKeyboardButton(text="📆 Месяц", callback_data="feed_period_month"),
-            ],
-            [
-                InlineKeyboardButton(
-                    text=f"📋 Каналы Ленты ({total_channels})",
-                    callback_data="feed_channels_0",
-                ),
-            ],
-            [
-                InlineKeyboardButton(text="ℹ️ Как добавить", callback_data="feed_help"),
-            ],
-        ]
-    )
+
+def is_session_owner(user_id: int) -> bool:
+    """Return True if user_id is the MTProto session owner."""
+    if _channel_source is None:
+        return False
+    account_id = getattr(_channel_source, "account_id", None)
+    return account_id is not None and int(user_id) == int(account_id)
+
+
+def get_cached_personal_channels(user_id: int) -> list[dict] | None:
+    try:
+        loop = asyncio.get_running_loop()
+        now_ts = loop.time()
+    except RuntimeError:
+        return None
+    if user_id in _personal_channels_cache:
+        cached_time, channels = _personal_channels_cache[user_id]
+        if now_ts - cached_time < FEED_PERSONAL_CHANNELS_CACHE_SECONDS:
+            return channels
+    return None
+
+
+def set_cached_personal_channels(user_id: int, channels: list[dict]) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+        now_ts = loop.time()
+    except RuntimeError:
+        now_ts = 0.0
+    _personal_channels_cache[user_id] = (now_ts, channels)
+
+
+def build_feed_main_keyboard(total_channels: int, show_personal_btn: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="☀️ День", callback_data="feed_period_day"),
+            InlineKeyboardButton(text="🗓 Неделя", callback_data="feed_period_week"),
+            InlineKeyboardButton(text="📆 Месяц", callback_data="feed_period_month"),
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"📋 Каналы Ленты ({total_channels})",
+                callback_data="feed_channels_0",
+            ),
+        ],
+    ]
+    if show_personal_btn:
+        rows.append([
+            InlineKeyboardButton(text="➕ Из моих подписок", callback_data="feed_personal")
+        ])
+    rows.append([
+        InlineKeyboardButton(text="ℹ️ Как добавить", callback_data="feed_help")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_feed_channel_actions(sub_id: int, is_paused: bool) -> InlineKeyboardMarkup:
@@ -258,15 +296,65 @@ def build_feed_channel_actions(sub_id: int, is_paused: bool) -> InlineKeyboardMa
     )
 
 
+def build_personal_channels_keyboard(user_id: int, channels: list[dict]) -> InlineKeyboardMarkup:
+    feed_subs = {s["channel_username"].lower() for s in list_feed_subscriptions(user_id, include_paused=True)}
+    buttons = []
+    for idx, c in enumerate(channels):
+        is_added = c["username"].lower() in feed_subs
+        if is_added:
+            btn_text = f"✅ {c['title']}"
+        else:
+            unread = c.get("unread_count", 0)
+            suffix = f" · {unread}" if unread > 0 else ""
+            btn_text = f"➕ {c['title']}{suffix}"
+        if len(btn_text) > 40:
+            btn_text = btn_text[:37] + "..."
+        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"fadd_p:{idx}")])
+
+    buttons.append([
+        InlineKeyboardButton(text="✅ Готово", callback_data="feed_main"),
+        InlineKeyboardButton(text="🔙 К Ленте", callback_data="feed_main"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 # ---------------------------------------------------------------------------
 # UX: Main screen & Help
 # ---------------------------------------------------------------------------
 
 
-async def render_feed_main(target: types.Message | types.CallbackQuery, user_id: int, edit: bool = False):
-    total = count_feed_subscriptions(user_id, include_paused=True)
-    text = f"📰 <b>Лента</b> — главное из {total} каналов"
-    kb = build_feed_main_keyboard(total)
+async def render_personal_channels(
+    target: types.Message | types.CallbackQuery,
+    user_id: int,
+    edit: bool = False,
+    force_refresh: bool = False,
+):
+    if not is_session_owner(user_id):
+        return
+
+    channels = get_cached_personal_channels(user_id)
+    if channels is None or force_refresh:
+        existing = {s["channel_username"].lower() for s in list_feed_subscriptions(user_id, include_paused=True)}
+        if _channel_source is not None and hasattr(_channel_source, "list_personal_channels"):
+            channels = await _channel_source.list_personal_channels(limit=20, exclude_usernames=existing)
+        else:
+            channels = []
+        set_cached_personal_channels(user_id, channels)
+
+    if not channels:
+        text = (
+            "ℹ️ <b>Подбор каналов из твоих подписок</b>\n\n"
+            "Не найдено активных публичных каналов за последние 30 дней, которых ещё нет в Ленте."
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔙 К Ленте", callback_data="feed_main")]]
+        )
+    else:
+        text = (
+            "Выбери каналы для Ленты — по одному. "
+            "Это твои активные подписки с наибольшим числом непрочитанных:"
+        )
+        kb = build_personal_channels_keyboard(user_id, channels)
 
     if edit and isinstance(target, types.CallbackQuery) and target.message:
         try:
@@ -277,14 +365,41 @@ async def render_feed_main(target: types.Message | types.CallbackQuery, user_id:
 
     if isinstance(target, types.CallbackQuery) and target.message:
         await target.message.answer(text, parse_mode="HTML", reply_markup=kb)
-    elif isinstance(target, types.Message):
+    elif hasattr(target, "answer"):
+        await target.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def render_feed_main(target: types.Message | types.CallbackQuery, user_id: int, edit: bool = False):
+    is_owner = is_session_owner(user_id)
+    if is_owner:
+        onboarding_shown = get_feed_user_onboarding_shown(user_id)
+        if not onboarding_shown:
+            set_feed_user_onboarding_shown(user_id)
+            await render_personal_channels(target, user_id, edit=edit)
+            return
+
+    total = count_feed_subscriptions(user_id, include_paused=True)
+    text = f"📰 <b>Лента</b> — главное из {total} каналов"
+    kb = build_feed_main_keyboard(total, show_personal_btn=is_owner)
+
+    if edit and isinstance(target, types.CallbackQuery) and target.message:
+        try:
+            await target.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+        except TelegramAPIError:
+            pass
+
+    if isinstance(target, types.CallbackQuery) and target.message:
+        await target.message.answer(text, parse_mode="HTML", reply_markup=kb)
+    elif hasattr(target, "answer"):
         await target.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 @router.message(Command("feed"))
 async def cmd_feed(message: types.Message, state: FSMContext):
     await state.clear()
-    await render_feed_main(message, message.chat.id, edit=False)
+    uid = message.from_user.id if message.from_user else message.chat.id
+    await render_feed_main(message, uid, edit=False)
 
 
 @router.callback_query(F.data == "feed_main")
@@ -292,6 +407,56 @@ async def cb_feed_main(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await render_feed_main(callback, callback.from_user.id, edit=True)
     await callback.answer()
+
+
+@router.callback_query(F.data == "feed_personal")
+async def cb_feed_personal(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    user_id = callback.from_user.id
+    if not is_session_owner(user_id):
+        await callback.answer("Доступно только владельцу сессии.", show_alert=True)
+        return
+    await render_personal_channels(callback, user_id, edit=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("fadd_p:"))
+async def cb_feed_add_personal(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_session_owner(user_id):
+        await callback.answer("Доступно только владельцу сессии.", show_alert=True)
+        return
+
+    try:
+        idx = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("❌ Ошибка данных.")
+        return
+
+    channels = get_cached_personal_channels(user_id)
+    if channels is None or idx < 0 or idx >= len(channels):
+        await callback.answer("Список устарел. Обновляю...")
+        await render_personal_channels(callback, user_id, edit=True, force_refresh=True)
+        return
+
+    target_chan = channels[idx]
+    username = target_chan["username"]
+    title = target_chan["title"]
+
+    try:
+        add_feed_subscription(user_id, username, channel_title=title)
+        schedule_channel_backfill(username)
+        await callback.answer("✅ Добавлен в Ленту!")
+    except ValueError as exc:
+        await callback.answer(f"❌ {exc}", show_alert=True)
+        return
+
+    kb = build_personal_channels_keyboard(user_id, channels)
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=kb)
+        except TelegramAPIError:
+            pass
 
 
 @router.callback_query(F.data == "feed_help")
