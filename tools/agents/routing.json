@@ -1,36 +1,88 @@
 {
   "candidates": {
-    "agy": ["gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"],
-    "opencode": ["Tokenn/gemini-3.5-flash", "Tokenn/gemini-3.6-flash", "Tokenn/codex-5.3", "Tokenn/gpt-5.5", "Tokenn/gpt-5.6-sol", "Tokenn/claude-sonnet-5", "Tokenn/gpt-6-sol", "Tokenn/gpt-6.1-sol", "Tokenn/gemini-3.1-pro-preview", "Tokenn/claude-opus-4-6", "Tokenn/claude-opus-4-8", "Tokenn/claude-opus-5"],
-    "claude": ["haiku", "sonnet", "opus"]
+    "agy": [
+      "gemini-3.8-flash-low",
+      "gemini-3.8-flash-medium",
+      "gemini-3.8-flash-high",
+      "claude-sonnet-4-6",
+      "claude-opus-4-6-thinking",
+      "gpt-oss-120b-medium"
+    ],
+    "opencode": [
+      "Tokenn/gpt-5.5",
+      "Tokenn/codex-5.3",
+      "Tokenn/gpt-5.6-sol",
+      "Tokenn/gpt-6-sol",
+      "Tokenn/gpt-6.1-sol"
+    ],
+    "claude": [
+      "haiku",
+      "sonnet",
+      "opus"
+    ]
   },
   "candidate_descriptions": {
     "agy": {
-      "gemini-3.8-flash-low": {"tier": "cheap", "notes": "мелкие правки"},
-      "gemini-3.8-flash-medium": {"tier": "cheap", "notes": "обычный код"},
-      "gemini-3.8-flash-high": {"tier": "mid", "notes": "многофайловый код — основной исполнитель"},
-      "claude-sonnet-4-6": {"tier": "premium", "notes": "сложный код и ревью, быстро тратит квоту agy"},
-      "claude-opus-4-6-thinking": {"tier": "premium", "notes": "самые трудные задачи, очень дорого по квоте"},
-      "gpt-oss-120b-medium": {"tier": "cheap", "notes": "слабее на больших репозиториях"}
+      "gemini-3.8-flash-low": {
+        "tier": "cheap",
+        "notes": "мелкие правки"
+      },
+      "gemini-3.8-flash-medium": {
+        "tier": "cheap",
+        "notes": "обычный код"
+      },
+      "gemini-3.8-flash-high": {
+        "tier": "mid",
+        "notes": "многофайловый код — основной исполнитель"
+      },
+      "claude-sonnet-4-6": {
+        "tier": "premium",
+        "notes": "сложный код и ревью, быстро тратит квоту agy"
+      },
+      "claude-opus-4-6-thinking": {
+        "tier": "premium",
+        "notes": "самые трудные задачи, очень дорого по квоте"
+      },
+      "gpt-oss-120b-medium": {
+        "tier": "cheap",
+        "notes": "слабее на больших репозиториях"
+      }
     },
     "opencode": {
-      "Tokenn/gemini-3.5-flash": {"tier": "cheap", "notes": "быстрые недорогие задачи"},
-      "Tokenn/gemini-3.6-flash": {"tier": "cheap", "notes": "быстрые недорогие задачи"},
-      "Tokenn/codex-5.3": {"tier": "mid", "notes": "код"},
-      "Tokenn/gpt-5.5": {"tier": "mid", "notes": "код"},
-      "Tokenn/gpt-5.6-sol": {"tier": "mid", "notes": "сбалансированная модель"},
-      "Tokenn/claude-sonnet-5": {"tier": "mid", "notes": "сбалансированная модель"},
-      "Tokenn/gpt-6-sol": {"tier": "premium", "notes": "сложные задачи"},
-      "Tokenn/gpt-6.1-sol": {"tier": "premium", "notes": "сложные задачи; статический откат"},
-      "Tokenn/gemini-3.1-pro-preview": {"tier": "premium", "notes": "сложные задачи"},
-      "Tokenn/claude-opus-4-6": {"tier": "premium", "notes": "трудные задачи"},
-      "Tokenn/claude-opus-4-8": {"tier": "premium", "notes": "трудные задачи"},
-      "Tokenn/claude-opus-5": {"tier": "premium", "notes": "самая дорогая модель"}
+      "Tokenn/gpt-5.5": {
+        "tier": "mid",
+        "notes": "старшая общая модель; не больше 4k токенов вывода за ход"
+      },
+      "Tokenn/codex-5.3": {
+        "tier": "mid",
+        "notes": "специализирована на коде; не больше 4k токенов вывода за ход; ревью 17 правок Ленты сделала точно (370k токенов)"
+      },
+      "Tokenn/gpt-5.6-sol": {
+        "tier": "mid",
+        "notes": "первые версии ранжирования и страницы Ленты — ревью нашли ~10 дефектов"
+      },
+      "Tokenn/gpt-6-sol": {
+        "tier": "premium",
+        "notes": "сложные задачи"
+      },
+      "Tokenn/gpt-6.1-sol": {
+        "tier": "premium",
+        "notes": "новейшая и сильнейшая; точные ревью с редкими ложными срабатываниями; статический откат"
+      }
     },
     "claude": {
-      "haiku": {"tier": "cheap", "notes": "быстрые простые задачи"},
-      "sonnet": {"tier": "mid", "notes": "сбалансированные задачи"},
-      "opus": {"tier": "premium", "notes": "сложные задачи"}
+      "haiku": {
+        "tier": "cheap",
+        "notes": "быстрые простые задачи"
+      },
+      "sonnet": {
+        "tier": "mid",
+        "notes": "сбалансированные задачи"
+      },
+      "opus": {
+        "tier": "premium",
+        "notes": "сложные задачи"
+      }
     }
   },
   "tasks": {
