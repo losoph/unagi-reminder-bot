@@ -235,12 +235,17 @@ def cluster_candidates(candidates: list[dict]) -> list[dict]:
                      if len(text) >= _CLUSTER_MIN_TEXT]
     for left_pos, (_, left_candidate, left_text) in enumerate(eligible_text):
         left_time = _utc(left_candidate["post"]["time"])
+        left_index = candidate_positions[id(left_candidate)]
+        matcher = difflib.SequenceMatcher(None, left_text, "")
         for _, right_candidate, right_text in eligible_text[left_pos + 1:]:
+            right_index = candidate_positions[id(right_candidate)]
+            if uf.find(left_index) == uf.find(right_index):
+                continue
             if abs((left_time - _utc(right_candidate["post"]["time"])).total_seconds()) > 36 * 3600:
                 continue
-            matcher = difflib.SequenceMatcher(None, left_text, right_text)
+            matcher.set_seq2(right_text)
             if matcher.quick_ratio() >= 0.6 and matcher.ratio() >= 0.6:
-                uf.union(candidate_positions[id(left_candidate)], candidate_positions[id(right_candidate)])
+                uf.union(left_index, right_index)
     groups: dict[int, list[dict]] = defaultdict(list)
     # Map identity rather than dict equality (candidate dictionaries can nest mutable objects).
     positions = {id(candidate): i for i, candidate in enumerate(candidates)}

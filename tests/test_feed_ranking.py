@@ -1,5 +1,6 @@
 import random
 import os
+import math
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -146,6 +147,19 @@ class FeedRankingTests(unittest.TestCase):
         print(f"FEED_PERF_TEST rank_feed(30000): {elapsed:.3f}s")
         self.assertLessEqual(elapsed, 10)
 
+    @unittest.skipUnless(os.getenv("FEED_PERF_TEST") == "1", "замер включается только вручную")
+    def test_300_similar_texts_performance(self):
+        # 300 почти одинаковых копий пресс-релиза во всех каналах должны объединиться менее чем за секунду.
+        text = "Важное сообщение пресс-релиз о развитии компании и новых проектах " * 8
+        posts = [post(i, f"channel{i}", text=text, time=NOW - timedelta(minutes=i))
+                 for i in range(300)]
+        started = time.perf_counter()
+        clusters = cluster_candidates(score_candidates(posts, {}, "month", NOW))
+        elapsed = time.perf_counter() - started
+        print(f"FEED_PERF_TEST cluster_candidates(300 similar): {elapsed:.3f}s")
+        self.assertEqual(len(clusters), 1)
+        self.assertLess(elapsed, 1)
+
     def test_more_forwards_do_not_lower_score(self):
         # 1 и 10 пересылок дают fwd_abs=0.30 и 1.04; остальные сигналы одинаковы.
         result = score_candidates([post(1, "a", forwards=1), post(2, "b", forwards=10)], {}, "day", NOW)
@@ -209,7 +223,42 @@ class FeedRankingTests(unittest.TestCase):
         clusters = cluster_candidates(scored)
         self.assertEqual(len(clusters), 1)
         self.assertEqual(len(clusters[0]["also_in"]), 2)
-        self.assertAlmostEqual(clusters[0]["score"], max(x["score"] for x in scored) + 0.05 * __import__("math").log2(3))
+        self.assertAlmostEqual(clusters[0]["score"], max(x["score"] for x in scored) + 0.05 * math.log2(3))
+
+    def test_forwarded_post_uses_original_as_representative_despite_higher_score(self):
+        # Связь пересылки указывает первоисточник; его score=.4 остаётся представителем против .9 у пересылки.
+        original = candidate(post(1, "source", channel_id=10, text="короткий текст"), .4)
+        forwarded = candidate(post(2, "forward", channel_id=20, text="короткий текст",
+                                   fwd_from_channel_id=10, fwd_from_post_id=1), .9)
+        cluster = cluster_candidates([forwarded, original])[0]
+        self.assertEqual(cluster["post"]["channel_username"], "source")
+        self.assertEqual(cluster["score"], .4 + .05 * math.log2(2))
+
+    def test_reach_relative_badge_threshold(self):
+        # views_m=100/(1-exp(-12/8)) и median=views_m/2 дают reach_rel=2, значит 🔥 ×2 к норме.
+        now = NOW
+        age_h = 12
+        views_m = 100 / (1 - math.exp(-age_h / 8))
+        median = views_m / 2
+        item = rank_feed([post(1, "reach", views=100, forwards=None, reactions_total=None,
+                               replies=None, time=now - timedelta(hours=age_h))],
+                         {"reach": {"median_views": median}}, "day", now)[0]
+        self.assertEqual(item.badges, ["🔥 ×2 к норме"])
+
+    def test_forward_relative_badge_threshold(self):
+        # (forwards/views)/median_fwd= (2/100)/.01=2, значит ↗️ ×2 пересылок к норме.
+        item = rank_feed([post(1, "forward", views=100, forwards=2, reactions_total=None,
+                               replies=None)],
+                         {"forward": {"median_fwd_rate": .01}}, "day", NOW)[0]
+        self.assertEqual(item.badges, ["↗️ ×2 пересылок к норме"])
+
+    def test_new_badge_only_for_week_and_month_posts_under_24h(self):
+        # Возраст 23 ч <24 ч: 🆕 положен неделе/месяцу; дневному выпуску свежесть не добавляет значок.
+        fresh_post = post(1, "fresh", time=NOW - timedelta(hours=23))
+        for period in ("week", "month"):
+            with self.subTest(period=period):
+                self.assertEqual(rank_feed([fresh_post], {}, period, NOW)[0].badges, ["🆕"])
+        self.assertEqual(rank_feed([fresh_post], {}, "day", NOW)[0].badges, [])
 
     def test_missing_signals_and_medians_degrade_gracefully(self):
         # views=0/null, medians=None/0 yield only fwd_abs; all-None metrics yield quality=0 and finite freshness.
