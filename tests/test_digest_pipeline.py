@@ -510,7 +510,7 @@ class WebFallbackPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(posts.cursor_reached)
         self.assertEqual([p["id"] for p in posts], [42, 43, 44])
 
-    async def test_ceiling_reached_advances_cursor_for_inspected_posts_and_marks_partial(self):
+    async def test_ceiling_reached_returns_inspected_posts_and_marks_partial(self):
         from scraper import get_latest_posts
 
         page1 = message_html(30, "2026-07-24T12:00:00+00:00", text="Post 30")
@@ -532,11 +532,138 @@ class WebFallbackPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(posts.cursor_reached)
         self.assertTrue(posts.is_partial)
 
-        # In T8, scan cursor and delivery cursor advance for the actually inspected/delivered posts (post 30)
-        max_scanned_id = max(p["id"] for p in posts)
-        delivered_post_id = max(p["id"] for p in posts)
-        self.assertEqual(max_scanned_id, 30)
-        self.assertEqual(delivered_post_id, 30)
+        # The delivery cursor may move over these posts; the channel scan cursor
+        # must not (see ChannelScanCursorPartialWebTests).
+        self.assertEqual([p["id"] for p in posts], [20, 30])
+
+
+class ChannelScanCursorPartialWebTests(unittest.IsolatedAsyncioTestCase):
+    """Digest ingestion through the Telegram Web fallback, served from HTML fixtures."""
+
+    MARKER = "2026-07-24 08:00:00"
+
+    def setUp(self):
+        from functools import partial
+        from unittest import mock
+
+        import main
+        import scraper
+        from data import database
+
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.database = database
+        self.original_db_path = database.DB_PATH
+        database.DB_PATH = os.path.join(self.temp_dir.name, "test_scan_cursor.db")
+        database.init_db()
+        database.update_channel_scan_cursor("example", self.MARKER, 10)
+
+        source = HybridChannelSource()
+        source.mode = "web"
+        source._client = None
+        patches = [
+            mock.patch.object(main, "channel_source", source),
+            mock.patch(
+                "channel_source.get_latest_posts",
+                partial(scraper.get_latest_posts, max_pages=2, page_delay=0),
+            ),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        self.database.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def partial_session():
+        # Two pages (the patched ceiling) of posts newer than the marker: the marker is never met.
+        return FakeClientSession(
+            {
+                "https://t.me/s/example": message_html(30, "2026-07-24T12:00:00+00:00", text="Post 30"),
+                "https://t.me/s/example?before=30": message_html(20, "2026-07-24T11:00:00+00:00", text="Post 20"),
+            }
+        )
+
+    @staticmethod
+    def complete_session():
+        return FakeClientSession(
+            {
+                "https://t.me/s/example": message_html(30, "2026-07-24T12:00:00+00:00", text="Post 30"),
+                "https://t.me/s/example?before=30": (
+                    message_html(5, "2026-07-24T07:00:00+00:00", text="Post 5")
+                    + message_html(20, "2026-07-24T11:00:00+00:00", text="Post 20")
+                ),
+            }
+        )
+
+    def stored_post_ids(self):
+        return [p["id"] for p in self.database.get_channel_posts_since("example", self.MARKER)]
+
+    def sub_tuple(self):
+        sub_id = self.database.add_subscription(
+            100,
+            "example",
+            "Example",
+            "daily",
+            self.MARKER,
+            "2026-07-25 07:00:00",
+        )
+        return (sub_id, 100, "example", "Example", "daily", self.MARKER, 0, None)
+
+    async def test_prefetch_partial_scan_keeps_channel_cursor_and_upserts_posts(self):
+        import asyncio
+
+        from main import prefetch_due_channels
+
+        result = await prefetch_due_channels(
+            [self.sub_tuple()], self.partial_session(), asyncio.Semaphore(1)
+        )
+
+        self.assertFalse(result["example"]["posts"].cursor_reached)
+        self.assertEqual(self.database.get_channel_scan_cursor("example"), (self.MARKER, 10))
+        self.assertEqual(self.stored_post_ids(), [20, 30])
+
+    async def test_prefetch_complete_scan_advances_channel_cursor(self):
+        import asyncio
+
+        from main import prefetch_due_channels
+
+        result = await prefetch_due_channels(
+            [self.sub_tuple()], self.complete_session(), asyncio.Semaphore(1)
+        )
+
+        self.assertTrue(result["example"]["posts"].cursor_reached)
+        self.assertEqual(self.database.get_channel_scan_cursor("example"), ("2026-07-24 12:00:00", 30))
+        self.assertEqual(self.stored_post_ids(), [20, 30])
+
+    async def test_subscription_fetch_partial_scan_keeps_channel_cursor_and_upserts_posts(self):
+        import asyncio
+
+        from main import fetch_subscription_posts
+
+        result = await fetch_subscription_posts(
+            self.sub_tuple(), self.partial_session(), asyncio.Semaphore(1), "2026-07-24 13:00:00"
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["is_partial"])
+        self.assertEqual(self.database.get_channel_scan_cursor("example"), (self.MARKER, 10))
+        self.assertEqual(self.stored_post_ids(), [20, 30])
+
+    async def test_subscription_fetch_complete_scan_advances_channel_cursor(self):
+        import asyncio
+
+        from main import fetch_subscription_posts
+
+        result = await fetch_subscription_posts(
+            self.sub_tuple(), self.complete_session(), asyncio.Semaphore(1), "2026-07-24 13:00:00"
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["is_partial"])
+        self.assertEqual(self.database.get_channel_scan_cursor("example"), ("2026-07-24 12:00:00", 30))
+        self.assertEqual(self.stored_post_ids(), [20, 30])
 
 
 class FakeJsonResponse:

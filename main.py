@@ -211,6 +211,27 @@ async def fetch_channel_posts(
     upsert_channel_posts(channel_username, posts, source_name)
     return posts
 
+
+def advance_channel_scan_cursor(channel_username: str, posts: list[dict]) -> None:
+    """Move the shared channel scan cursor past freshly fetched posts.
+
+    A Telegram Web scan that hit the page limit before the marker returns only the
+    newest posts; moving the cursor past them would leave the unfetched gap behind
+    for every subscriber of the channel, so the cursor stays put.
+    """
+    if not posts:
+        return
+    if not getattr(posts, "cursor_reached", True):
+        logger.warning(
+            "Scan of @%s did not reach the marker; channel scan cursor not advanced",
+            channel_username,
+        )
+        return
+    max_time = max(p["time"] for p in posts)
+    max_id = max((p["id"] for p in posts if p.get("id") is not None), default=None)
+    update_channel_scan_cursor(channel_username, max_time, max_id)
+
+
 _QUICK_RESCHEDULE_ACTION: dict[str, str] = {
     "morning": "morning",
     "day": "day",
@@ -1146,10 +1167,7 @@ async def fetch_subscription_posts(
                     web_session=session,
                 )
                 upsert_channel_posts(username, fetched_posts, source_name)
-                if fetched_posts:
-                    max_time = max(p["time"] for p in fetched_posts)
-                    max_id = max((p["id"] for p in fetched_posts if p.get("id") is not None), default=None)
-                    update_channel_scan_cursor(username, max_time, max_id)
+                advance_channel_scan_cursor(username, fetched_posts)
 
             available_posts = get_channel_posts_since(username, last_scraped, last_post_id)
             if fetched_posts and not available_posts:
@@ -1288,10 +1306,7 @@ async def prefetch_due_channels(
                     web_session=session,
                 )
                 upsert_channel_posts(username, posts, source_name)
-                if posts:
-                    max_time = max(p["time"] for p in posts)
-                    max_id = max((p["id"] for p in posts if p.get("id") is not None), default=None)
-                    update_channel_scan_cursor(username, max_time, max_id)
+                advance_channel_scan_cursor(username, posts)
                 return username, {"posts": posts, "source": source_name, "error": None}
             except ChannelFetchError as exc:
                 return username, {"posts": [], "source": None, "error": exc}
