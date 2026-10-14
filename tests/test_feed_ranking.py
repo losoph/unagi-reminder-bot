@@ -1,4 +1,6 @@
 import random
+import os
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -44,10 +46,105 @@ def candidate(item, score, signals=None, percentiles=None, ad_strength=None):
 
 class FeedRankingTests(unittest.TestCase):
     def test_more_views_do_not_lower_score(self):
-        # Одинаковый возраст: 100→reach_abs=2.31, 1000→3.31; при том же ранге остальных сигналов score выше.
-        posts = [post(1, "a", views=100, forwards=2), post(2, "b", views=1000, forwards=2)]
+        # Пять просмотровых уровней дают монотонные перцентили при пропусках всех остальных сигналов.
+        posts = [post(i, f"c{i}", views=views, forwards=None, reactions_total=None, replies=None)
+                 for i, views in enumerate((100, 200, 300, 400, 500), 1)]
         result = score_candidates(posts, {}, "day", NOW)
-        self.assertGreater(result[1]["score"], result[0]["score"])
+        self.assertEqual([entry["percentiles"]["reach_abs"] for entry in result], [0, .25, .5, .75, 1])
+
+    def test_incomplete_signal_quality_is_shrunk_to_neutral(self):
+        # При одном кандидате доступны веса .30+.10=.40 из общей суммы .95;
+        # Q=(.40/.95)*1+(1-.40/.95)*.5, затем score=.95*Q+.05*fresh.
+        posts = [post(1, "only", views=100, forwards=None, reactions_total=1, replies=None)]
+        result = score_candidates(posts, {}, "day", NOW)
+        coverage = (.30 + .10) / (.30 + .25 + .15 + .15 + .10)
+        quality = coverage * 1 + (1 - coverage) * .5
+        self.assertAlmostEqual(result[0]["score"], .95 * quality + .05 * result[0]["signals"]["fresh"])
+
+    def test_external_url_skips_telegram_and_canonicalizes(self):
+        # Первая внешняя ссылка нормализуется к https, без www и хвостового слэша.
+        posts = [post(1, "a", text="via https://t.me/x/1 потом http://www.Example.com/news/"),
+                 post(2, "b", text="https://example.com/news")]
+        self.assertEqual(len(cluster_candidates(score_candidates(posts, {}, "day", NOW))), 1)
+
+    def test_short_text_does_not_cluster_but_long_text_at_36h_does(self):
+        # «Доброе утро!» → 11 символов после нормализации; тексты >60 на границе 36 ч сливаются.
+        short = [post(1, "a", text="Доброе утро!"), post(2, "b", text="Доброе утро!")]
+        self.assertEqual(len(cluster_candidates(score_candidates(short, {}, "day", NOW))), 2)
+        text = "важное сообщение " * 5
+        long = [post(3, "a", text=text, time=NOW), post(4, "b", text=text, time=NOW-timedelta(hours=36))]
+        self.assertEqual(len(cluster_candidates(score_candidates(long, {}, "day", NOW))), 1)
+
+    def test_cluster_also_in_excludes_primary_and_deduplicates_channel(self):
+        # От представителя канал не показывается; два поста одного канала схлопываются до лучшего.
+        posts = [post(1, "a", text="https://site.test/x", views=100),
+                 post(2, "b", text="https://site.test/x", views=20),
+                 post(3, "b", text="https://site.test/x", views=10),
+                 post(4, "c", text="https://site.test/x", views=30)]
+        cluster = cluster_candidates(score_candidates(posts, {}, "day", NOW))[0]
+        related_channels = [p["channel_username"] for p in cluster["also_in"]]
+        self.assertEqual(len(related_channels), len(set(related_channels)))
+        self.assertNotIn(cluster["post"]["channel_username"], related_channels)
+
+    def test_single_ad_candidate_is_not_admitted_without_percentile_pool(self):
+        # Один кандидат не задаёт верхнюю четверть; рекламный пост исключается при пуле меньше четырёх.
+        self.assertEqual(rank_feed([post(1, "ad", text="Реклама erid")], {}, "day", NOW), [])
+
+    def test_week_synthetic_top_three_and_source_cap(self):
+        # Перцентили заданы просмотрами внутри выпуска: после top крупного/среднего третий large обходит small;
+        # потолок недели — 10, крупный не забирает всю выдачу.
+        posts = []
+        for channel, views in (("large", 100_000), ("middle", 10_000), ("small", 1_000)):
+            for index in range(12):
+                posts.append(post(index + 1, channel, views=views-index, forwards=20-index,
+                                  reactions_total=None, replies=None,
+                                  text=f"сюжет {channel} {index}", time=NOW-timedelta(hours=index+1)))
+        items = rank_feed(posts, {}, "week", NOW)
+        self.assertEqual([item.post["channel_username"] for item in items[:3]], ["large", "middle", "large"])
+        from collections import Counter
+        counts = Counter(item.post["channel_username"] for item in items)
+        self.assertLessEqual(counts["large"], 10)
+        self.assertLess(counts["large"], len(items))
+
+    def test_tied_percentiles_use_average_rank(self):
+        # [1,2,2,4]: ничья занимает ранги 2 и 3, средний ранг 2.5, P=(2.5−1)/3=.5.
+        posts = [post(i, str(i), views=value, forwards=None, reactions_total=None, replies=None)
+                 for i, value in enumerate((1, 2, 2, 4), 1)]
+        result = score_candidates(posts, {}, "day", NOW)
+        self.assertEqual(result[1]["percentiles"]["reach_abs"], .5)
+        self.assertEqual(result[2]["percentiles"]["reach_abs"], .5)
+
+    def test_single_channel_cluster_has_no_bonus(self):
+        # Уникальных каналов один, поэтому 0.05*log2(1)=0.
+        posts = [post(1, "same", text="https://site.test/x"), post(2, "same", text="https://site.test/x")]
+        scored = score_candidates(posts, {}, "day", NOW)
+        cluster = cluster_candidates(scored)[0]
+        self.assertEqual(cluster["score"], max(candidate["score"] for candidate in scored))
+
+    def test_monotonicity_with_missing_signals(self):
+        # Набор из пяти постов с пропуском просмотров проверяет неубывание среди измеримых reach_abs.
+        posts = [post(i, f"c{i}", views=views, forwards=None, reactions_total=None, replies=None)
+                 for i, views in enumerate((10, None, 30, 40, 50), 1)]
+        result = score_candidates(posts, {}, "day", NOW)
+        values = [candidate["percentiles"]["reach_abs"] for candidate in result if "reach_abs" in candidate["percentiles"]]
+        self.assertEqual(values, sorted(values))
+
+    def test_week_and_month_channel_caps(self):
+        # Лимиты канала из формулы: 10 за неделю и 20 за месяц.
+        clusters = [candidate(post(i, "one", text=f"уникальный {i}"), 1 - i / 100) for i in range(25)]
+        self.assertEqual(len(select_diverse(clusters, "week", 50)), 10)
+        self.assertEqual(len(select_diverse(clusters, "month", 50)), 20)
+
+    @unittest.skipUnless(os.getenv("FEED_PERF_TEST") == "1", "замер включается только вручную")
+    def test_30000_candidates_performance(self):
+        # Полный синтетический конвейер, 100 каналов и уникальный текст для запрета схлопывания.
+        posts = [post(i, f"channel{i % 100}", views=(i % 1000) + 1, forwards=i % 100,
+                      text=f"уникальный сюжет номер {i} с разными подробностями") for i in range(30_000)]
+        started = time.perf_counter()
+        rank_feed(posts, {}, "month", NOW)
+        elapsed = time.perf_counter() - started
+        print(f"FEED_PERF_TEST rank_feed(30000): {elapsed:.3f}s")
+        self.assertLessEqual(elapsed, 10)
 
     def test_more_forwards_do_not_lower_score(self):
         # 1 и 10 пересылок дают fwd_abs=0.30 и 1.04; остальные сигналы одинаковы.
@@ -66,14 +163,20 @@ class FeedRankingTests(unittest.TestCase):
         self.assertGreater(result[1]["score"], result[2]["score"])
 
     def test_freshness_only_breaks_identical_post_tie(self):
-        # Идентичные метрики имеют одинаковые перцентили; 1-часовой пост имеет fresh=e^-1/12 > e^-12/12.
+        # Идентичные метрики имеют одинаковые перцентили; свежесть поднимает только более новый пост.
         fresh, old = post(1, "a", time=NOW - timedelta(hours=1)), post(2, "b", time=NOW - timedelta(hours=12))
         result = score_candidates([old, fresh], {}, "day", NOW)
         self.assertGreater(result[1]["score"], result[0]["score"])
 
+        # При разных перцентилях старший по сигналам пост остаётся выше, несмотря на меньшую свежесть.
+        weak_fresh = post(3, "c", views=1, forwards=0, time=NOW - timedelta(hours=1))
+        strong_old = post(4, "d", views=100000, forwards=100, time=NOW - timedelta(hours=12))
+        result = score_candidates([weak_fresh, strong_old], {}, "day", NOW)
+        self.assertGreater(result[1]["score"], result[0]["score"])
+
     def test_weak_erid_ad_is_excluded(self):
         # Ad percentiles .0/.0 < .75; it remains in the percentile pool but fails selection.
-        posts = [post(1, "ad", text="Реклама erid", views=1, forwards=0), post(2, "b"), post(3, "c")]
+        posts = [post(1, "ad", text="Реклама erid", views=1, forwards=0), post(2, "b"), post(3, "c"), post(4, "d")]
         result = rank_feed(posts, {}, "day", NOW)
         self.assertNotIn(1, [item.post["post_id"] for item in result])
 

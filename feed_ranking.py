@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import difflib
-import html
 import math
 import os
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from heapq import heappop, heappush
 from urllib.parse import urlsplit, urlunsplit
 
 _WEIGHTS = {
@@ -21,6 +21,8 @@ _WEIGHTS = {
 }
 _MAX_POSTS = max(0, int(os.getenv("FEED_MAX_POSTS", "50")))
 _AD_MIN_PERCENTILE = float(os.getenv("FEED_AD_MIN_PERCENTILE", "0.75"))
+_AD_MIN_POOL = max(1, int(os.getenv("FEED_AD_MIN_POOL", "4")))
+_CLUSTER_MIN_TEXT = max(0, int(os.getenv("FEED_CLUSTER_MIN_TEXT", "60")))
 _AD_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -141,46 +143,48 @@ def score_candidates(posts: list[dict], medians_by_channel: dict, period: str, n
         signals = _signals(post, medians_by_channel or {}, now, period)
         candidates.append({"post": post, "signals": signals, "percentiles": {}})
     candidates = percentiles(candidates)
+    pool_sizes = {name: sum(candidate["signals"].get(name) is not None for candidate in candidates)
+                  for name in ("reach_abs", "fwd_abs")}
+    total_weight = sum(_WEIGHTS.values())
     for candidate in candidates:
         values = candidate["percentiles"]
         weight_sum = sum(_WEIGHTS[name] for name in values)
         quality = (sum(_WEIGHTS[name] * value for name, value in values.items()) / weight_sum
                    if weight_sum else 0.0)
+        coverage = weight_sum / total_weight if total_weight else 0.0
+        quality = coverage * quality + (1 - coverage) * 0.5
         candidate["score"] = 0.95 * quality + 0.05 * candidate["signals"]["fresh"]
-        ad_values = [values[name] for name in ("reach_abs", "fwd_abs") if name in values]
+        ad_values = [values[name] for name in ("reach_abs", "fwd_abs")
+                     if name in values and pool_sizes[name] >= _AD_MIN_POOL]
         candidate["ad_strength"] = sum(ad_values) / len(ad_values) if ad_values else None
     return candidates
 
 
 def _canonical_url(text: str) -> str | None:
-    match = _URL_RE.search(text)
-    if not match:
-        return None
-    raw = match.group(0).rstrip(".,;:!?…")
-    try:
-        parts = urlsplit(raw)
-        host = (parts.hostname or "").casefold().rstrip(".")
-        if not host or host == "t.me" or host.endswith(".t.me"):
-            return None
+    for match in _URL_RE.finditer(text):
+        raw = match.group(0).rstrip(".,;:!?…")
         try:
-            host = host.encode("idna").decode("ascii")
-        except UnicodeError:
-            return None
-        port = parts.port
-        netloc = host if port is None or (parts.scheme.lower(), port) in (("http", 80), ("https", 443)) else f"{host}:{port}"
-        query = "&".join(
-            pair for pair in parts.query.split("&")
-            if pair and not pair.split("=", 1)[0].casefold().startswith("utm_")
-        )
-        path = parts.path.rstrip("/")
-        return urlunsplit((parts.scheme.lower(), netloc, path, query, ""))
-    except ValueError:
-        return None
+            parts = urlsplit(raw)
+            host = (parts.hostname or "").casefold().rstrip(".")
+            if not host or host == "t.me" or host.endswith(".t.me"):
+                continue
+            try:
+                host = host.encode("idna").decode("ascii")
+            except UnicodeError:
+                continue
+            host = host.removeprefix("www.")
+            port = parts.port
+            netloc = host if port is None or (parts.scheme.lower(), port) in (("http", 80), ("https", 443)) else f"{host}:{port}"
+            query = "&".join(pair for pair in parts.query.split("&")
+                             if pair and not pair.split("=", 1)[0].casefold().startswith("utm_"))
+            return urlunsplit(("https", netloc, parts.path.rstrip("/"), query, ""))
+        except ValueError:
+            continue
+    return None
 
 
 def _normalized_text(text: str) -> str:
     text = _URL_RE.sub(" ", text.casefold())
-    text = html.unescape(text)
     text = _TEXT_CLEAN_RE.sub(" ", text)
     return _SPACE_RE.sub(" ", text).strip()[:400]
 
@@ -223,18 +227,20 @@ def cluster_candidates(candidates: list[dict]) -> list[dict]:
                 uf.union(index, keyed[("url", url)])
             else:
                 keyed[("url", url)] = index
+    # Текстовая кластеризация ограничена топ-300; прямой источник и URL остаются без этого лимита.
     text_candidates = sorted(candidates, key=lambda candidate: (-candidate["score"], _tie_key(candidate["post"])))[:300]
     normalized = [_normalized_text(str(candidate["post"].get("text") or "")) for candidate in text_candidates]
-    for left in range(len(text_candidates)):
-        if not normalized[left]:
-            continue
-        for right in range(left + 1, len(text_candidates)):
-            if not normalized[right] or abs((_utc(text_candidates[left]["post"]["time"]) - _utc(text_candidates[right]["post"]["time"])).total_seconds()) > 36 * 3600:
+    candidate_positions = {id(candidate): index for index, candidate in enumerate(candidates)}
+    eligible_text = [(i, text_candidates[i], text) for i, text in enumerate(normalized)
+                     if len(text) >= _CLUSTER_MIN_TEXT]
+    for left_pos, (_, left_candidate, left_text) in enumerate(eligible_text):
+        left_time = _utc(left_candidate["post"]["time"])
+        for _, right_candidate, right_text in eligible_text[left_pos + 1:]:
+            if abs((left_time - _utc(right_candidate["post"]["time"])).total_seconds()) > 36 * 3600:
                 continue
-            if difflib.SequenceMatcher(None, normalized[left], normalized[right]).quick_ratio() < 0.6:
-                continue
-            if difflib.SequenceMatcher(None, normalized[left], normalized[right]).ratio() >= 0.6:
-                uf.union(candidates.index(text_candidates[left]), candidates.index(text_candidates[right]))
+            matcher = difflib.SequenceMatcher(None, left_text, right_text)
+            if matcher.quick_ratio() >= 0.6 and matcher.ratio() >= 0.6:
+                uf.union(candidate_positions[id(left_candidate)], candidate_positions[id(right_candidate)])
     groups: dict[int, list[dict]] = defaultdict(list)
     # Map identity rather than dict equality (candidate dictionaries can nest mutable objects).
     positions = {id(candidate): i for i, candidate in enumerate(candidates)}
@@ -260,9 +266,22 @@ def cluster_candidates(candidates: list[dict]) -> list[dict]:
             **representative,
             "score": representative["score"] + bonus,
             "members": members,
-            "also_in": [member["post"] for member in members if member is not representative],
+            "also_in": _related_posts(members, representative),
         })
     return sorted(clusters, key=lambda c: (-c["score"], _tie_key(c["post"])))
+
+
+def _related_posts(members: list[dict], representative: dict) -> list[dict]:
+    primary_channel = str(representative["post"].get("channel_username") or "").casefold()
+    best_by_channel: dict[str, dict] = {}
+    for member in members:
+        channel = str(member["post"].get("channel_username") or "").casefold()
+        if channel == primary_channel:
+            continue
+        current = best_by_channel.get(channel)
+        if current is None or (-member["score"], _tie_key(member["post"])) < (-current["score"], _tie_key(current["post"])):
+            best_by_channel[channel] = member
+    return [member["post"] for member in sorted(best_by_channel.values(), key=lambda c: (-c["score"], _tie_key(c["post"]))) ]
 
 
 def select_diverse(clusters: list[dict], period: str, max_posts: int = _MAX_POSTS) -> list[dict]:
@@ -276,22 +295,33 @@ def select_diverse(clusters: list[dict], period: str, max_posts: int = _MAX_POST
     ]
     counts: Counter[str] = Counter()
     selected = []
-    remaining = list(eligible)
-    while remaining and len(selected) < max(0, max_posts):
-        available = []
-        for cluster in remaining:
-            channel = str(cluster["post"].get("channel_username") or "").casefold()
-            if counts[channel] < _CAPS[period]:
-                available.append((cluster["score"] * (0.85 ** counts[channel]), cluster))
-        if not available:
+    by_channel: dict[str, list[dict]] = defaultdict(list)
+    for cluster in eligible:
+        by_channel[str(cluster["post"].get("channel_username") or "").casefold()].append(cluster)
+    heap = []
+    channel_positions: Counter[str] = Counter()
+    def push_channel(channel: str) -> None:
+        channel_clusters = by_channel[channel]
+        index = channel_positions[channel]
+        if counts[channel] >= _CAPS[period] or index >= len(channel_clusters):
+            return
+        cluster = channel_clusters[index]
+        value = cluster["score"] * (0.85 ** counts[channel])
+        timestamp, username, post_id = _tie_key(cluster["post"])
+        heappush(heap, (-value, timestamp, username, post_id, channel, index, cluster))
+    for channel in by_channel:
+        push_channel(channel)
+    while len(selected) < max(0, max_posts):
+        while heap and counts[heap[0][3]] >= _CAPS[period]:
+            heappop(heap)
+        if not heap:
             break
-        best_value = max(score for score, _ in available)
-        tied = [cluster for score, cluster in available if score == best_value]
-        winner = min(tied, key=lambda c: _tie_key(c["post"]))
+        _, _, _, _, channel, index, winner = heappop(heap)
         selected.append(winner)
-        channel = str(winner["post"].get("channel_username") or "").casefold()
         counts[channel] += 1
-        remaining.remove(winner)
+        next_index = index + 1
+        channel_positions[channel] = next_index
+        push_channel(channel)
     return selected
 
 
