@@ -1,4 +1,4 @@
-"""Экономный монитор opencode: срочные события сразу, обычные — периодической сводкой."""
+"""Экономный монитор opencode --format json: коммиты и ошибки сразу, остальное сводкой раз в PERIOD."""
 import json
 import os
 import re
@@ -28,8 +28,8 @@ def emit():
 
 
 while True:
-    ready, _, _ = select.select([sys.stdin], [], [], 30)
-    if ready:
+    r, _, _ = select.select([sys.stdin], [], [], 30)
+    if r:
         line = sys.stdin.readline()
         if not line:
             emit()
@@ -51,24 +51,29 @@ while True:
         elif typ == "tool_use":
             name = part.get("tool") or "?"
             state = part.get("state") or {}
-            inp_obj = state.get("input") or {}
-            inp = json.dumps(inp_obj, ensure_ascii=False)
-            if RISK.search(inp):
+            raw_input = state.get("input") or {}
+            inp = json.dumps(raw_input, ensure_ascii=False)
+            # Тревоги и коммиты — только по shell-командам: в патчах файлов те же слова — просто текст.
+            command = str(raw_input.get("command") or "") if name in ("bash", "shell") else ""
+            if RISK.search(command):
                 print(f"OC ALERT {name} {inp[:300]}", flush=True)
             if name in READS:
                 reads += 1
                 continue
             tools += 1
             for key in ("filePath", "path", "file_path"):
-                value = inp_obj.get(key)
-                if isinstance(value, str):
-                    files.add(value.rsplit("/", 1)[-1])
-            if "git commit" in inp:
+                v = (state.get("input") or {}).get(key)
+                if isinstance(v, str):
+                    files.add(v.rsplit("/", 1)[-1])
+            if "git commit" in command:
                 print("OC COMMIT " + inp[:300], flush=True)
             out = str(state.get("output") or "")
-            if name == "bash" and "unittest" in inp and re.search(r"FAILED|Error|Traceback", out):
-                tail = out.strip().splitlines()[-1:] or [""]
-                print("OC TESTS RED " + tail[0][:200], flush=True)
+            if name in ("bash", "shell") and "unittest" in command and re.search(r"^FAILED \(", out, re.M):
+                failed = sorted(set(re.findall(r"^(?:FAIL|ERROR): (\S+)", out, re.M)))
+                signature = ",".join(failed) or out.strip().splitlines()[-1][:200]
+                if signature != globals().get("_last_red"):
+                    globals()["_last_red"] = signature
+                    print("OC TESTS RED " + signature[:300], flush=True)
         elif typ == "text":
             text = " ".join(str(part.get("text") or "").split())
             if text:

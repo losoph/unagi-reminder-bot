@@ -66,7 +66,7 @@ class AgentToolkitTests(unittest.TestCase):
             }
             proc = self.run_cmd([str(TOOLS / "route.sh"), "opencode", "review"], env=env)
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn("model=tokenn/gpt-6.1-sol effort=high", proc.stdout)
+            self.assertIn("model=Tokenn/gpt-6.1-sol effort=high", proc.stdout)
             row = json.loads(log.read_text(encoding="utf-8"))
             self.assertEqual(row["source"], "fallback")
 
@@ -77,7 +77,7 @@ class AgentToolkitTests(unittest.TestCase):
             router.write_text(
                 "import json, sys\n"
                 "task = json.load(sys.stdin)\n"
-                "print(json.dumps({'model': 'tokenn/gpt-5.6-sol', 'effort': 'low', 'reason': task['task_kind']}))\n",
+                "print(json.dumps({'model': 'Tokenn/gpt-5.6-sol', 'effort': 'low', 'reason': task['task_kind']}))\n",
                 encoding="utf-8",
             )
             env = os.environ | {

@@ -26,8 +26,8 @@ tools/agents/worktree.sh rm reviewer
 AGY_LOG_DIR=.agy AGY_MODEL=gemini-3.8-flash-high AGY_PROXY="$HTTPS_PROXY" tools/agents/agy_supervise.sh brief.md '(TASK-1)' 6
 tools/agents/agy_watch.sh follow
 tools/agents/agy_watch.sh digest 600
-tools/agents/oc_run.sh ../dev-worktrees/impl tokenn/gpt-6.1-sol brief.md .agents/impl.ndjson impl
-tools/agents/oc_run.sh ../dev-worktrees/reviewer tokenn/gpt-6.1-sol review.md .agents/review.ndjson review --review
+tools/agents/oc_run.sh ../dev-worktrees/impl Tokenn/gpt-6.1-sol brief.md .agents/impl.ndjson impl
+tools/agents/oc_run.sh ../dev-worktrees/reviewer Tokenn/gpt-6.1-sol review.md .agents/review.ndjson review --review
 PERIOD=600 python3 tools/agents/oc_digest.py < .agents/impl.ndjson
 tools/agents/route.sh opencode executor-complex 'Implement the requested feature'
 tools/agents/usage.sh
@@ -61,3 +61,17 @@ tools/agents/usage.sh
 - Избегайте кириллицы в путях worktree и логов: отдельные CLI и shell-расширения некорректно обрабатывают такие пути.
 - Супервизор без `AGY_KEEP_TREE=1` сохраняет tracked diff и очищает дерево: `git clean` удаляет все неотслеживаемые файлы, кроме каталога логов. Не держите там данные; включение `AGY_KEEP_TREE=1` оставляет правки первой попытки.
 - Логи могут содержать содержимое задач и ответов; выбирайте расположение и права доступа осознанно.
+
+## Окружение исполнителей
+
+Исполнителям запрещено ставить пакеты (`pip install` и т. п.): тесты и линтер — только из venv
+проекта тех же версий, что в CI. 14.10 opencode без спроса поставил ~28 пакетов в системный
+Python и проверял ruff другой версии — это правило в шаблонах `templates/*.md`. Команды, ждущие
+stdin (`cat > file` без here-doc), вешают прогон агента на десятки минут — файлы только инструментом.
+
+## Бомбы замедленного действия в тестах
+
+`tools/agents/time_shift_tests.sh` прогоняет набор тестов со сдвинутыми часами (libfaketime:
++1d, +7d, +30d, +365d, -30d). Тест, падающий только при сдвиге, сравнивает жёсткую дату с
+реальным «сейчас» и однажды сломает CI сам по себе. Запускать перед слиянием веток и перед
+деплоем: `PYTHON=~/.venvs/unagi/bin/python tools/agents/time_shift_tests.sh`.
