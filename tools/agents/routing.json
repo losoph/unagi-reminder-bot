@@ -1,0 +1,32 @@
+{
+  "candidates": {
+    "agy": ["gemini-3.8-flash-high", "gemini-3.8-pro"],
+    "opencode": ["Tokenn/gpt-6.1-sol", "Tokenn/gpt-5.6-sol"]
+  },
+  "tasks": {
+    "executor-complex": {
+      "agy": {"model": "gemini-3.8-pro", "effort": "high", "reason": "Сложная реализация требует сильного рассуждения."},
+      "opencode": {"model": "Tokenn/gpt-6.1-sol", "effort": "high", "reason": "Сложная реализация требует сильного рассуждения."}
+    },
+    "executor-ux": {
+      "agy": {"model": "gemini-3.8-flash-high", "effort": "medium", "reason": "Итеративная UX-задача с умеренной сложностью."},
+      "opencode": {"model": "Tokenn/gpt-6.1-sol", "effort": "medium", "reason": "UX требует сбалансированного решения."}
+    },
+    "review": {
+      "agy": {"model": "gemini-3.8-pro", "effort": "high", "reason": "Проверка должна охватывать сценарии и границы."},
+      "opencode": {"model": "Tokenn/gpt-6.1-sol", "effort": "high", "reason": "Независимое ревью с тщательной проверкой."}
+    },
+    "adversarial-review": {
+      "agy": {"model": "gemini-3.8-pro", "effort": "high", "reason": "Враждебное ревью ищет обходы и крайние случаи."},
+      "opencode": {"model": "Tokenn/gpt-6.1-sol", "effort": "high", "reason": "Враждебное ревью ищет обходы и крайние случаи."}
+    },
+    "docs": {
+      "agy": {"model": "gemini-3.8-flash-high", "effort": "low", "reason": "Документации достаточно быстрой недорогой модели."},
+      "opencode": {"model": "Tokenn/gpt-5.6-sol", "effort": "low", "reason": "Документация не требует максимального рассуждения."}
+    },
+    "merge-audit": {
+      "agy": {"model": "gemini-3.8-pro", "effort": "high", "reason": "Аудит слияния требует проверки целостности."},
+      "opencode": {"model": "Tokenn/gpt-6.1-sol", "effort": "high", "reason": "Аудит слияния требует проверки целостности."}
+    }
+  }
+}
