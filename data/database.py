@@ -1,9 +1,14 @@
 import json
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+# SEC1 (п.6): файлы БД содержат токен Telegraph, почту и коды подтверждения —
+# закрываем их от других локальных пользователей на уровне процесса и файла.
+os.umask(0o077)
 
 UTC = timezone.utc
 DB_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -15,6 +20,20 @@ MAX_ERROR_TEXT_LENGTH = int(os.getenv("MAX_ERROR_TEXT_LENGTH", "800"))
 CHANNEL_BACKLOG_MAX = int(os.getenv("CHANNEL_BACKLOG_MAX", "500"))
 CHANNEL_DELIVERY_BATCH_SIZE = int(os.getenv("CHANNEL_DELIVERY_BATCH_SIZE", "50"))
 MAX_FEED_CHANNELS = int(os.getenv("MAX_FEED_CHANNELS", "100"))
+# SEC1 (п.2/п.9): квоты на пользователя, чтобы один аккаунт не выел память.
+MAX_DIGEST_SUBSCRIPTIONS = int(os.getenv("MAX_DIGEST_SUBSCRIPTIONS", "300"))
+MAX_USER_REMINDERS = int(os.getenv("MAX_USER_REMINDERS", "1000"))
+MAX_USER_SAVED_MESSAGES = int(os.getenv("MAX_USER_SAVED_MESSAGES", "2000"))
+
+CHANNEL_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{4,32}$")
+
+
+def is_valid_channel_username(username: str | None) -> bool:
+    """Публичное имя канала: только латиница/цифры/подчёркивание, 4–32 символа."""
+    if not username:
+        return False
+    return bool(CHANNEL_USERNAME_RE.match(username))
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "bot_data.db"))
@@ -32,9 +51,24 @@ def get_connection():
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA temp_store = MEMORY")
         conn.execute("PRAGMA cache_size = -64000")
+        _secure_db_files()
         yield conn
     finally:
         conn.close()
+
+
+def _secure_db_files() -> None:
+    """SEC1 (п.6): закрыть правами 0600 основной файл БД и WAL/SHM-спутники."""
+    if DB_PATH == ":memory:":
+        return
+    for suffix in ("", "-wal", "-shm"):
+        path = f"{DB_PATH}{suffix}"
+        try:
+            if os.path.exists(path):
+                os.chmod(path, 0o600)
+        except OSError:
+            pass
+
 
 
 def serialize_datetime(dt: datetime) -> str:
@@ -428,6 +462,23 @@ def init_db():
             )
             '''
         )
+        # SEC1 (п.4): журнал отправок писем для суточных лимитов на пользователя/адрес.
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS email_send_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                sent_at DATETIME NOT NULL
+            )
+            '''
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_email_send_log_user_time ON email_send_log(user_id, sent_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_email_send_log_address_time ON email_send_log(address, sent_at)"
+        )
         cursor.execute(
             '''
             CREATE TABLE IF NOT EXISTS digest_executions (
@@ -582,9 +633,6 @@ def init_db():
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_subscriptions_failed_cleanup ON subscriptions(is_disabled, digest_status, last_attempt_at)"
-        )
-        cursor.execute(
-            "DROP INDEX IF EXISTS uq_subscriptions_user_channel_period_active"
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_saved_messages_user_tag_date ON saved_messages(user_id, tag, saved_at)"
@@ -745,6 +793,12 @@ def add_message(
         normalized = full_text.replace("\n", " ")
         text_preview = normalized[:37] + "..." if len(normalized) > 40 else normalized
     with get_connection() as conn:
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM scheduled_messages WHERE user_id = ? AND is_sent = 0",
+            (user_id,),
+        ).fetchone()[0]
+        if pending >= MAX_USER_REMINDERS:
+            raise ValueError(f"Достигнут лимит напоминаний ({MAX_USER_REMINDERS})")
         cur = conn.execute(
             '''
             INSERT INTO scheduled_messages (
@@ -806,7 +860,9 @@ def mark_message_delivery_error(msg_id, error_text, attempted_at, retry_count, i
         conn.commit()
 
 
-def get_user_messages(user_id):
+def get_user_messages(user_id, limit: int | None = None):
+    """SEC1 (п.9): выборка ограничена квотой пользователя, а не вычитывается целиком."""
+    limit = MAX_USER_REMINDERS if limit is None else max(1, int(limit))
     with get_connection() as conn:
         rows = conn.execute(
             '''
@@ -814,8 +870,9 @@ def get_user_messages(user_id):
             FROM scheduled_messages
             WHERE user_id = ? AND is_sent = 0
             ORDER BY send_at
+            LIMIT ?
             ''',
-            (user_id,),
+            (user_id, limit),
         ).fetchall()
     return rows
 
@@ -1185,52 +1242,74 @@ def add_subscription(user_id, channel_username, channel_title, period, last_scra
     normalized_username = normalize_channel_username(channel_username)
     created_at = serialize_datetime(utc_now())
     with get_connection() as conn:
-        existing_row = conn.execute(
-            """
-            SELECT id
-            FROM subscriptions
-            WHERE user_id = ? AND channel_username = ? AND period = ? AND is_disabled = 0
-            LIMIT 1
-            """,
-            (user_id, normalized_username, period),
-        ).fetchone()
+        # SEC1 (п.13): BEGIN IMMEDIATE закрывает гонку SELECT→INSERT между процессами.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing_row = conn.execute(
+                """
+                SELECT id
+                FROM subscriptions
+                WHERE user_id = ? AND channel_username = ? AND period = ? AND is_disabled = 0
+                LIMIT 1
+                """,
+                (user_id, normalized_username, period),
+            ).fetchone()
 
-        if existing_row:
-            sub_id = existing_row[0]
-            if tag is None:
-                conn.execute(
-                    """
-                    UPDATE subscriptions
-                    SET channel_username = ?, channel_title = ?, last_scraped_at = ?, next_send_at = ?,
-                        digest_status = 'active', failure_count = 0, last_error = NULL, last_attempt_at = NULL,
-                        is_paused = 0, last_post_id = NULL
-                    WHERE id = ?
-                    """,
-                    (normalized_username, channel_title, last_scraped_at, next_send_at, sub_id),
-                )
+            if existing_row:
+                sub_id = existing_row[0]
+                if tag is None:
+                    conn.execute(
+                        """
+                        UPDATE subscriptions
+                        SET channel_username = ?, channel_title = ?, last_scraped_at = ?, next_send_at = ?,
+                            digest_status = 'active', failure_count = 0, last_error = NULL, last_attempt_at = NULL,
+                            is_paused = 0, last_post_id = NULL
+                        WHERE id = ?
+                        """,
+                        (normalized_username, channel_title, last_scraped_at, next_send_at, sub_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE subscriptions
+                        SET channel_username = ?, channel_title = ?, last_scraped_at = ?, next_send_at = ?,
+                            digest_status = 'active', failure_count = 0, last_error = NULL, last_attempt_at = NULL,
+                            is_paused = 0, tag = ?, last_post_id = NULL
+                        WHERE id = ?
+                        """,
+                        (normalized_username, channel_title, last_scraped_at, next_send_at, tag, sub_id),
+                    )
             else:
-                conn.execute(
-                    """
-                    UPDATE subscriptions
-                    SET channel_username = ?, channel_title = ?, last_scraped_at = ?, next_send_at = ?,
-                        digest_status = 'active', failure_count = 0, last_error = NULL, last_attempt_at = NULL,
-                        is_paused = 0, tag = ?, last_post_id = NULL
-                    WHERE id = ?
-                    """,
-                    (normalized_username, channel_title, last_scraped_at, next_send_at, tag, sub_id),
+                # SEC1 (п.10): имя канала должно быть безопасным для href.
+                # Подписку с таким же каналом (перенос между периодами) не блокируем.
+                if not is_valid_channel_username(normalized_username):
+                    legacy_row = conn.execute(
+                        "SELECT 1 FROM subscriptions WHERE user_id = ? AND channel_username = ? LIMIT 1",
+                        (user_id, normalized_username),
+                    ).fetchone()
+                    if not legacy_row:
+                        raise ValueError("Некорректное имя канала")
+                # SEC1 (п.2): квота активных подписок на пользователя.
+                active_count = conn.execute(
+                    "SELECT COUNT(*) FROM subscriptions WHERE user_id = ? AND is_disabled = 0",
+                    (user_id,),
+                ).fetchone()[0]
+                if active_count >= MAX_DIGEST_SUBSCRIPTIONS:
+                    raise ValueError(f"Достигнут лимит подписок ({MAX_DIGEST_SUBSCRIPTIONS})")
+                cursor = conn.execute(
+                    '''
+                    INSERT INTO subscriptions (
+                        user_id, channel_username, channel_title, period, created_at, last_scraped_at, next_send_at, tag
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (user_id, normalized_username, channel_title, period, created_at, last_scraped_at, next_send_at, tag),
                 )
-        else:
-            cursor = conn.execute(
-                '''
-                INSERT INTO subscriptions (
-                    user_id, channel_username, channel_title, period, created_at, last_scraped_at, next_send_at, tag
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''',
-                (user_id, normalized_username, channel_title, period, created_at, last_scraped_at, next_send_at, tag),
-            )
-            sub_id = cursor.lastrowid
-        conn.commit()
+                sub_id = cursor.lastrowid
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     return sub_id
 
 
@@ -1264,9 +1343,10 @@ def get_due_subscriptions(current_time_str, limit: int | None = None):
     return rows
 
 
-def get_user_subscriptions_due_until(user_id, until_str):
+def get_user_subscriptions_due_until(user_id, until_str, limit: int | None = None):
     """Active subscriptions of one user scheduled up to ``until_str`` (same row shape as
     get_due_subscriptions): everything that belongs to the user's edition of the day."""
+    limit = MAX_DIGEST_SUBSCRIPTIONS if limit is None else max(1, int(limit))
     with get_connection() as conn:
         rows = conn.execute(
             '''
@@ -1275,8 +1355,9 @@ def get_user_subscriptions_due_until(user_id, until_str):
             FROM subscriptions
             WHERE user_id = ? AND next_send_at <= ? AND is_disabled = 0 AND is_paused = 0
             ORDER BY next_send_at, id
+            LIMIT ?
             ''',
-            (user_id, until_str),
+            (user_id, until_str, limit),
         ).fetchall()
     return rows
 
@@ -1671,8 +1752,10 @@ def get_channel_posts_since(
     channel_username: str,
     last_scraped_at: str | None,
     last_post_id: int | None = None,
+    limit: int | None = None,
 ) -> list[dict]:
     normalized_username = normalize_channel_username(channel_username)
+    limit = CHANNEL_DELIVERY_BATCH_SIZE if limit is None else max(1, int(limit))
     with get_connection() as conn:
         if last_post_id is not None:
             rows = conn.execute(
@@ -1682,8 +1765,9 @@ def get_channel_posts_since(
                 FROM channel_posts
                 WHERE channel_username = ? AND post_id > ?
                 ORDER BY post_id
+                LIMIT ?
                 ''',
-                (normalized_username, last_post_id),
+                (normalized_username, last_post_id, limit),
             ).fetchall()
         else:
             marker = last_scraped_at or serialize_datetime(datetime.min.replace(tzinfo=UTC))
@@ -1694,8 +1778,9 @@ def get_channel_posts_since(
                 FROM channel_posts
                 WHERE channel_username = ? AND post_time > ?
                 ORDER BY post_id
+                LIMIT ?
                 ''',
-                (normalized_username, marker),
+                (normalized_username, marker, limit),
             ).fetchall()
     return [
         {
@@ -2071,8 +2156,9 @@ def export_user_data(user_id) -> dict:
             FROM scheduled_messages
             WHERE user_id = ? AND is_sent = 0 AND delivery_status != 'failed_permanent'
             ORDER BY send_at
+            LIMIT ?
             ''',
-            (user_id,),
+            (user_id, MAX_USER_REMINDERS),
         ).fetchall()
         bookmarks = conn.execute(
             '''
@@ -2080,8 +2166,9 @@ def export_user_data(user_id) -> dict:
             FROM saved_messages
             WHERE user_id = ?
             ORDER BY saved_at
+            LIMIT ?
             ''',
-            (user_id,),
+            (user_id, MAX_USER_SAVED_MESSAGES),
         ).fetchall()
         subscriptions = conn.execute(
             '''
@@ -2089,8 +2176,9 @@ def export_user_data(user_id) -> dict:
             FROM subscriptions
             WHERE user_id = ? AND is_disabled = 0
             ORDER BY channel_username
+            LIMIT ?
             ''',
-            (user_id,),
+            (user_id, MAX_DIGEST_SUBSCRIPTIONS),
         ).fetchall()
         digest_settings = conn.execute(
             '''
@@ -2206,6 +2294,12 @@ def get_digest_cycle_backlog_history() -> list[int]:
 
 def add_saved_message(user_id, full_text, source_name, tag, saved_at):
     with get_connection() as conn:
+        saved_count = conn.execute(
+            "SELECT COUNT(*) FROM saved_messages WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()[0]
+        if saved_count >= MAX_USER_SAVED_MESSAGES:
+            raise ValueError(f"Достигнут лимит закладок ({MAX_USER_SAVED_MESSAGES})")
         cur = conn.execute(
             '''
             INSERT INTO saved_messages (user_id, full_text, source_name, tag, saved_at)
@@ -2233,7 +2327,8 @@ def get_user_tags(user_id):
     return [row[0] for row in rows if row[0]]
 
 
-def get_saved_messages(user_id):
+def get_saved_messages(user_id, limit: int | None = None):
+    limit = MAX_USER_SAVED_MESSAGES if limit is None else max(1, int(limit))
     with get_connection() as conn:
         rows = conn.execute(
             '''
@@ -2241,8 +2336,9 @@ def get_saved_messages(user_id):
             FROM saved_messages
             WHERE user_id = ?
             ORDER BY tag, saved_at DESC
+            LIMIT ?
             ''',
-            (user_id,),
+            (user_id, limit),
         ).fetchall()
     return rows
 
@@ -2394,16 +2490,21 @@ def get_digest_execution_by_id(execution_id: int) -> dict | None:
         return dict(row) if row else None
 
 
-def retry_digest_execution(execution_id: int) -> bool:
+def retry_digest_execution(execution_id: int, user_id: int) -> bool:
+    """SEC1 (п.1): повтор выпуска разрешён только его владельцу.
+
+    И владелец, и период берутся из строки, найденной по (id, user_id) — чужой
+    идентификатор не даёт доступа и не меняет состояние.
+    """
     now_str = serialize_datetime(utc_now())
     with get_connection() as conn:
         row = conn.execute(
-            'SELECT user_id, period, scheduled_at FROM digest_executions WHERE id = ?',
-            (execution_id,),
+            'SELECT user_id, period, scheduled_at FROM digest_executions WHERE id = ? AND user_id = ?',
+            (execution_id, user_id),
         ).fetchone()
         if not row:
             return False
-        user_id = row['user_id']
+        owner_id = row['user_id']
         period = row['period']
         sched_at = row['scheduled_at'] if ('scheduled_at' in row.keys() and row['scheduled_at']) else now_str
 
@@ -2411,9 +2512,9 @@ def retry_digest_execution(execution_id: int) -> bool:
             '''
             UPDATE digest_executions
             SET status = 'retrying', retry_count = 0, error_message = NULL
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             ''',
-            (execution_id,),
+            (execution_id, user_id),
         )
         conn.execute(
             '''
@@ -2421,7 +2522,7 @@ def retry_digest_execution(execution_id: int) -> bool:
             SET next_send_at = ?, failure_count = 0, digest_status = 'pending', is_disabled = 0
             WHERE user_id = ? AND period = ?
             ''',
-            (sched_at, user_id, period),
+            (sched_at, owner_id, period),
         )
         conn.commit()
         return True
@@ -2903,8 +3004,7 @@ def start_email_verification(user_id: int, email: str, code: str, sent_at: str, 
                 pending_email = excluded.pending_email,
                 verify_code = excluded.verify_code,
                 code_sent_at = excluded.code_sent_at,
-                code_expires_at = excluded.code_expires_at,
-                code_attempts = 0
+                code_expires_at = excluded.code_expires_at
             """,
             (user_id, email, code, sent_at, expires_at),
         )
@@ -2943,6 +3043,35 @@ def confirm_email_code(user_id: int, code: str, now_str: str) -> str:
         )
         conn.commit()
         return "ok"
+
+
+def count_email_sends_for_user(user_id: int, since_str: str) -> int:
+    """SEC1 (п.4): сколько писем пользователь запросил с момента since_str."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM email_send_log WHERE user_id = ? AND sent_at >= ?",
+            (user_id, since_str),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def count_email_sends_for_address(address: str, since_str: str) -> int:
+    """SEC1 (п.4): сколько писем ушло на конкретный адрес с момента since_str."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM email_send_log WHERE address = ? AND sent_at >= ?",
+            (address, since_str),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def record_email_send(user_id: int, address: str, sent_at: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO email_send_log (user_id, address, sent_at) VALUES (?, ?, ?)",
+            (user_id, address, sent_at),
+        )
+        conn.commit()
 
 
 def delete_user_email(user_id: int) -> None:

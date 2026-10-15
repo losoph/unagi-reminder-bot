@@ -252,7 +252,7 @@ class TestAlertRecovery(unittest.TestCase):
         db.record_digest_alert_sent(user_id, period, sched, alert_type="failure", message_id=30)
 
         # Retry triggered by user
-        self.assertTrue(db.retry_digest_execution(exec_id))
+        self.assertTrue(db.retry_digest_execution(exec_id, user_id))
 
         # Check that subscription next_send_at preserved scheduled_at
         due = db.get_due_subscriptions("2026-09-29 10:00:00")

@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, tzinfo
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.enums import ChatType
 from aiogram.exceptions import (
     TelegramAPIError,
     TelegramBadRequest,
@@ -43,6 +44,8 @@ from data.database import (
     confirm_email_code,
     clear_subscription_failure,
     count_due_subscriptions,
+    count_email_sends_for_address,
+    count_email_sends_for_user,
     count_user_subscriptions,
     delete_message,
     delete_saved_message,
@@ -50,6 +53,7 @@ from data.database import (
     export_user_data,
     get_ai_usage_today,
     get_channel_scan_cursor,
+    get_digest_execution_by_id,
     get_digest_posts,
     get_digest_settings,
     get_email_delivery,
@@ -74,6 +78,7 @@ from data.database import (
     increment_ai_usage,
     init_db,
     is_channel_backlog_overloaded,
+    is_valid_channel_username,
     mark_as_sent,
     mark_message_delivery_error,
     mark_reminder_as_done,
@@ -83,6 +88,7 @@ from data.database import (
     record_digest_cycle_heartbeat,
     record_digest_execution_finish,
     record_digest_execution_start,
+    record_email_send,
     replace_sent_reminder_with_pending,
     reset_user_alert_consecutive_failures,
     retry_digest_execution,
@@ -148,6 +154,12 @@ import feed
 dp.include_router(reminders_ux.router)
 dp.include_router(user_prefs.router)
 dp.include_router(feed.router)
+# SEC1 (п.5): бот работает только в личных сообщениях. Корневые фильтры
+# отсекают группы/каналы до маршрутизации во вложенные роутеры, поэтому ни один
+# пользовательский обработчик (main/reminders_ux/user_prefs/feed) не увидит
+# сообщение или callback из группового чата.
+dp.message.filter(F.chat.type == ChatType.PRIVATE)
+dp.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
 feed.configure(bot=bot, channel_source=channel_source)
 from time_utils import (  # noqa: E402
     _DAY_PART_HOURS,
@@ -187,7 +199,46 @@ AI_DAILY_LIMIT = ai_assistant.AI_DAILY_LIMIT
 READING_WORDS_PER_MINUTE = 180
 EXPORT_VERSION = 2
 
+# SEC1 (п.3): общий per-user кулдаун для дорогих сетевых операций.
+EXPENSIVE_COMMAND_COOLDOWN_SECONDS = int(os.getenv("EXPENSIVE_COMMAND_COOLDOWN_SECONDS", "60"))
+# SEC1 (п.4): суточные лимиты писем с подтверждением.
+EMAIL_DAILY_LIMIT_PER_USER = int(os.getenv("EMAIL_DAILY_LIMIT_PER_USER", "5"))
+EMAIL_DAILY_LIMIT_PER_ADDRESS = int(os.getenv("EMAIL_DAILY_LIMIT_PER_ADDRESS", "5"))
+
+_expensive_command_last: dict[int, float] = {}
+
 USER_FACING_ERROR = "Что-то пошло не так. Попробуй ещё раз позже."
+
+
+def check_expensive_command_cooldown(user_id: int) -> int:
+    """SEC1 (п.3): 0 — можно выполнять (время отмечено), иначе сколько секунд ждать."""
+    now = time.monotonic()
+    last = _expensive_command_last.get(user_id, 0.0)
+    elapsed = now - last
+    if elapsed < EXPENSIVE_COMMAND_COOLDOWN_SECONDS:
+        return int(EXPENSIVE_COMMAND_COOLDOWN_SECONDS - elapsed) + 1
+    _expensive_command_last[user_id] = now
+    return 0
+
+
+def user_id_from_message(message: types.Message) -> int:
+    """SEC1 (п.5): идентичность пользователя берём из from_user, а не из chat.id."""
+    from_user = getattr(message, "from_user", None)
+    uid = getattr(from_user, "id", None)
+    if isinstance(uid, int):
+        return uid
+    return message.chat.id
+
+
+def user_id_from_callback(callback: CallbackQuery) -> int:
+    """SEC1 (п.5): владелец callback — from_user.id; chat.id только как запасной путь."""
+    from_user = getattr(callback, "from_user", None)
+    uid = getattr(from_user, "id", None)
+    if isinstance(uid, int):
+        return uid
+    message = getattr(callback, "message", None)
+    chat = getattr(message, "chat", None) if message is not None else None
+    return getattr(chat, "id", 0)
 
 
 def create_telegram_http_session() -> aiohttp.ClientSession:
@@ -755,7 +806,7 @@ def get_replied_sent_schedule(message: types.Message):
     replied = message.reply_to_message
     if not replied:
         return None
-    return get_scheduled_message_by_delivered_message_id(message.chat.id, replied.message_id)
+    return get_scheduled_message_by_delivered_message_id(user_id_from_message(message), replied.message_id)
 
 
 def get_callback_message(callback: CallbackQuery) -> Message | None:
@@ -988,12 +1039,14 @@ def append_digest_channel_lines(
     lines.append(f"📌 <b>{html.escape(channel_title) if channel_title else 'Канал'}</b>  {unsubscribe_link}")
     for post in posts:
         text_safe = html.escape(format_post_preview(post.get("text") or ""))
-        lines.append(f"🔹 <i>{text_safe}</i> <a href='{post['link']}'>[Читать]</a>\n")
+        # SEC1 (п.10): ссылка тоже экранируется, иначе кавычка в href ломает разметку.
+        link_safe = html.escape(str(post.get("link") or ""), quote=True)
+        lines.append(f"🔹 <i>{text_safe}</i> <a href='{link_safe}'>[Читать]</a>\n")
 
     if omitted_count > 0 and channel_username:
         from telegraph_publisher import plural_ru
 
-        clean_user = channel_username.lstrip("@")
+        clean_user = html.escape(channel_username.lstrip("@"), quote=True)
         post_str = plural_ru(omitted_count, "пост", "поста", "постов")
         lines.append(f"▫️ <a href='https://t.me/{clean_user}'>ещё {post_str} в канале</a>\n")
 
@@ -1177,7 +1230,10 @@ async def fetch_subscription_posts(
                 upsert_channel_posts(username, fetched_posts, source_name)
                 advance_channel_scan_cursor(username, fetched_posts)
 
-            available_posts = get_channel_posts_since(username, last_scraped, last_post_id)
+            # SEC1 (п.14): берём batch+1, чтобы отличить «ровно батч» от «есть backlog».
+            available_posts = get_channel_posts_since(
+                username, last_scraped, last_post_id, limit=CHANNEL_DELIVERY_BATCH_SIZE + 1
+            )
             if fetched_posts and not available_posts:
                 # Compatibility for a malformed legacy link without a numeric post id.
                 available_posts = fetched_posts
@@ -1333,7 +1389,7 @@ async def prefetch_due_channels(
 
 
 async def handle_digest_deep_link(message: types.Message, payload: str) -> bool:
-    user_id = message.chat.id
+    user_id = user_id_from_message(message)
 
     if payload == "ds":
         await message.answer(
@@ -1388,14 +1444,18 @@ async def handle_digest_deep_link(message: types.Message, payload: str) -> bool:
             return True
         settings = resolve_digest_settings(user_id, new_period)
         next_send_at = serialize_datetime(get_next_digest_time(new_period, local_now(), settings))
-        add_subscription(
-            user_id,
-            sub["channel_username"],
-            sub["channel_title"],
-            new_period,
-            sub["last_scraped_at"] or serialize_datetime(utc_now()),
-            next_send_at,
-        )
+        try:
+            add_subscription(
+                user_id,
+                sub["channel_username"],
+                sub["channel_title"],
+                new_period,
+                sub["last_scraped_at"] or serialize_datetime(utc_now()),
+                next_send_at,
+            )
+        except ValueError as exc:
+            await message.answer(f"🚫 {exc}")
+            return True
         delete_subscription(user_id, sub_id)
         await message.answer(
             f"↪️ <b>{html.escape(sub['channel_title']) if sub['channel_title'] else 'Канал'}</b> перенесён в {_PERIOD_TITLES[new_period].lower()} дайджест.",
@@ -1509,7 +1569,7 @@ async def cmd_home(message: types.Message, state: FSMContext):
 async def cmd_back(message: types.Message, state: FSMContext):
     prev = await pop_screen(state)
     if prev:
-        await render_screen(message.chat.id, prev, message, state)
+        await render_screen(user_id_from_message(message), prev, message, state)
     else:
         await state.clear()
         await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=build_main_menu_keyboard())
@@ -1533,7 +1593,7 @@ async def callback_home(callback: types.CallbackQuery, state: FSMContext):
 async def callback_back(callback: types.CallbackQuery, state: FSMContext):
     prev = await pop_screen(state)
     if prev:
-        await render_screen(callback.message.chat.id, prev, callback, state)
+        await render_screen(user_id_from_callback(callback), prev, callback, state)
     else:
         await state.clear()
         try:
@@ -1588,18 +1648,18 @@ async def callback_settings(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "menu_rem")
 async def callback_menu_reminders(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    if not get_user_messages(callback.message.chat.id):
+    if not get_user_messages(user_id_from_callback(callback)):
         await callback.answer("📭 Напоминаний нет. Перешли сообщение или напиши текст — отложу его.", show_alert=True)
         return
     await push_screen(state, "rem_list", tag=None, page=1)
-    await render_rem_list_screen(callback.message.chat.id, None, 1, callback, state)
+    await render_rem_list_screen(user_id_from_callback(callback), None, 1, callback, state)
 
 
 @dp.callback_query(F.data == "menu_kb")
 async def callback_menu_bookmarks(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await push_screen(state, "kb_tags")
-    await render_kb_tags_screen(callback.message.chat.id, callback, state)
+    await render_kb_tags_screen(user_id_from_callback(callback), callback, state)
 
 
 async def set_bot_commands(bot: Bot):
@@ -1618,7 +1678,7 @@ async def start_save_flow(
     command_message_id: int | None = None,
     orig_msg_id: int | None = None,
 ) -> None:
-    tags = get_user_tags(message.chat.id)
+    tags = get_user_tags(user_id_from_message(message))
     tags_text = ""
     if tags:
         tags_formatted = "  ".join([f"`{tag}`" for tag in tags])
@@ -1649,7 +1709,7 @@ async def _apply_replied_reschedule(
     db_id, source_message_id, _, _, preview, source, *_ = scheduled_msg
     try:
         new_db_id = replace_sent_reminder_with_pending(
-            message.chat.id,
+            user_id_from_message(message),
             db_id,
             source_message_id,
             serialize_datetime(scheduled_time),
@@ -1680,7 +1740,7 @@ async def _reschedule_replied_reminder(
         await message.answer("Ответь этой командой на доставленное напоминание от бота.")
         return
 
-    user_id = message.chat.id
+    user_id = user_id_from_message(message)
     now = user_now(user_id)
     hours = day_part_hours(user_id)
     scheduled_time, label = get_quick_scheduled_time(quick_action, now, hours=hours)
@@ -1692,8 +1752,8 @@ async def _reschedule_replied_reminder(
 
 async def reschedule_replied_by_text(message: types.Message, scheduled_msg, text: str) -> None:
     """«завтра 11» / «24/09 в 9» / «через 2 дня» as a reply to a delivered reminder (or /at)."""
-    now = user_now(message.chat.id)
-    hours = day_part_hours(message.chat.id)
+    now = user_now(user_id_from_message(message))
+    hours = day_part_hours(user_id_from_message(message))
     scheduled_time = parse_reminder_time(text, now, hours=hours)
     if scheduled_time is None:
         await message.answer(
@@ -1767,7 +1827,7 @@ async def cmd_delete_reply(message: types.Message):
         return
 
     db_id = scheduled_msg[0]
-    delete_message(message.chat.id, db_id)
+    delete_message(user_id_from_message(message), db_id)
     try:
         if message.reply_to_message is not None:
             await message.reply_to_message.delete()
@@ -1784,7 +1844,7 @@ async def show_sent_reminder_time_actions(callback: CallbackQuery):
         return
 
     scheduled_msg = get_scheduled_message_by_delivered_message_id(
-        callback_message.chat.id, callback_message.message_id
+        user_id_from_callback(callback), callback_message.message_id
     )
     if not scheduled_msg:
         await callback.answer("Напоминание уже перенесено.")
@@ -1798,7 +1858,7 @@ async def show_sent_reminder_time_actions(callback: CallbackQuery):
         )
     except TelegramBadRequest:
         pass
-    user_id = callback_message.chat.id
+    user_id = user_id_from_callback(callback)
     await callback.answer(f"{describe_quick_times(user_now(user_id), day_part_hours(user_id))}\nИли ответь текстом: {TIME_TEXT_EXAMPLES}")
 
 
@@ -1830,14 +1890,14 @@ async def handle_sent_reminder_time_selection(callback: CallbackQuery, state: FS
         return
 
     scheduled_msg = get_scheduled_message_by_delivered_message_id(
-        callback_message.chat.id, delivered_message_id
+        user_id_from_callback(callback), delivered_message_id
     )
     if not scheduled_msg:
         await callback.answer("Напоминание уже перенесено.")
         return
 
     db_id, source_message_id, _, _, preview, source, _ = scheduled_msg
-    user_id = callback_message.chat.id
+    user_id = user_id_from_callback(callback)
     now = user_now(user_id)
     hours = day_part_hours(user_id)
 
@@ -1872,7 +1932,7 @@ async def handle_sent_reminder_time_selection(callback: CallbackQuery, state: FS
 
     try:
         new_db_id = replace_sent_reminder_with_pending(
-            callback_message.chat.id,
+            user_id_from_callback(callback),
             db_id,
             source_message_id,
             serialize_datetime(scheduled_time),
@@ -1886,13 +1946,13 @@ async def handle_sent_reminder_time_selection(callback: CallbackQuery, state: FS
 
     for message_id in {delivered_message_id, callback_message.message_id}:
         try:
-            await bot.delete_message(callback_message.chat.id, message_id)
+            await bot.delete_message(user_id_from_callback(callback), message_id)
         except TelegramAPIError:
             pass
 
     await callback.answer()
     kb = reminders_ux.build_reschedule_note_keyboard(new_db_id)
-    await bot.send_message(callback_message.chat.id, f"✅ Отложил {label}.", reply_markup=kb)
+    await bot.send_message(user_id_from_callback(callback), f"✅ Отложил {label}.", reply_markup=kb)
 
 
 @dp.callback_query(F.data == "sent_save")
@@ -1903,7 +1963,7 @@ async def save_sent_reminder(callback: CallbackQuery, state: FSMContext):
         return
 
     scheduled_msg = get_scheduled_message_by_delivered_message_id(
-        callback_message.chat.id, callback_message.message_id
+        user_id_from_callback(callback), callback_message.message_id
     )
     if not scheduled_msg:
         await callback.answer("❌ Напоминание уже обработано.", show_alert=True)
@@ -1929,13 +1989,13 @@ async def delete_sent_reminder(callback: CallbackQuery):
         return
 
     scheduled_msg = get_scheduled_message_by_delivered_message_id(
-        callback_message.chat.id, callback_message.message_id
+        user_id_from_callback(callback), callback_message.message_id
     )
     if not scheduled_msg:
         await callback.answer("❌ Напоминание уже обработано.", show_alert=True)
         return
 
-    delete_message(callback_message.chat.id, scheduled_msg[0])
+    delete_message(user_id_from_callback(callback), scheduled_msg[0])
     try:
         await callback_message.delete()
     except TelegramAPIError:
@@ -1954,14 +2014,14 @@ async def handle_sent_snooze(callback: CallbackQuery):
         return
 
     scheduled_msg = get_scheduled_message_by_delivered_message_id(
-        callback_message.chat.id, callback_message.message_id
+        user_id_from_callback(callback), callback_message.message_id
     )
     if not scheduled_msg:
         await callback.answer("Напоминание уже перенесено.")
         return
 
     db_id, source_message_id, delivered_message_id, _, preview, source, _ = scheduled_msg
-    user_id = callback_message.chat.id
+    user_id = user_id_from_callback(callback)
     now = user_now(user_id)
     hours = day_part_hours(user_id)
 
@@ -1980,7 +2040,7 @@ async def handle_sent_snooze(callback: CallbackQuery):
 
     try:
         new_db_id = replace_sent_reminder_with_pending(
-            callback_message.chat.id,
+            user_id_from_callback(callback),
             db_id,
             source_message_id,
             serialize_datetime(scheduled_time),
@@ -1994,14 +2054,14 @@ async def handle_sent_snooze(callback: CallbackQuery):
 
     for message_id in {delivered_message_id, callback_message.message_id}:
         try:
-            await bot.delete_message(callback_message.chat.id, message_id)
+            await bot.delete_message(user_id_from_callback(callback), message_id)
         except TelegramAPIError:
             pass
 
     await callback.answer()
     kb = reminders_ux.build_reschedule_note_keyboard(new_db_id)
     await bot.send_message(
-        callback_message.chat.id,
+        user_id_from_callback(callback),
         f"✅ Отложил на {format_when(scheduled_time, now)}.",
         reply_markup=kb,
     )
@@ -2015,11 +2075,11 @@ async def handle_sent_reminder_done(callback: CallbackQuery):
         return
 
     scheduled_msg = get_scheduled_message_by_delivered_message_id(
-        callback_message.chat.id, callback_message.message_id
+        user_id_from_callback(callback), callback_message.message_id
     )
     if scheduled_msg:
         db_id = scheduled_msg[0]
-        mark_reminder_as_done(callback_message.chat.id, db_id)
+        mark_reminder_as_done(user_id_from_callback(callback), db_id)
 
     try:
         await callback_message.edit_reply_markup(reply_markup=None)
@@ -2236,17 +2296,17 @@ async def render_rem_move_screen(chat_id: int, msg_id: int, target: types.Messag
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message, state: FSMContext):
     await state.clear()
-    if not get_user_messages(message.chat.id):
+    if not get_user_messages(user_id_from_message(message)):
         await message.answer("📭 У тебя нет активных напоминаний.\n\nДля дайджестов используй /list_digest.")
         return
     await push_screen(state, "rem_list", tag=None, page=1)
-    await render_rem_list_screen(message.chat.id, None, 1, message, state)
+    await render_rem_list_screen(user_id_from_message(message), None, 1, message, state)
 
 
 @dp.message(Command("list_digest"))
 async def cmd_list_digest(message: types.Message, state: FSMContext):
     await state.clear()
-    user_id = message.chat.id
+    user_id = user_id_from_message(message)
     await message.answer(
         render_digest_settings_text(user_id),
         parse_mode="HTML",
@@ -2262,13 +2322,13 @@ async def handle_rem_ignore(callback: CallbackQuery):
 @dp.callback_query(F.data == "rem_view_tags")
 async def handle_rem_view_tags(callback: CallbackQuery, state: FSMContext):
     await push_screen(state, "rem_tags")
-    await render_rem_tags_screen(callback.message.chat.id, callback, state)
+    await render_rem_tags_screen(user_id_from_callback(callback), callback, state)
 
 
 @dp.callback_query(F.data == "rem_tag_all")
 async def handle_rem_tag_all(callback: CallbackQuery, state: FSMContext):
     await push_screen(state, "rem_list", tag=None, page=1)
-    await render_rem_list_screen(callback.message.chat.id, None, 1, callback, state)
+    await render_rem_list_screen(user_id_from_callback(callback), None, 1, callback, state)
 
 
 @dp.callback_query(F.data.startswith("rem_tag_idx_"))
@@ -2279,7 +2339,7 @@ async def handle_rem_tag_selection(callback: CallbackQuery, state: FSMContext):
     if idx < len(tags_list):
         tag = tags_list[idx]
         await push_screen(state, "rem_list", tag=tag, page=1)
-        await render_rem_list_screen(callback.message.chat.id, tag, 1, callback, state)
+        await render_rem_list_screen(user_id_from_callback(callback), tag, 1, callback, state)
     else:
         await callback.answer("❌ Ошибка выбора тега.")
 
@@ -2289,7 +2349,7 @@ async def handle_rem_page_prev(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     tag = data.get("rem_current_tag")
     page = max(1, (data.get("rem_current_page") or 1) - 1)
-    await render_rem_list_screen(callback.message.chat.id, tag, page, callback, state)
+    await render_rem_list_screen(user_id_from_callback(callback), tag, page, callback, state)
 
 
 @dp.callback_query(F.data == "rem_page_next")
@@ -2297,7 +2357,7 @@ async def handle_rem_page_next(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     tag = data.get("rem_current_tag")
     page = (data.get("rem_current_page") or 1) + 1
-    await render_rem_list_screen(callback.message.chat.id, tag, page, callback, state)
+    await render_rem_list_screen(user_id_from_callback(callback), tag, page, callback, state)
 
 
 @dp.callback_query(F.data.startswith("rem_sel_"))
@@ -2314,27 +2374,27 @@ async def handle_rem_select(callback: CallbackQuery, state: FSMContext):
     else:
         msg_id = int(data.split("_")[-1])
     await push_screen(state, "rem_detail", msg_id=msg_id)
-    await render_rem_detail_screen(callback.message.chat.id, msg_id, callback, state)
+    await render_rem_detail_screen(user_id_from_callback(callback), msg_id, callback, state)
 
 
 @dp.callback_query(F.data.startswith("rem_del_"))
 async def handle_rem_delete(callback: CallbackQuery, state: FSMContext):
     msg_id = int(callback.data.split("_")[-1])
-    delete_message(callback.message.chat.id, msg_id)
+    delete_message(user_id_from_callback(callback), msg_id)
     await callback.answer("✅ Напоминание удалено!")
     await pop_screen(state)
     prev = (await state.get_data()).get("screen_history", [])
     if prev:
-        await render_screen(callback.message.chat.id, prev[-1], callback, state)
+        await render_screen(user_id_from_callback(callback), prev[-1], callback, state)
     else:
-        await render_rem_list_screen(callback.message.chat.id, None, 1, callback, state)
+        await render_rem_list_screen(user_id_from_callback(callback), None, 1, callback, state)
 
 
 @dp.callback_query(F.data.startswith("rem_tag_init_"))
 async def handle_rem_tag_init(callback: CallbackQuery, state: FSMContext):
     msg_id = int(callback.data.split("_")[-1])
     await push_screen(state, "rem_move", msg_id=msg_id)
-    await render_rem_move_screen(callback.message.chat.id, msg_id, callback, state)
+    await render_rem_move_screen(user_id_from_callback(callback), msg_id, callback, state)
 
 
 @dp.callback_query(F.data.startswith("rem_mv_idx_"))
@@ -2346,10 +2406,10 @@ async def handle_rem_move_tag_selection(callback: CallbackQuery, state: FSMConte
     if idx >= len(tags) or not msg_id:
         await callback.answer("❌ Ошибка выбора тега.")
         return
-    update_reminder_tag(callback.message.chat.id, msg_id, tags[idx])
+    update_reminder_tag(user_id_from_callback(callback), msg_id, tags[idx])
     await callback.answer(f"✅ Тег: #{tags[idx]}")
     await pop_screen(state)  # leave rem_move
-    await render_rem_detail_screen(callback.message.chat.id, msg_id, callback, state)
+    await render_rem_detail_screen(user_id_from_callback(callback), msg_id, callback, state)
 
 
 @dp.message(SaveState.waiting_for_reminder_tag)
@@ -2365,7 +2425,7 @@ async def process_reminder_tag(message: types.Message, state: FSMContext):
         await message.answer("❌ Ошибка: напоминание не найдено.", reply_markup=build_back_home_keyboard())
         return
 
-    update_reminder_tag(message.chat.id, msg_id, new_tag)
+    update_reminder_tag(user_id_from_message(message), msg_id, new_tag)
     await pop_screen(state)  # leave rem_move
     confirm = await message.answer(f"✅ Тег: #{new_tag}")
     await state.set_state(None)
@@ -2375,38 +2435,42 @@ async def process_reminder_tag(message: types.Message, state: FSMContext):
         await message.delete()
     except TelegramAPIError:
         pass
-    await render_rem_detail_screen(message.chat.id, msg_id, message, state)
+    await render_rem_detail_screen(user_id_from_message(message), msg_id, message, state)
 
 
 @dp.callback_query(F.data.startswith("rem_tobk_"))
 async def handle_rem_to_bookmark(callback: CallbackQuery, state: FSMContext):
     msg_id = int(callback.data.split("_")[-1])
-    row = get_reminder_by_id(callback.message.chat.id, msg_id)
+    row = get_reminder_by_id(user_id_from_callback(callback), msg_id)
     if not row:
         await callback.answer("❌ Напоминание не найдено.", show_alert=True)
         return
     _id, _send_at, preview, source, row_tag, _msg_id = row
-    add_saved_message(
-        callback.message.chat.id,
-        preview or "Без текста",
-        source or "Неизвестно",
-        row_tag or "Без тега",
-        serialize_datetime(utc_now()),
-    )
-    delete_message(callback.message.chat.id, msg_id)
+    try:
+        add_saved_message(
+            user_id_from_callback(callback),
+            preview or "Без текста",
+            source or "Неизвестно",
+            row_tag or "Без тега",
+            serialize_datetime(utc_now()),
+        )
+    except ValueError as exc:
+        await callback.answer(f"🚫 {exc}", show_alert=True)
+        return
+    delete_message(user_id_from_callback(callback), msg_id)
     await callback.answer("✅ Перенесено в закладки!")
     await pop_screen(state)  # leave rem_detail
     prev = (await state.get_data()).get("screen_history", [])
     if prev:
-        await render_screen(callback.message.chat.id, prev[-1], callback, state)
+        await render_screen(user_id_from_callback(callback), prev[-1], callback, state)
     else:
-        await render_rem_list_screen(callback.message.chat.id, None, 1, callback, state)
+        await render_rem_list_screen(user_id_from_callback(callback), None, 1, callback, state)
 
 
 @dp.callback_query(F.data.startswith("rem_resched_init_"))
 async def handle_rem_resched_init(callback: CallbackQuery, state: FSMContext):
     msg_id = int(callback.data.rsplit("_", 1)[-1])
-    row = get_reminder_by_id(callback.message.chat.id, msg_id)
+    row = get_reminder_by_id(user_id_from_callback(callback), msg_id)
     if not row:
         await callback.answer("❌ Напоминание не найдено.", show_alert=True)
         return
@@ -2416,7 +2480,7 @@ async def handle_rem_resched_init(callback: CallbackQuery, state: FSMContext):
         source=row[3] or "",
         prompt_msg_id=callback.message.message_id,
     )
-    user_id = callback.message.chat.id
+    user_id = user_id_from_callback(callback)
     now = user_now(user_id)
     hours = day_part_hours(user_id)
     await callback.message.edit_text(
@@ -2447,18 +2511,18 @@ async def handle_rem_resched_choice(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    user_id = callback.message.chat.id
+    user_id = user_id_from_callback(callback)
     now = user_now(user_id)
     hours = day_part_hours(user_id)
     scheduled_time, label = get_quick_scheduled_time(action, now, hours=hours)
     if scheduled_time is None:
         await callback.answer("❌ Ошибка при планировании времени.")
         return
-    update_reminder_time(callback.message.chat.id, msg_id, serialize_datetime(scheduled_time))
+    update_reminder_time(user_id_from_callback(callback), msg_id, serialize_datetime(scheduled_time))
     await callback.answer(f"✅ Перенесено на {scheduled_time.strftime('%d.%m %H:%M')}")
     # rem_detail is already the top of history (the time picker replaced the message
     # in place without pushing a screen), so just re-render it.
-    await render_rem_detail_screen(callback.message.chat.id, msg_id, callback, state)
+    await render_rem_detail_screen(user_id_from_callback(callback), msg_id, callback, state)
 
 
 @dp.callback_query(F.data.startswith("unsub_"))
@@ -2473,12 +2537,18 @@ async def handle_unsub(callback: CallbackQuery):
         await callback.answer("❌ Некорректные данные.")
         return
 
-    delete_subscription(callback_message.chat.id, sub_id)
+    user_id = user_id_from_callback(callback)
+    # SEC1 (п.1): подписка должна принадлежать нажавшему, иначе ничего не меняем.
+    if not get_subscription_by_id(user_id, sub_id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    delete_subscription(user_id, sub_id)
     try:
         await callback_message.edit_text(
-            render_digest_settings_text(callback_message.chat.id),
+            render_digest_settings_text(user_id),
             parse_mode="HTML",
-            reply_markup=build_digest_settings_keyboard(get_user_subscriptions(callback_message.chat.id)),
+            reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id)),
         )
     except TelegramAPIError:
         pass
@@ -2486,7 +2556,7 @@ async def handle_unsub(callback: CallbackQuery):
 
 
 async def _refresh_digest_settings(callback: CallbackQuery):
-    user_id = callback.from_user.id
+    user_id = user_id_from_callback(callback)
     await edit_or_answer(
         callback,
         render_digest_settings_text(user_id),
@@ -2495,7 +2565,7 @@ async def _refresh_digest_settings(callback: CallbackQuery):
 
 
 async def render_subscription_actions(callback: CallbackQuery, sub_id: int) -> bool:
-    user_id = callback.from_user.id
+    user_id = user_id_from_callback(callback)
     sub = get_subscription_by_id(user_id, sub_id)
     if not sub:
         await callback.answer("❌ Подписка не найдена.", show_alert=True)
@@ -2528,7 +2598,14 @@ async def handle_alert_retry(callback: CallbackQuery):
         await callback.answer("❌ Некорректный ID выпуска.", show_alert=True)
         return
 
-    success = retry_digest_execution(execution_id)
+    # SEC1 (п.1): чужой/несуществующий выпуск не даёт доступа и не меняет состояние.
+    callback_user_id = user_id_from_callback(callback)
+    execution = get_digest_execution_by_id(execution_id)
+    if not execution or execution["user_id"] != callback_user_id:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    success = retry_digest_execution(execution_id, callback_user_id)
     if success:
         await callback.answer("🔄 Повтор запущен! Бот попытается собрать выпуск в ближайшем цикле.", show_alert=True)
         callback_msg = get_callback_message(callback)
@@ -2549,7 +2626,7 @@ async def handle_alert_retry(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "alert_pause_24h")
 async def handle_alert_pause_24h(callback: CallbackQuery):
-    user_id = callback.from_user.id
+    user_id = user_id_from_callback(callback)
     paused_until = utc_now() + timedelta(hours=24)
     set_user_alerts_paused_until(user_id, serialize_datetime(paused_until))
     await callback.answer("⏸ Технические алерты на паузе на 24 часа.")
@@ -2576,7 +2653,7 @@ async def handle_alert_pause_24h(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "alert_pause_7d")
 async def handle_alert_pause_7d(callback: CallbackQuery):
-    user_id = callback.from_user.id
+    user_id = user_id_from_callback(callback)
     paused_until = utc_now() + timedelta(days=7)
     set_user_alerts_paused_until(user_id, serialize_datetime(paused_until))
     await callback.answer("⏸ Технические алерты на паузе на 7 дней.")
@@ -2603,7 +2680,7 @@ async def handle_alert_pause_7d(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "alert_disable")
 async def handle_alert_disable(callback: CallbackQuery):
-    user_id = callback.from_user.id
+    user_id = user_id_from_callback(callback)
     set_user_alerts_enabled(user_id, False)
     await callback.answer("🔕 Технические алерты отключены.")
     callback_msg = get_callback_message(callback)
@@ -2629,7 +2706,7 @@ async def handle_alert_disable(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "alert_toggle_enable")
 async def handle_alert_toggle_enable(callback: CallbackQuery):
-    user_id = callback.from_user.id
+    user_id = user_id_from_callback(callback)
     set_user_alerts_enabled(user_id, True)
     set_user_alerts_paused_until(user_id, None)
     await callback.answer("🔔 Технические алерты включены!")
@@ -2655,7 +2732,7 @@ async def open_digest_subscription_actions(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("dmove_"))
 async def move_digest_subscription(callback: CallbackQuery):
-    user_id = callback.from_user.id
+    user_id = user_id_from_callback(callback)
     payload = parse_callback_strip_prefix(callback.data, "dmove_")
     if not payload or "_" not in payload:
         await callback.answer("❌ Некорректные данные.", show_alert=True)
@@ -2677,15 +2754,19 @@ async def move_digest_subscription(callback: CallbackQuery):
 
     settings = resolve_digest_settings(user_id, new_period)
     next_send_at = serialize_datetime(get_next_digest_time(new_period, local_now(), settings))
-    new_sub_id = add_subscription(
-        user_id,
-        sub["channel_username"],
-        sub["channel_title"],
-        new_period,
-        sub["last_scraped_at"] or serialize_datetime(utc_now()),
-        next_send_at,
-        tag=sub["tag"],
-    )
+    try:
+        new_sub_id = add_subscription(
+            user_id,
+            sub["channel_username"],
+            sub["channel_title"],
+            new_period,
+            sub["last_scraped_at"] or serialize_datetime(utc_now()),
+            next_send_at,
+            tag=sub["tag"],
+        )
+    except ValueError as exc:
+        await callback.answer(f"🚫 {exc}", show_alert=True)
+        return
     if new_sub_id != sub_id:
         delete_subscription(user_id, sub_id)
 
@@ -2704,7 +2785,7 @@ async def pause_subscription(callback: CallbackQuery):
     if sub_id is None:
         await callback.answer("❌ Некорректные данные.", show_alert=True)
         return
-    set_subscription_paused(callback.from_user.id, sub_id, True)
+    set_subscription_paused(user_id_from_callback(callback), sub_id, True)
     await render_subscription_actions(callback, sub_id)
     await callback.answer("⏸ Подписка на паузе.")
 
@@ -2715,7 +2796,7 @@ async def resume_subscription(callback: CallbackQuery):
     if sub_id is None:
         await callback.answer("❌ Некорректные данные.", show_alert=True)
         return
-    user_id = callback.from_user.id
+    user_id = user_id_from_callback(callback)
     set_subscription_paused(user_id, sub_id, False)
     # Сдвигаем next_send_at вперёд, чтобы возобновлённая подписка не сработала мгновенно.
     sub = get_subscription_by_id(user_id, sub_id)
@@ -2729,14 +2810,14 @@ async def resume_subscription(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "dpauseall")
 async def pause_all_subscriptions(callback: CallbackQuery):
-    changed = set_all_subscriptions_paused(callback.from_user.id, True)
+    changed = set_all_subscriptions_paused(user_id_from_callback(callback), True)
     await _refresh_digest_settings(callback)
     await callback.answer(f"⏸ На паузе: {changed}")
 
 
 @dp.callback_query(F.data == "dresumeall")
 async def resume_all_subscriptions(callback: CallbackQuery):
-    user_id = callback.from_user.id
+    user_id = user_id_from_callback(callback)
     changed = set_all_subscriptions_paused(user_id, False)
     # Пересчитываем расписание для всех периодов после возобновления.
     for period in ("daily", "weekly", "monthly"):
@@ -2747,7 +2828,7 @@ async def resume_all_subscriptions(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "dunsuball")
 async def confirm_unsubscribe_all(callback: CallbackQuery):
-    count = count_user_subscriptions(callback.from_user.id)
+    count = count_user_subscriptions(user_id_from_callback(callback))
     if not count:
         await callback.answer("У тебя нет подписок.", show_alert=True)
         return
@@ -2767,7 +2848,7 @@ async def confirm_unsubscribe_all(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "dunsuball_yes")
 async def unsubscribe_all_confirmed(callback: CallbackQuery):
-    removed = unsubscribe_all(callback.from_user.id)
+    removed = unsubscribe_all(user_id_from_callback(callback))
     await _refresh_digest_settings(callback)
     await callback.answer(f"🗑 Удалено подписок: {removed}")
 
@@ -2791,7 +2872,7 @@ def build_subscription_folder_keyboard(sub_id: int, folders: list[str]) -> Inlin
 
 @dp.callback_query(F.data.startswith("dtag_"))
 async def open_subscription_folder_menu(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
+    user_id = user_id_from_callback(callback)
     sub_id = parse_callback_int_suffix(callback.data, "dtag_")
     if sub_id is None:
         await callback.answer("❌ Некорректные данные.", show_alert=True)
@@ -2831,7 +2912,7 @@ async def set_subscription_folder(callback: CallbackQuery, state: FSMContext):
     if idx >= len(folders):
         await callback.answer("❌ Папка не найдена.", show_alert=True)
         return
-    set_subscription_tag(callback.from_user.id, sub_id, folders[idx])
+    set_subscription_tag(user_id_from_callback(callback), sub_id, folders[idx])
     await render_subscription_actions(callback, sub_id)
     await callback.answer(f"📁 Папка: {folders[idx]}")
 
@@ -2842,7 +2923,7 @@ async def clear_subscription_folder(callback: CallbackQuery):
     if sub_id is None:
         await callback.answer("❌ Некорректные данные.", show_alert=True)
         return
-    set_subscription_tag(callback.from_user.id, sub_id, None)
+    set_subscription_tag(user_id_from_callback(callback), sub_id, None)
     await render_subscription_actions(callback, sub_id)
     await callback.answer("📁 Убрано из папки.")
 
@@ -2877,7 +2958,7 @@ async def process_new_subscription_folder(message: types.Message, state: FSMCont
         await message.answer("❌ Не нашёл подписку. Открой /list_digest заново.")
         await state.set_state(None)
         return
-    set_subscription_tag(message.chat.id, sub_id, folder)
+    set_subscription_tag(user_id_from_message(message), sub_id, folder)
     await state.set_state(None)
     confirm = await message.answer(f"📁 Канал перенесён в папку <b>{html.escape(folder)}</b>.", parse_mode="HTML")
     await asyncio.sleep(2)
@@ -2887,9 +2968,9 @@ async def process_new_subscription_folder(message: types.Message, state: FSMCont
     except TelegramAPIError:
         pass
     await message.answer(
-        render_digest_settings_text(message.chat.id),
+        render_digest_settings_text(user_id_from_message(message)),
         parse_mode="HTML",
-        reply_markup=build_digest_settings_keyboard(get_user_subscriptions(message.chat.id)),
+        reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id_from_message(message))),
     )
 
 
@@ -2901,7 +2982,7 @@ async def open_digest_schedule(callback: CallbackQuery):
         return
     await edit_or_answer(
         callback,
-        render_digest_schedule_text(callback.from_user.id, period),
+        render_digest_schedule_text(user_id_from_callback(callback), period),
         reply_markup=build_digest_schedule_keyboard(period),
     )
     await callback.answer()
@@ -2958,11 +3039,11 @@ async def save_digest_time(callback: CallbackQuery):
     except ValueError:
         await callback.answer("❌ Некорректные данные.", show_alert=True)
         return
-    upsert_digest_settings(callback.from_user.id, period, send_hour=hour, send_minute=minute)
-    reschedule_user_period(callback.from_user.id, period)
+    upsert_digest_settings(user_id_from_callback(callback), period, send_hour=hour, send_minute=minute)
+    reschedule_user_period(user_id_from_callback(callback), period)
     await edit_or_answer(
         callback,
-        render_digest_schedule_text(callback.from_user.id, period),
+        render_digest_schedule_text(user_id_from_callback(callback), period),
         reply_markup=build_digest_schedule_keyboard(period),
     )
     await callback.answer(f"Время обновлено: {hour:02d}:{minute:02d}")
@@ -2994,11 +3075,11 @@ async def save_digest_weekday(callback: CallbackQuery):
     except ValueError:
         await callback.answer("❌ Некорректные данные.", show_alert=True)
         return
-    upsert_digest_settings(callback.from_user.id, period, weekday=weekday)
-    reschedule_user_period(callback.from_user.id, period)
+    upsert_digest_settings(user_id_from_callback(callback), period, weekday=weekday)
+    reschedule_user_period(user_id_from_callback(callback), period)
     await edit_or_answer(
         callback,
-        render_digest_schedule_text(callback.from_user.id, period),
+        render_digest_schedule_text(user_id_from_callback(callback), period),
         reply_markup=build_digest_schedule_keyboard(period),
     )
     await callback.answer(f"День обновлён: {_WEEKDAY_ACC_RU[weekday]}.")
@@ -3020,11 +3101,11 @@ async def save_digest_monthday(callback: CallbackQuery):
     if day is None:
         await callback.answer("❌ Некорректные данные.", show_alert=True)
         return
-    upsert_digest_settings(callback.from_user.id, "monthly", month_day=day)
-    reschedule_user_period(callback.from_user.id, "monthly")
+    upsert_digest_settings(user_id_from_callback(callback), "monthly", month_day=day)
+    reschedule_user_period(user_id_from_callback(callback), "monthly")
     await edit_or_answer(
         callback,
-        render_digest_schedule_text(callback.from_user.id, "monthly"),
+        render_digest_schedule_text(user_id_from_callback(callback), "monthly"),
         reply_markup=build_digest_schedule_keyboard("monthly"),
     )
     await callback.answer(f"Дата обновлена: {day}.")
@@ -3032,7 +3113,7 @@ async def save_digest_monthday(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "dmode_monthly")
 async def open_digest_monthly_mode_picker(callback: CallbackQuery):
-    settings = resolve_digest_settings(callback.from_user.id, "monthly")
+    settings = resolve_digest_settings(user_id_from_callback(callback), "monthly")
     await edit_or_answer(
         callback,
         "🔀 <b>Ежемесячный дайджест</b>\n\nВыбери режим отправки:",
@@ -3047,11 +3128,11 @@ async def save_digest_monthly_mode(callback: CallbackQuery):
     if mode not in {"date", "weekday"}:
         await callback.answer("❌ Некорректные данные.", show_alert=True)
         return
-    upsert_digest_settings(callback.from_user.id, "monthly", monthly_mode=mode)
-    reschedule_user_period(callback.from_user.id, "monthly")
+    upsert_digest_settings(user_id_from_callback(callback), "monthly", monthly_mode=mode)
+    reschedule_user_period(user_id_from_callback(callback), "monthly")
     await edit_or_answer(
         callback,
-        render_digest_schedule_text(callback.from_user.id, "monthly"),
+        render_digest_schedule_text(user_id_from_callback(callback), "monthly"),
         reply_markup=build_digest_schedule_keyboard("monthly"),
     )
     await callback.answer("Режим обновлён.")
@@ -3065,7 +3146,12 @@ async def save_digest_monthly_mode(callback: CallbackQuery):
 @dp.message(Command("check"))
 async def cmd_check(message: types.Message, state: FSMContext):
     await state.clear()
-    user_id = message.chat.id
+    user_id = user_id_from_message(message)
+    # SEC1 (п.3): /check обходит все подписки и ходит в сеть — общий кулдаун.
+    wait_seconds = check_expensive_command_cooldown(user_id)
+    if wait_seconds:
+        await message.answer(f"⏳ Подожди {wait_seconds} с.")
+        return
     subs = get_user_subscriptions(user_id)
     if not subs:
         await message.answer("📭 У тебя нет подписок для проверки.")
@@ -3202,7 +3288,7 @@ async def _resolve_ai_channel(callback: CallbackQuery, state: FSMContext, prefix
 
 @dp.callback_query(F.data == "digest_ai")
 async def open_ai_menu(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
+    user_id = user_id_from_callback(callback)
     subs = get_user_subscriptions(user_id)
     if not subs:
         await callback.answer("Сначала подпишись хотя бы на один канал.", show_alert=True)
@@ -3221,12 +3307,17 @@ async def open_ai_menu(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("aich_"))
 async def open_ai_channel(callback: CallbackQuery, state: FSMContext):
+    # SEC1 (п.3): ИИ-меню и анализ — дорогие операции, общий per-user кулдаун.
+    wait_seconds = check_expensive_command_cooldown(user_id_from_callback(callback))
+    if wait_seconds:
+        await callback.answer(f"⏳ Подожди {wait_seconds} с.", show_alert=True)
+        return
     idx, username, title = await _resolve_ai_channel(callback, state, "aich_")
     if username is None:
         return
     limit_note = ""
     if ai_assistant.is_enabled() and AI_DAILY_LIMIT > 0:
-        used = get_ai_usage_today(callback.from_user.id, _ai_today_key())
+        used = get_ai_usage_today(user_id_from_callback(callback), _ai_today_key())
         limit_note = f"\n\n🤖 ИИ-запросов сегодня: {used}/{AI_DAILY_LIMIT}"
     text = f"📊 <b>{html.escape(title or username)}</b>\n\nЧто сделать с этим каналом?{limit_note}"
     await edit_or_answer(callback, text, reply_markup=build_ai_channel_menu(idx))
@@ -3235,10 +3326,14 @@ async def open_ai_channel(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("aiadj_"))
 async def ai_adjust_digest(callback: CallbackQuery, state: FSMContext):
+    wait_seconds = check_expensive_command_cooldown(user_id_from_callback(callback))
+    if wait_seconds:
+        await callback.answer(f"⏳ Подожди {wait_seconds} с.", show_alert=True)
+        return
     idx, username, title = await _resolve_ai_channel(callback, state, "aiadj_")
     if username is None:
         return
-    user_id = callback.from_user.id
+    user_id = user_id_from_callback(callback)
     await callback.answer("⏳ Анализирую канал...")
 
     old_marker = serialize_datetime(utc_now() - timedelta(days=3650))
@@ -3302,10 +3397,14 @@ async def ai_adjust_digest(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("aisum_"))
 async def ai_summary(callback: CallbackQuery, state: FSMContext):
+    wait_seconds = check_expensive_command_cooldown(user_id_from_callback(callback))
+    if wait_seconds:
+        await callback.answer(f"⏳ Подожди {wait_seconds} с.", show_alert=True)
+        return
     idx, username, title = await _resolve_ai_channel(callback, state, "aisum_")
     if username is None:
         return
-    user_id = callback.from_user.id
+    user_id = user_id_from_callback(callback)
 
     if not ai_assistant.is_enabled():
         await callback.answer("🤖 ИИ не настроен (нет DEEPSEEK_API_KEY).", show_alert=True)
@@ -3393,13 +3492,13 @@ async def _send_export(user_id: int):
 @dp.message(Command("export"))
 async def cmd_export(message: types.Message, state: FSMContext):
     await state.clear()
-    await _send_export(message.chat.id)
+    await _send_export(user_id_from_message(message))
 
 
 @dp.callback_query(F.data == "data_export")
 async def cb_export(callback: CallbackQuery):
     await callback.answer("📤 Готовлю файл...")
-    await _send_export(callback.from_user.id)
+    await _send_export(user_id_from_callback(callback))
 
 
 async def _prompt_import(user_id: int, state: FSMContext):
@@ -3418,12 +3517,12 @@ async def _prompt_import(user_id: int, state: FSMContext):
 @dp.message(Command("import"))
 async def cmd_import(message: types.Message, state: FSMContext):
     await state.clear()
-    await _prompt_import(message.chat.id, state)
+    await _prompt_import(user_id_from_message(message), state)
 
 
 @dp.callback_query(F.data == "data_import")
 async def cb_import(callback: CallbackQuery, state: FSMContext):
-    await _prompt_import(callback.from_user.id, state)
+    await _prompt_import(user_id_from_callback(callback), state)
     await callback.answer()
 
 
@@ -3466,7 +3565,8 @@ def _import_user_payload(user_id: int, payload) -> str:
 
     for sub in subscriptions[:MAX_IMPORT_SUBSCRIPTIONS]:
         username = normalize_channel_username(sub.get("channel_username") or "")
-        if not username:
+        if not username or not is_valid_channel_username(username):
+            # SEC1 (п.10): имя канала должно быть безопасным для href.
             continue
         period = sub.get("period") if sub.get("period") in ("daily", "weekly", "monthly") else "daily"
         settings = resolve_digest_settings(user_id, period, now)
@@ -3489,7 +3589,7 @@ def _import_user_payload(user_id: int, payload) -> str:
 
     for item in feed[:MAX_IMPORT_FEED]:
         username = normalize_channel_username(item.get("channel_username") or "")
-        if not username:
+        if not username or not is_valid_channel_username(username):
             continue
         try:
             if get_feed_subscription_by_username(user_id, username):
@@ -3511,13 +3611,19 @@ def _import_user_payload(user_id: int, payload) -> str:
         text = bookmark.get("full_text")
         if not text:
             continue
+        # SEC1 (п.11): произвольный saved_at ломал карточку закладки при открытии.
+        saved_at_raw = bookmark.get("saved_at")
+        try:
+            saved_at = parse_db_datetime(saved_at_raw) if saved_at_raw else utc_now()
+        except (ValueError, TypeError):
+            saved_at = utc_now()
         try:
             add_saved_message(
                 user_id,
                 text,
                 bookmark.get("source_name") or "Импорт",
                 bookmark.get("tag") or "Импорт",
-                bookmark.get("saved_at") or serialize_datetime(utc_now()),
+                serialize_datetime(saved_at),
             )
             added_bms += 1
         except Exception:
@@ -3588,7 +3694,7 @@ async def process_import_file(message: types.Message, state: FSMContext):
         await message.answer("❌ Не удалось прочитать файл как JSON. Проверь, что это экспорт из /export.")
         return
 
-    report = _import_user_payload(message.chat.id, payload)
+    report = _import_user_payload(user_id_from_message(message), payload)
     await message.answer(report, parse_mode="HTML")
 
 
@@ -3842,7 +3948,7 @@ async def render_kb_move_screen(chat_id: int, msg_id: int, target: types.Message
 async def cmd_saved(message: types.Message, state: FSMContext):
     await state.clear()
     await push_screen(state, "kb_tags")
-    await render_kb_tags_screen(message.chat.id, message, state)
+    await render_kb_tags_screen(user_id_from_message(message), message, state)
 
 
 @dp.callback_query(F.data.startswith("kb_tag_idx_"))
@@ -3853,7 +3959,7 @@ async def handle_kb_tag_selection(callback: CallbackQuery, state: FSMContext):
     if idx < len(tags_list):
         tag = tags_list[idx]
         await push_screen(state, "kb_list", tag=tag, page=1)
-        await render_kb_list_screen(callback.message.chat.id, tag, 1, callback, state)
+        await render_kb_list_screen(user_id_from_callback(callback), tag, 1, callback, state)
     else:
         await callback.answer("❌ Ошибка выбора категории.")
 
@@ -3861,13 +3967,13 @@ async def handle_kb_tag_selection(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "kb_tag_all")
 async def handle_kb_tag_all(callback: CallbackQuery, state: FSMContext):
     await push_screen(state, "kb_list", tag=None, page=1)
-    await render_kb_list_screen(callback.message.chat.id, None, 1, callback, state)
+    await render_kb_list_screen(user_id_from_callback(callback), None, 1, callback, state)
 
 
 @dp.callback_query(F.data == "kb_view_tags")
 async def handle_kb_view_tags(callback: CallbackQuery, state: FSMContext):
     await push_screen(state, "kb_tags")
-    await render_kb_tags_screen(callback.message.chat.id, callback, state)
+    await render_kb_tags_screen(user_id_from_callback(callback), callback, state)
 
 
 @dp.callback_query(F.data == "kb_page_prev")
@@ -3880,7 +3986,7 @@ async def handle_kb_page_prev(callback: CallbackQuery, state: FSMContext):
     if history and history[-1].get("screen") == "kb_list":
         history[-1]["args"]["page"] = prev_page
         await state.update_data(screen_history=history)
-    await render_kb_list_screen(callback.message.chat.id, tag, prev_page, callback, state)
+    await render_kb_list_screen(user_id_from_callback(callback), tag, prev_page, callback, state)
 
 
 @dp.callback_query(F.data == "kb_page_next")
@@ -3893,7 +3999,7 @@ async def handle_kb_page_next(callback: CallbackQuery, state: FSMContext):
     if history and history[-1].get("screen") == "kb_list":
         history[-1]["args"]["page"] = next_page
         await state.update_data(screen_history=history)
-    await render_kb_list_screen(callback.message.chat.id, tag, next_page, callback, state)
+    await render_kb_list_screen(user_id_from_callback(callback), tag, next_page, callback, state)
 
 
 @dp.callback_query(F.data.startswith("kb_sel_idx_"))
@@ -3904,7 +4010,7 @@ async def handle_kb_sel_idx(callback: CallbackQuery, state: FSMContext):
     if idx < len(page_msg_ids):
         msg_id = page_msg_ids[idx]
         await push_screen(state, "kb_detail", msg_id=msg_id)
-        await render_kb_detail_screen(callback.message.chat.id, msg_id, callback, state)
+        await render_kb_detail_screen(user_id_from_callback(callback), msg_id, callback, state)
     else:
         await callback.answer("❌ Ошибка выбора закладки.")
 
@@ -3918,7 +4024,7 @@ async def handle_kb_ignore(callback: CallbackQuery):
 async def handle_bkmv_init(callback: CallbackQuery, state: FSMContext):
     msg_id = int(callback.data.split("_")[-1])
     await push_screen(state, "kb_move", msg_id=msg_id)
-    await render_kb_move_screen(callback.message.chat.id, msg_id, callback, state)
+    await render_kb_move_screen(user_id_from_callback(callback), msg_id, callback, state)
 
 
 @dp.callback_query(F.data.startswith("kb_mv_idx_"))
@@ -3932,10 +4038,10 @@ async def handle_kb_mv_idx(callback: CallbackQuery, state: FSMContext):
         return
     if idx < len(tags):
         new_tag = tags[idx]
-        update_saved_message_tag(callback.message.chat.id, msg_id, new_tag)
+        update_saved_message_tag(user_id_from_callback(callback), msg_id, new_tag)
         await callback.answer(f"✅ Перенесено в #{new_tag}")
         await pop_screen(state)
-        await render_kb_detail_screen(callback.message.chat.id, msg_id, callback, state)
+        await render_kb_detail_screen(user_id_from_callback(callback), msg_id, callback, state)
     else:
         await callback.answer("❌ Ошибка переноса.")
 
@@ -3960,7 +4066,7 @@ async def process_new_tag(message: types.Message, state: FSMContext):
         await message.answer("❌ Ошибка: не найден ID закладки. Попробуй сначала.", reply_markup=build_back_home_keyboard())
         return
         
-    update_saved_message_tag(message.chat.id, msg_id, new_tag)
+    update_saved_message_tag(user_id_from_message(message), msg_id, new_tag)
     await pop_screen(state)
     confirm = await message.answer(f"✅ Перенесено в #{new_tag}!")
     await state.set_state(None)
@@ -3972,13 +4078,13 @@ async def process_new_tag(message: types.Message, state: FSMContext):
     except TelegramAPIError:
         pass
         
-    await render_kb_detail_screen(message.chat.id, msg_id, message, state)
+    await render_kb_detail_screen(user_id_from_message(message), msg_id, message, state)
 
 
 @dp.callback_query(F.data.startswith("bkdel_"))
 async def handle_bkdel(callback: CallbackQuery, state: FSMContext):
     msg_id = int(callback.data.split("_")[-1])
-    delete_saved_message(callback.message.chat.id, msg_id)
+    delete_saved_message(user_id_from_callback(callback), msg_id)
     await callback.answer("✅ Закладка удалена!")
     await pop_screen(state)
     
@@ -3986,15 +4092,15 @@ async def handle_bkdel(callback: CallbackQuery, state: FSMContext):
     history = data.get("screen_history", [])
     if history:
         prev = history[-1]
-        await render_screen(callback.message.chat.id, prev, callback, state)
+        await render_screen(user_id_from_callback(callback), prev, callback, state)
     else:
-        await render_kb_tags_screen(callback.message.chat.id, callback, state)
+        await render_kb_tags_screen(user_id_from_callback(callback), callback, state)
 
 
 @dp.callback_query(F.data.startswith("bksched_init_"))
 async def handle_bksched_init(callback: CallbackQuery, state: FSMContext):
     msg_id = int(callback.data.split("_")[-1])
-    msg_data = get_saved_message_by_id(callback.message.chat.id, msg_id)
+    msg_data = get_saved_message_by_id(user_id_from_callback(callback), msg_id)
     if not msg_data:
         await callback.answer("❌ Закладка не найдена.")
         return
@@ -4012,7 +4118,7 @@ async def handle_bksched_init(callback: CallbackQuery, state: FSMContext):
     )
 
     markup = build_time_selection_keyboard(f"bksched_choice_{msg_id}")
-    u_id = callback.message.chat.id
+    u_id = user_id_from_callback(callback)
     now = user_now(u_id)
     hours = day_part_hours(u_id)
     await callback.message.edit_text(
@@ -4034,7 +4140,7 @@ async def handle_bksched_choice(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Сообщение недоступно.")
         return
 
-    msg_data = get_saved_message_by_id(callback_message.chat.id, msg_id)
+    msg_data = get_saved_message_by_id(user_id_from_callback(callback), msg_id)
     if not msg_data:
         await callback.answer("❌ Закладка не найдена.")
         return
@@ -4059,25 +4165,29 @@ async def handle_bksched_choice(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    u_id = callback_message.chat.id
+    u_id = user_id_from_callback(callback)
     now = user_now(u_id)
     hours = day_part_hours(u_id)
     scheduled_time, label = get_quick_scheduled_time(action, now, hours=hours)
     if scheduled_time:
         # Move: create the reminder (keeping the tag) and drop the bookmark.
-        new_id = add_message(
-            callback_message.chat.id,
-            None,
-            serialize_datetime(scheduled_time),
-            preview,
-            source,
-            tag,
-            full_text=full_text,
-        )
-        delete_saved_message(callback_message.chat.id, msg_id)
+        try:
+            new_id = add_message(
+                user_id_from_callback(callback),
+                None,
+                serialize_datetime(scheduled_time),
+                preview,
+                source,
+                tag,
+                full_text=full_text,
+            )
+        except ValueError as exc:
+            await callback.answer(f"🚫 {exc}", show_alert=True)
+            return
+        delete_saved_message(user_id_from_callback(callback), msg_id)
         reply_markup = reminders_ux.build_reschedule_note_keyboard(new_id) if new_id else None
         confirm_msg = await bot.send_message(
-            callback_message.chat.id,
+            user_id_from_callback(callback),
             f"✅ Перенесено в напоминания на {scheduled_time.strftime('%d.%m.%Y %H:%M')}!",
             reply_markup=reply_markup,
         )
@@ -4091,7 +4201,7 @@ async def handle_bksched_choice(callback: CallbackQuery, state: FSMContext):
             except TelegramAPIError:
                 pass
 
-        await render_screen(callback_message.chat.id, {"screen": "rem_list", "args": {"tag": None, "page": 1}}, callback_message, state)
+        await render_screen(user_id_from_callback(callback), {"screen": "rem_list", "args": {"tag": None, "page": 1}}, callback_message, state)
     await callback.answer()
 
 
@@ -4157,27 +4267,37 @@ async def complete_manual_schedule(
     source_url = data.get("source_url")
     new_db_id = None
     if msg_id:
-        new_db_id = add_message(
-            chat_id,
-            msg_id,
-            serialize_datetime(scheduled_time),
-            preview,
-            source,
-            full_text=full_text,
-            source_url=source_url,
-        )
+        try:
+            new_db_id = add_message(
+                chat_id,
+                msg_id,
+                serialize_datetime(scheduled_time),
+                preview,
+                source,
+                full_text=full_text,
+                source_url=source_url,
+            )
+        except ValueError as exc:
+            await reply_target.answer(f"🚫 {exc}")
+            await state.clear()
+            return
         confirmation_text = f"✅ Принято! Запланировано на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}."
     elif is_bksched:
-        new_db_id = add_message(
-            chat_id,
-            None,
-            serialize_datetime(scheduled_time),
-            preview,
-            source,
-            bookmark_tag,
-            full_text=full_text,
-            source_url=source_url,
-        )
+        try:
+            new_db_id = add_message(
+                chat_id,
+                None,
+                serialize_datetime(scheduled_time),
+                preview,
+                source,
+                bookmark_tag,
+                full_text=full_text,
+                source_url=source_url,
+            )
+        except ValueError as exc:
+            await reply_target.answer(f"🚫 {exc}")
+            await state.clear()
+            return
         if bookmark_msg_id:
             delete_saved_message(chat_id, bookmark_msg_id)
         confirmation_text = f"✅ Перенесено в напоминания на {scheduled_time.strftime('%d.%m.%Y в %H:%M')}!"
@@ -4240,14 +4360,14 @@ async def complete_manual_schedule(
 
 @dp.message(ScheduleState.waiting_for_datetime)
 async def process_custom_datetime(message: types.Message, state: FSMContext):
-    user_id = message.chat.id
+    user_id = user_id_from_message(message)
     scheduled_time = parse_reminder_time(message.text or "", user_now(user_id), hours=day_part_hours(user_id))
     if scheduled_time is None:
         await message.answer(f"🤔 Не понял время. Примеры: {TIME_TEXT_EXAMPLES}, «15.03.2026 14:30».")
         return
 
     await complete_manual_schedule(
-        message.chat.id,
+        user_id_from_message(message),
         state,
         scheduled_time,
         reply_target=message,
@@ -4271,14 +4391,14 @@ async def process_custom_time(message: types.Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    scheduled_time = build_scheduled_time_from_state(data, hour=hour, minute=minute, tz=user_tz(message.chat.id))
+    scheduled_time = build_scheduled_time_from_state(data, hour=hour, minute=minute, tz=user_tz(user_id_from_message(message)))
     if scheduled_time is None:
         await message.answer("Ошибка: дата выбора утеряна. Попробуй выбрать время заново.")
         await state.clear()
         return
 
     await complete_manual_schedule(
-        message.chat.id,
+        user_id_from_message(message),
         state,
         scheduled_time,
         reply_target=message,
@@ -4306,14 +4426,14 @@ async def process_custom_minutes(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    scheduled_time = build_scheduled_time_from_state(data, hour=int(hour), minute=minute, tz=user_tz(message.chat.id))
+    scheduled_time = build_scheduled_time_from_state(data, hour=int(hour), minute=minute, tz=user_tz(user_id_from_message(message)))
     if scheduled_time is None:
         await message.answer("Ошибка: дата выбора утеряна. Попробуй выбрать время заново.")
         await state.clear()
         return
 
     await complete_manual_schedule(
-        message.chat.id,
+        user_id_from_message(message),
         state,
         scheduled_time,
         reply_target=message,
@@ -4338,23 +4458,27 @@ async def process_tag(message: types.Message, state: FSMContext):
     command_message_id = data.get("command_message_id")
 
     saved_at = serialize_datetime(utc_now())
-    add_saved_message(message.chat.id, full_text, source, tag, saved_at)
+    try:
+        add_saved_message(user_id_from_message(message), full_text, source, tag, saved_at)
+    except ValueError as exc:
+        await message.answer(f"🚫 {exc}")
+        return
 
     try:
         await message.delete()
         if prompt_msg_id:
-            await bot.delete_message(message.chat.id, prompt_msg_id)
+            await bot.delete_message(user_id_from_message(message), prompt_msg_id)
         if orig_msg_id:
-            await bot.delete_message(message.chat.id, orig_msg_id)
+            await bot.delete_message(user_id_from_message(message), orig_msg_id)
         if target_message_id:
-            await bot.delete_message(message.chat.id, target_message_id)
+            await bot.delete_message(user_id_from_message(message), target_message_id)
         if command_message_id:
-            await bot.delete_message(message.chat.id, command_message_id)
+            await bot.delete_message(user_id_from_message(message), command_message_id)
     except TelegramAPIError:
         pass
 
     if scheduled_db_id:
-        delete_message(message.chat.id, scheduled_db_id)
+        delete_message(user_id_from_message(message), scheduled_db_id)
 
     confirm_msg = await message.answer(
         f"✅ Сохранено в базу знаний под тегом <b>{html.escape(tag)}</b>",
@@ -4372,7 +4496,12 @@ async def process_tag(message: types.Message, state: FSMContext):
 @dp.message(Command("test_digest"))
 async def cmd_test_digest(message: types.Message, state: FSMContext):
     await state.clear()
-    user_id = message.chat.id
+    user_id = user_id_from_message(message)
+    # SEC1 (п.3): тестовая сборка обходит все подписки — общий кулдаун.
+    wait_seconds = check_expensive_command_cooldown(user_id)
+    if wait_seconds:
+        await message.answer(f"⏳ Подожди {wait_seconds} с.")
+        return
     user_subs = [sub for sub in get_user_subscriptions(user_id) if not sub[5]]
 
     if not user_subs:
@@ -4481,14 +4610,14 @@ def build_email_cancel_keyboard() -> InlineKeyboardMarkup:
 @dp.message(Command("email"))
 async def cmd_email(message: types.Message, state: FSMContext):
     await state.clear()
-    text, markup = build_email_menu(message.chat.id)
+    text, markup = build_email_menu(user_id_from_message(message))
     await message.answer(text, parse_mode="HTML", reply_markup=markup)
 
 
 @dp.callback_query(F.data == "email_menu")
 async def open_email_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    text, markup = build_email_menu(callback.from_user.id)
+    text, markup = build_email_menu(user_id_from_callback(callback))
     await edit_or_answer(callback, text, reply_markup=markup)
     await callback.answer()
 
@@ -4499,7 +4628,7 @@ async def toggle_email_period(callback: CallbackQuery):
     if period not in _PERIOD_TITLES:
         await callback.answer("❌ Некорректные данные.")
         return
-    user_id = callback.from_user.id
+    user_id = user_id_from_callback(callback)
     address, email_periods = get_email_delivery(user_id)
     if not address:
         await callback.answer("Сначала подтверди адрес почты.", show_alert=True)
@@ -4520,9 +4649,9 @@ async def toggle_email_period(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "email_delete")
 async def remove_email(callback: CallbackQuery):
-    _, email_periods = get_email_delivery(callback.from_user.id)
-    delete_user_email(callback.from_user.id)
-    text, markup = build_email_menu(callback.from_user.id)
+    _, email_periods = get_email_delivery(user_id_from_callback(callback))
+    delete_user_email(user_id_from_callback(callback))
+    text, markup = build_email_menu(user_id_from_callback(callback))
     await edit_or_answer(callback, text, reply_markup=markup)
     if email_periods:
         await callback.answer("Адрес удалён. ⚠️ Все дайджесты снова приходят в Telegram.", show_alert=True)
@@ -4551,13 +4680,22 @@ async def process_email_address(message: types.Message, state: FSMContext):
         await message.answer("❌ Не похоже на адрес почты. Пример: name@example.com", reply_markup=build_email_cancel_keyboard())
         return
 
-    user_id = message.chat.id
+    user_id = user_id_from_message(message)
     now = utc_now()
     record = get_user_email(user_id)
     if record and record.get("code_sent_at"):
         if parse_db_datetime(record["code_sent_at"]) > now - timedelta(seconds=EMAIL_CODE_RESEND_SECONDS):
             await message.answer("⏳ Код только что отправлялся — подожди минуту и пришли адрес снова.")
             return
+
+    # SEC1 (п.4): не даём рассылать письма с SMTP бота на произвольные адреса.
+    since = serialize_datetime(now - timedelta(days=1))
+    if count_email_sends_for_user(user_id, since) >= EMAIL_DAILY_LIMIT_PER_USER:
+        await message.answer("🚫 Суточный лимит писем исчерпан. Попробуй позже.")
+        return
+    if count_email_sends_for_address(address, since) >= EMAIL_DAILY_LIMIT_PER_ADDRESS:
+        await message.answer("🚫 На этот адрес сегодня уже отправлялось слишком много писем.")
+        return
 
     code = f"{secrets.randbelow(10**6):06d}"
     sent = await email_digest.send_email(
@@ -4580,6 +4718,7 @@ async def process_email_address(message: types.Message, state: FSMContext):
         serialize_datetime(now),
         serialize_datetime(now + timedelta(minutes=EMAIL_CODE_TTL_MINUTES)),
     )
+    record_email_send(user_id, address, serialize_datetime(now))
     await state.set_state(EmailState.waiting_for_code)
     await message.answer(
         f"✉️ Отправил код на <b>{html.escape(address)}</b>. Пришли его сюда — он действует "
@@ -4592,7 +4731,7 @@ async def process_email_address(message: types.Message, state: FSMContext):
 @dp.message(EmailState.waiting_for_code)
 async def process_email_code(message: types.Message, state: FSMContext):
     code = re.sub(r"\D", "", message.text or "")
-    result = confirm_email_code(message.chat.id, code, serialize_datetime(utc_now()))
+    result = confirm_email_code(user_id_from_message(message), code, serialize_datetime(utc_now()))
     if result == "invalid":
         await message.answer("❌ Неверный код. Попробуй ещё раз.", reply_markup=build_email_cancel_keyboard())
         return
@@ -4602,7 +4741,7 @@ async def process_email_code(message: types.Message, state: FSMContext):
         "expired": "⌛ Код устарел — запроси новый.",
         "too_many": "🚫 Слишком много попыток — запроси новый код.",
     }
-    text, markup = build_email_menu(message.chat.id)
+    text, markup = build_email_menu(user_id_from_message(message))
     await message.answer(
         f"{notices.get(result, 'Запроси код заново.')}\n\n{text}", parse_mode="HTML", reply_markup=markup
     )
@@ -4687,7 +4826,7 @@ async def catch_message(message: types.Message, state: FSMContext):
         await state.update_data(channel_username=channel_username, channel_title=channel_title)
         prompt = f"📡 Канал <b>{html.escape(channel_title or channel_username)}</b> (@{html.escape(channel_username)})\nЧто сделать?"
 
-    user_id = message.chat.id
+    user_id = user_id_from_message(message)
     now = user_now(user_id)
     hours = day_part_hours(user_id)
     await message.reply(
@@ -4736,25 +4875,33 @@ async def save_subscription(callback: CallbackQuery, state: FSMContext):
         return
 
     username = normalize_channel_username(username)
+    # SEC1 (п.10): имя канала идёт в href дайджеста — валидируем при сохранении.
+    if not is_valid_channel_username(username):
+        await callback.answer("❌ Некорректное имя канала.", show_alert=True)
+        return
 
     now = local_now()
-    settings = resolve_digest_settings(callback_message.chat.id, period, now)
+    settings = resolve_digest_settings(user_id_from_callback(callback), period, now)
     next_send = get_next_digest_time(period, now, settings)
     last_scraped = serialize_datetime(utc_now())
-    sub_id = add_subscription(
-        callback_message.chat.id,
-        username,
-        title,
-        period,
-        last_scraped,
-        serialize_datetime(next_send),
-    )
+    try:
+        sub_id = add_subscription(
+            user_id_from_callback(callback),
+            username,
+            title,
+            period,
+            last_scraped,
+            serialize_datetime(next_send),
+        )
+    except ValueError as exc:
+        await callback.answer(f"🚫 {exc}", show_alert=True)
+        return
 
     await callback.answer("✅ Подписка оформлена!")
 
     try:
         if callback_message.reply_to_message:
-            await bot.delete_message(callback_message.chat.id, callback_message.reply_to_message.message_id)
+            await bot.delete_message(user_id_from_callback(callback), callback_message.reply_to_message.message_id)
     except TelegramAPIError:
         pass
 
@@ -4808,7 +4955,7 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Сообщение недоступно.")
         return
 
-    user_id = callback_message.chat.id
+    user_id = user_id_from_callback(callback)
     now = user_now(user_id)
     hours = day_part_hours(user_id)
     if callback_message.reply_to_message is None:
@@ -4851,15 +4998,19 @@ async def handle_time_selection(callback: CallbackQuery, state: FSMContext):
     scheduled_time, label = get_quick_scheduled_time(action, now, hours=hours)
 
     if scheduled_time:
-        new_id = add_message(
-            callback_message.chat.id,
-            orig_msg.message_id,
-            serialize_datetime(scheduled_time),
-            preview,
-            source,
-            full_text=full_text,
-            source_url=source_url,
-        )
+        try:
+            new_id = add_message(
+                user_id_from_callback(callback),
+                orig_msg.message_id,
+                serialize_datetime(scheduled_time),
+                preview,
+                source,
+                full_text=full_text,
+                source_url=source_url,
+            )
+        except ValueError as exc:
+            await callback.answer(f"🚫 {exc}", show_alert=True)
+            return
         reply_markup = reminders_ux.build_reschedule_note_keyboard(new_id) if new_id else None
         try:
             await callback_message.edit_text(
@@ -4888,7 +5039,7 @@ async def handle_manual_date_selection(callback: CallbackQuery, state: FSMContex
         await state.clear()
         return
 
-    user_id = callback_message.chat.id
+    user_id = user_id_from_callback(callback)
     user_time = user_now(user_id)
     hours = day_part_hours(user_id)
 
@@ -5007,7 +5158,7 @@ async def handle_manual_minute_selection(callback: CallbackQuery, state: FSMCont
         return
 
     scheduled_time = build_scheduled_time_from_state(
-        data, hour=int(hour), minute=minute, tz=user_tz(callback_message.chat.id)
+        data, hour=int(hour), minute=minute, tz=user_tz(user_id_from_callback(callback))
     )
     if scheduled_time is None:
         await callback.answer("❌ Дата выбора утеряна.", show_alert=True)
@@ -5016,7 +5167,7 @@ async def handle_manual_minute_selection(callback: CallbackQuery, state: FSMCont
 
     try:
         await complete_manual_schedule(
-            callback_message.chat.id,
+            user_id_from_callback(callback),
             state,
             scheduled_time,
             reply_target=callback_message,

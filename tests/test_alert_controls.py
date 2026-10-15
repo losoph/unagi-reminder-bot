@@ -73,7 +73,7 @@ class TestAlertControls(unittest.TestCase):
         db.mark_subscription_delivery_error(sub_id, "Fail", sched_str, failure_count=5, is_permanent=True)
 
         # 2. Trigger retry
-        success = db.retry_digest_execution(exec_id)
+        success = db.retry_digest_execution(exec_id, user_id)
         self.assertTrue(success)
 
         # 3. Check execution updated to retrying with retry_count=0
@@ -154,7 +154,7 @@ class TestAlertControls(unittest.TestCase):
         now = datetime(2026, 9, 29, 9, 0, 0, tzinfo=timezone.utc)
         sched_str = db.serialize_datetime(now)
 
-        db.add_subscription(user_id, "c80", "C80", period, sched_str, sched_str)
+        db.add_subscription(user_id, "chan80", "C80", period, sched_str, sched_str)
         exec_id = db.record_digest_execution_start(user_id, period, sched_str)
 
         # Setup mock CallbackQuery
