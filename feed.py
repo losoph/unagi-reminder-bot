@@ -64,6 +64,7 @@ router = Router(name="feed")
 FEED_CACHE_MINUTES = int(os.getenv("FEED_CACHE_MINUTES", "15"))
 FEED_MIN_INTERVAL_SECONDS = int(os.getenv("FEED_MIN_INTERVAL_SECONDS", "60"))
 FEED_BUILD_TIMEOUT_SECONDS = int(os.getenv("FEED_BUILD_TIMEOUT_SECONDS", "120"))
+FEED_PUBLISH_TIMEOUT_SECONDS = int(os.getenv("FEED_PUBLISH_TIMEOUT_SECONDS", "30"))
 
 _bot: Any = None
 _channel_source: Any = None
@@ -83,6 +84,7 @@ class FeedBuildResult:
     channel_count: int = 0
     cached: bool = False
     error_message: str | None = None
+    error_channels: list[str] | None = None
 
 
 def compute_subs_hash(subs: list[Any]) -> str:
@@ -204,7 +206,7 @@ async def ingest_window(
     is_backfill: bool = False,
     channel_source: Any = None,
     web_session: Any = None,
-) -> dict[str, list[dict]]:
+) -> dict[str, Any]:
     """Load posts for channels within the given window.
 
     marker = max(window_start, cursor) if cursor exists and history is backfilled,
@@ -214,7 +216,13 @@ async def ingest_window(
     cs = channel_source if channel_source is not None else _channel_source
     if cs is None:
         logger.warning("ingest_window called without channel_source")
-        return {}
+        return {
+            "posts_by_channel": {},
+            "failed_channels": sorted(
+                clean for channel in channels
+                if (clean := normalize_channel_username(channel))
+            ),
+        }
 
     now_dt = now or utc_now()
     if isinstance(window_start, str):
@@ -225,10 +233,10 @@ async def ingest_window(
     sem = get_fetch_semaphore()
     thirty_days_ago = now_dt - timedelta(days=30)
 
-    async def _ingest_one(raw_channel: str) -> tuple[str, list[dict]]:
+    async def _ingest_one(raw_channel: str) -> tuple[str, list[dict], bool]:
         clean_username = normalize_channel_username(raw_channel)
         if not clean_username:
-            return raw_channel, []
+            return raw_channel, [], True
 
         backfilled_at = await _run_db_call(get_channel_feed_backfilled_at, clean_username)
         cursor_str, _ = await _run_db_call(get_channel_scan_cursor, clean_username)
@@ -246,13 +254,13 @@ async def ingest_window(
                 posts, source_name = await cs.fetch(clean_username, marker_str, web_session=web_session)
         except Exception as exc:
             logger.warning("Failed to fetch posts for feed channel @%s: %s", clean_username, exc)
-            return clean_username, []
+            return clean_username, [], False
 
         try:
             await _run_db_call(upsert_channel_posts, clean_username, posts, source_name)
         except Exception as exc:
             logger.warning("Failed to upsert channel posts for @%s: %s", clean_username, exc)
-            return clean_username, posts
+            return clean_username, posts, False
 
         # Mark backfilled if full 30-day window was fetched with MTProto
         if (is_backfill or marker_dt <= thirty_days_ago) and source_name == "mtproto":
@@ -278,10 +286,13 @@ async def ingest_window(
                 if is_backfill or marker_dt <= thirty_days_ago:
                     await _run_db_call(update_channel_scan_cursor, clean_username, max_time, max_id)
 
-        return clean_username, posts
+        return clean_username, posts, True
 
     results = await asyncio.gather(*(_ingest_one(ch) for ch in channels))
-    return dict(results)
+    return {
+        "posts_by_channel": {channel: posts for channel, posts, _ in results},
+        "failed_channels": [channel for channel, _, succeeded in results if not succeeded],
+    }
 
 
 def schedule_channel_backfill(channel_username: str) -> asyncio.Task | None:
@@ -694,8 +705,33 @@ async def build_feed_edition(
         active_usernames = [s["channel_username"] for s in active_subs]
 
         async def _run_pipeline():
+            publish_started = asyncio.Event()
             # Ingest window for active channels
-            await ingest_window(active_usernames, window_start, now=now_dt)
+            ingest_result = await ingest_window(active_usernames, window_start, now=now_dt)
+            failed_channels = (
+                ingest_result.get("failed_channels", [])
+                if isinstance(ingest_result, dict) and "failed_channels" in ingest_result
+                else []
+            )
+            if failed_channels and len(failed_channels) == len(active_usernames):
+                return FeedBuildResult(
+                    status="error",
+                    error_message="⚠️ Не удалось загрузить данные ни из одного канала. Попробуй позже.",
+                    error_channels=[
+                        next(
+                            (s.get("channel_title") or s["channel_username"] for s in active_subs
+                             if s["channel_username"] == username),
+                            username,
+                        )
+                        for username in failed_channels
+                    ],
+                )
+            if failed_channels:
+                logger.info(
+                    "feed_build partial_ingest user=%s failed_channels=%d",
+                    user_id,
+                    len(failed_channels),
+                )
 
             # Get candidate posts
             candidates = await asyncio.to_thread(
@@ -778,10 +814,36 @@ async def build_feed_edition(
                 now=now_dt,
                 channel_count=len(unique_channels),
                 has_web_source=has_web,
+                incomplete_channels=[
+                    next(
+                        (s.get("channel_title") or s["channel_username"] for s in active_subs
+                         if s["channel_username"] == username),
+                        username,
+                    )
+                    for username in failed_channels
+                ],
                 tz=tz,
             )
 
-            telegraph_url = await publish_page(title, nodes)
+            # После начала публикации deadline подготовки уже не должен терять URL и кеш.
+            try:
+                publish_started.set()
+                publish_task = asyncio.create_task(publish_page(title, nodes))
+                telegraph_url = await asyncio.wait_for(
+                    asyncio.shield(publish_task), timeout=FEED_PUBLISH_TIMEOUT_SECONDS
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                logger.warning("Telegraph publish timed out for user=%s period=%s", user_id, period)
+                return FeedBuildResult(
+                    status="error",
+                    error_message="❌ Не удалось опубликовать выпуск в Telegraph. Попробуй позже.",
+                )
+            except Exception as exc:
+                logger.warning("Telegraph publish failed for user=%s period=%s: %s", user_id, period, exc)
+                return FeedBuildResult(
+                    status="error",
+                    error_message="❌ Не удалось опубликовать выпуск в Telegraph. Попробуй позже.",
+                )
             if not telegraph_url:
                 logger.error("Telegraph publishing failed for user=%s period=%s", user_id, period)
                 return FeedBuildResult(
@@ -825,11 +887,25 @@ async def build_feed_edition(
             )
 
         try:
-            if hasattr(asyncio, "timeout"):
-                async with asyncio.timeout(FEED_BUILD_TIMEOUT_SECONDS):
-                    return await _run_pipeline()
-            else:
-                return await asyncio.wait_for(_run_pipeline(), timeout=FEED_BUILD_TIMEOUT_SECONDS)
+            pipeline_task = asyncio.create_task(_run_pipeline())
+            deadline = time.monotonic() + FEED_BUILD_TIMEOUT_SECONDS
+            while not pipeline_task.done():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    coro_frame = pipeline_task.get_coro().cr_frame
+                    event = coro_frame.f_locals.get("publish_started") if coro_frame else None
+                    if event and event.is_set():
+                        # Публикация/запись кеша уже началась — дождаться короткой publish-секции.
+                        await asyncio.gather(pipeline_task, return_exceptions=True)
+                        break
+                    pipeline_task.cancel()
+                    await asyncio.gather(pipeline_task, return_exceptions=True)
+                    raise TimeoutError
+                await asyncio.wait({pipeline_task}, timeout=remaining)
+            if pipeline_task.cancelled():
+                raise TimeoutError
+            result = pipeline_task.result()
+            return result
         except (TimeoutError, asyncio.TimeoutError):
             duration_ms = int((time.monotonic() - start_mono) * 1000)
             logger.warning(
@@ -875,7 +951,13 @@ async def cb_feed_period(callback: types.CallbackQuery):
     # 1. Quick concurrency check
     lock = get_user_build_lock(user_id)
     if lock.locked() or user_id in _building_users:
-        await callback.answer("⏳ Сборка уже выполняется, пожалуйста, подожди...", show_alert=True)
+        text = "⏳ Сборка уже выполняется, пожалуйста, подожди..."
+        await callback.answer(text, show_alert=True)
+        if callback.message:
+            try:
+                await callback.message.edit_text(text)
+            except TelegramAPIError:
+                await callback.message.answer(text)
         return
 
     # 2. Check subscriptions
@@ -893,7 +975,7 @@ async def cb_feed_period(callback: types.CallbackQuery):
             try:
                 await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
             except TelegramAPIError:
-                pass
+                await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
         await callback.answer()
         return
 
@@ -913,7 +995,7 @@ async def cb_feed_period(callback: types.CallbackQuery):
             try:
                 await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
             except TelegramAPIError:
-                pass
+                await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
         await callback.answer()
         return
 
@@ -943,7 +1025,12 @@ async def cb_feed_period(callback: types.CallbackQuery):
                     link_preview_options=LinkPreviewOptions(is_disabled=False),
                 )
             except TelegramAPIError:
-                pass
+                await callback.message.answer(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                    link_preview_options=LinkPreviewOptions(is_disabled=False),
+                )
         await callback.answer()
         return
 
@@ -951,7 +1038,13 @@ async def cb_feed_period(callback: types.CallbackQuery):
     now_ts = time.time()
     last_time = _last_build_time.get(user_id, 0.0)
     if now_ts - last_time < FEED_MIN_INTERVAL_SECONDS:
-        await callback.answer("Подожди минуту", show_alert=True)
+        text = "Подожди минуту"
+        await callback.answer(text, show_alert=True)
+        if callback.message:
+            try:
+                await callback.message.edit_text(text)
+            except TelegramAPIError:
+                await callback.message.answer(text)
         return
 
     # 5. Show progress
@@ -987,14 +1080,12 @@ async def cb_feed_period(callback: types.CallbackQuery):
                     link_preview_options=LinkPreviewOptions(is_disabled=False),
                 )
             except TelegramAPIError:
-                if _bot:
-                    await _bot.send_message(
-                        user_id,
-                        text,
-                        parse_mode="HTML",
-                        reply_markup=kb,
-                        link_preview_options=LinkPreviewOptions(is_disabled=False),
-                    )
+                await callback.message.answer(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                    link_preview_options=LinkPreviewOptions(is_disabled=False),
+                )
     elif res.status == "empty_posts":
         empty_text = f"За {p_name} в каналах Ленты постов не было."
         kb = build_feed_period_keyboard()
@@ -1002,7 +1093,7 @@ async def cb_feed_period(callback: types.CallbackQuery):
             try:
                 await callback.message.edit_text(empty_text, reply_markup=kb)
             except TelegramAPIError:
-                pass
+                await callback.message.answer(empty_text, reply_markup=kb)
     elif res.status == "timeout":
         err_text = (
             "⚠️ <b>Не удалось собрать Ленту</b>\n\n"
@@ -1013,15 +1104,17 @@ async def cb_feed_period(callback: types.CallbackQuery):
             try:
                 await callback.message.edit_text(err_text, parse_mode="HTML", reply_markup=kb)
             except TelegramAPIError:
-                pass
+                await callback.message.answer(err_text, parse_mode="HTML", reply_markup=kb)
     else:
         err_text = res.error_message or "⚠️ Не удалось собрать Ленту. Попробуй позже."
+        if res.error_channels:
+            err_text += "\n\nНе загрузились: " + ", ".join(res.error_channels)
         kb = build_feed_period_keyboard()
         if callback.message:
             try:
                 await callback.message.edit_text(err_text, parse_mode="HTML", reply_markup=kb)
             except TelegramAPIError:
-                pass
+                await callback.message.answer(err_text, parse_mode="HTML", reply_markup=kb)
 
 
 # ---------------------------------------------------------------------------

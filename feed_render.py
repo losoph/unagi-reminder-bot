@@ -143,6 +143,7 @@ def render_feed(
     now: datetime,
     channel_count: int | None = None,
     has_web_source: bool = False,
+    incomplete_channels: list[str] | None = None,
     post_chars: int | None = None,
     tz=timezone.utc,
 ) -> list[dict]:
@@ -191,6 +192,10 @@ def render_feed(
             rank += 1
     if has_web_source:
         nodes.append({"tag": "p", "children": ["ℹ️ Метрики части каналов неполные"]})
+    if incomplete_channels:
+        nodes.append({"tag": "p", "children": [
+            f"ℹ️ Часть каналов не загрузилась: {', '.join(incomplete_channels)}"
+        ]})
     return nodes
 
 
