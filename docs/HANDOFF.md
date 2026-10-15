@@ -1,4 +1,4 @@
-# Передача дел · unagi · релиз «Лента» (15.10.2026)
+# Передача дел · unagi · релиз «Лента» (выкачен на прод 16.10.2026)
 
 Документ для новой сессии Claude или нового агента: прочитай его первым, потом — `docs/sprint/2026-10-13-lenta-sprint.md`
 (спека, решения владельца, алгоритм) и `docs/sprint/progress.md` (журнал решений по каждой задаче).
@@ -10,7 +10,8 @@
 | Репозиторий (источник истины для кода) | GitHub `losoph/unagi-reminder-bot`, ветка `main` |
 | Локальная рабочая копия | `~/Library/CloudStorage/GoogleDrive-vctork@gmail.com/Мой диск/DEV/unagi` (Google Drive; раньше iCloud, старая копия — `~/Documents/unagi.old`) |
 | Окружение Python 3.12 (как в проде и CI) | `~/.venvs/unagi` — `bin/python`, `bin/ruff` (0.16.8, как в CI). `.venv` в репозитории не использовать. **Никаких `pip install` вне этого venv** |
-| Прод-сервер (с 12.10) | `ssh aiqu-new` (`89.124.104.144`, порт 2258, root), проект `~/projects/unagi-reminder-bot`, контейнер `unagi-bot`, БД `storage/bot_data.db` (`DB_PATH=storage/bot_data.db`). **Старый сервер `aiqu-eb` (45.145.64.58) больше не используется** |
+| Прод-сервер (с 12.10) | `ssh aiqu` (на этой машине; на прежней был алиас `aiqu-new`) — `89.124.104.144`, порт 2258, root, проект `~/projects/unagi-reminder-bot`, контейнер `unagi-bot`, БД `storage/bot_data.db` (`DB_PATH=storage/bot_data.db`). **Старый сервер `aiqu-eb` (45.145.64.58) больше не используется** |
+| Контроль прода | `ops/aiqu/prod_check.sh` — одна команда, только чтение: версия = `origin/main`, контейнер, ошибки в логах, цикл дайджеста, `quick_check` БД, диск, возраст бэкапа (`OK/WARN/ALERT`, код 1 при `ALERT`) |
 | Бэкап прод-БД перед релизом | на сервере `~/projects/unagi-reminder-bot/storage/backups/bot_data-20261015-2046-pre-lenta.db` (5,8 МБ, `integrity_check = ok`) |
 | Рабочие копии агентов | `~/dev-worktrees/*` (вне облачных папок: Google Drive/iCloud переименовывают файлы в «(1)» и ломают сокет fsmonitor). Служебное: `~/dev-worktrees/tools/` (брифы, `RESUME.md`, `merge-checklist.md`) |
 | Монитор и запуск агентов | `tools/agents/` (README внутри), старые `scripts/agy_*.sh` — тонкие обёртки |
@@ -36,7 +37,7 @@
 **НЕ в релизе:** T24c — опциональная автодоставка Ленты по расписанию. Незавершённая работа agy (609 строк, **без тестов**)
 сохранена в ветке `t24c-wip` (база `4ea8627`, перед продолжением — rebase на `main`). Спека — задача T24c в спринте.
 
-## 3. Как проверить перед пушем (все шаги проходили 15.10)
+## 3. Как проверить перед пушем (все шаги проходили 15.10, повторно 16.10)
 
 ```bash
 cd "$HOME/Library/CloudStorage/GoogleDrive-vctork@gmail.com/Мой диск/DEV/unagi"
@@ -44,6 +45,12 @@ cd "$HOME/Library/CloudStorage/GoogleDrive-vctork@gmail.com/Мой диск/DEV/
 ~/.venvs/unagi/bin/python -m unittest discover -s tests           # 354 тестов, skipped=2 — штатно
 PYTHON=~/.venvs/unagi/bin/python tools/agents/time_shift_tests.sh # +1d +7d +30d +365d -30d: нет зависимости от даты
 ```
+
+**Рабочая машина (itdirector, с 16.10).** Окружение собрано заново: `~/.venvs/unagi` (Python 3.12.15, ruff 0.16.8, зависимости из
+`requirements.txt`). Google Drive теряет биты исполняемости у `*.sh` — если `git status` показывает «mode change 100755 → 100644»,
+верните их: `git ls-files -s | awk '$1==100755{print $4}' | xargs chmod +x`. **libfaketime на этой машине не ставится** (Homebrew,
+Tier 3, формула не собралась) — `time_shift_tests.sh` здесь не работает; при появлении Linux/другой машины прогнать там, а новые
+тесты писать с датами относительно `now`.
 
 CI (`.github/workflows/deploy.yml`) на push в `main`: ruff → `docker build` → `unittest` в контейнере → SSH-деплой
 (`git pull origin main` → снимок БД `ops/aiqu/backup_db.py` в `storage/backups/*-predeploy.db`, 14 последних; нет снимка — деплой
@@ -84,6 +91,10 @@ CI (`.github/workflows/deploy.yml`) на push в `main`: ruff → `docker build`
   годятся для коротких ревью; для кода и больших тестов — `gpt-6.1-sol` (16k). `agy -c` продолжает **последний** разговор — после любого
   постороннего запуска agy указывать разговор явно или начинать новый. Супервизор `agy_supervise.sh` на повторных попытках откатывает
   дерево (обрывки в `.agy/partial-*`) — если нужно сохранить работу, `AGY_KEEP_TREE=1`.
+- **Простые решения через Jev:** `tools/agents/decide.sh "вопрос" вариант=описание … --default <безопасный>` — закрытый список, порог
+  уверенности 0.7, эскалация к человеку (код 10); журнал `.agents/decisions.ndjson`. Только советует: push, откат прода, удаление данных
+  решает наблюдатель/владелец. Ключ OpenRouter берётся из окружения или из `~/.config/agent-tools/env` (0600, строки `OPENROUTER_API_KEY=…`);
+  без ключа `route.sh` и `decide.sh` честно откатываются на статическую политику / «решает человек».
 - **Монитор:** `scripts/agy_watch.sh digest 600` и `tools/agents/oc_digest.py` (Monitor-задачи живут ≤30 мин, перезапускать).
 
 ## 6. Известный техдолг и открытые вопросы
