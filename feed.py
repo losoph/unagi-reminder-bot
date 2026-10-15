@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import hashlib
 import html
+import json
 import logging
 import os
 import time
@@ -60,7 +61,7 @@ from data.database import (
     utc_now,
 )
 from feed_ranking import rank_feed
-from feed_render import _plural_channel, _plural_ru, build_feed_title, render_feed
+from feed_render import _first_sentence, _plural_channel, _plural_ru, build_feed_title, render_feed
 from ranking import get_channel_medians
 from telegraph_publisher import publish_page
 from time_utils import TZ
@@ -103,6 +104,7 @@ class FeedBuildResult:
     cached: bool = False
     error_message: str | None = None
     error_channels: list[str] | None = None
+    headlines: list[str] | None = None
 
 
 def compute_subs_hash(subs: list[Any]) -> str:
@@ -123,15 +125,72 @@ def compute_subs_hash(subs: list[Any]) -> str:
     return hashlib.sha256(serialized).hexdigest()[:16]
 
 
-def format_feed_edition_message(period: str, post_count: int, channel_count: int, telegraph_url: str) -> str:
+FEED_HEADLINE_MAX_CHARS = 80
+FEED_HEADLINES_LIMIT = 3
+
+
+def _headline_from_text(text: Any, limit: int = FEED_HEADLINE_MAX_CHARS) -> str:
+    """Первая фраза поста для блока «Главное»: переносы строк → пробелы, не длиннее limit символов."""
+    normalized = " ".join(str(text or "").split())
+    if not normalized:
+        return ""
+    sentence, _ = _first_sentence(normalized)
+    sentence = sentence.strip()
+    if not sentence:
+        return ""
+    if len(sentence) <= limit:
+        return sentence
+    cut = sentence[: max(0, limit - 1)].rstrip()
+    if " " in cut:
+        cut = cut[: cut.rfind(" ")].rstrip()
+    if not cut:
+        cut = sentence[: max(0, limit - 1)].rstrip()
+    return cut + "…"
+
+
+def _headlines_from_items(items: list[Any], limit: int = FEED_HEADLINES_LIMIT) -> list[str] | None:
+    """Заголовки трёх первых по рангу постов выпуска; пустые тексты пропускаются."""
+    headlines: list[str] = []
+    for item in items:
+        post = item.get("post", item) if isinstance(item, dict) else getattr(item, "post", None)
+        if not isinstance(post, dict):
+            continue
+        headline = _headline_from_text(post.get("text"))
+        if headline:
+            headlines.append(headline)
+        if len(headlines) >= limit:
+            break
+    return headlines or None
+
+
+def _stored_headlines(edition: dict | None) -> list[str] | None:
+    """Заголовки «Главного», сохранённые вместе с выпуском; битые/старые записи → None (сообщение как раньше)."""
+    try:
+        data = json.loads((edition or {}).get("headlines") or "null")
+    except (TypeError, ValueError):
+        return None
+    return [str(item) for item in data][:FEED_HEADLINES_LIMIT] if isinstance(data, list) and data else None
+
+
+def format_feed_edition_message(
+    period: str,
+    post_count: int,
+    channel_count: int,
+    telegraph_url: str,
+    headlines: list[str] | None = None,
+) -> str:
     period_labels = {"day": "день", "week": "неделю", "month": "месяц"}
     p_label = period_labels.get(period, period)
     post_str = _plural_ru(post_count, "пост", "поста", "постов")
     ch_str = _plural_channel(channel_count)
-    return (
-        f"📰 <b>Лента за {p_label} · {post_count} {post_str} из {channel_count} {ch_str}</b>\n\n"
-        f'📖 <a href="{telegraph_url}">Открыть</a>'
-    )
+    lines = [f"📰 <b>Лента за {p_label} · {post_count} {post_str} из {channel_count} {ch_str}</b>"]
+    if headlines:
+        lines.append("")
+        lines.append("Главное:")
+        lines.extend(f"• {html.escape(h)}" for h in headlines)
+    lines.append("")
+    lines.append(f'📖 <a href="{telegraph_url}">Открыть</a>')
+    return "\n".join(lines)
 
 
 def build_feed_period_keyboard() -> InlineKeyboardMarkup:
@@ -913,12 +972,14 @@ async def build_feed_edition(
             cached.get("channel_count", 0),
             cached.get("post_count", 0),
         )
+        headlines = _stored_headlines(cached)
         return FeedBuildResult(
             status="ok",
             telegraph_url=cached["telegraph_url"],
             post_count=cached["post_count"],
             channel_count=cached["channel_count"],
             cached=True,
+            headlines=headlines,
         )
 
     # 2. Rate limit (unless ignored)
@@ -1108,6 +1169,7 @@ async def build_feed_edition(
                 telegraph_url=telegraph_url,
                 post_count=len(items),
                 channel_count=len(unique_channels),
+                headlines=_headlines_from_items(items),
             )
 
             _last_build_time[user_id] = time.time()
@@ -1130,6 +1192,7 @@ async def build_feed_edition(
                 post_count=len(items),
                 channel_count=len(unique_channels),
                 cached=False,
+                headlines=_headlines_from_items(items),
             )
 
         try:
@@ -1258,8 +1321,13 @@ async def cb_feed_period(callback: types.CallbackQuery):
             cached.get("channel_count", 0),
             cached.get("post_count", 0),
         )
+        headlines = _stored_headlines(cached)
         text = format_feed_edition_message(
-            period, cached["post_count"], cached["channel_count"], cached["telegraph_url"]
+            period,
+            cached["post_count"],
+            cached["channel_count"],
+            cached["telegraph_url"],
+            headlines,
         )
         kb = build_feed_edition_keyboard(user_id, period)
         if callback.message:
@@ -1314,7 +1382,7 @@ async def cb_feed_period(callback: types.CallbackQuery):
 
     if res.status == "ok":
         text = format_feed_edition_message(
-            period, res.post_count, res.channel_count, res.telegraph_url
+            period, res.post_count, res.channel_count, res.telegraph_url, res.headlines
         )
         kb = build_feed_edition_keyboard(user_id, period)
         if callback.message:
@@ -1372,11 +1440,13 @@ async def show_edition_or_feed(callback: types.CallbackQuery, user_id: int, peri
     """Restore feed edition message or fall back to /feed main screen."""
     latest = await asyncio.to_thread(get_latest_feed_edition, user_id, period)
     if latest and callback.message:
+        headlines = _stored_headlines(latest)
         text = format_feed_edition_message(
             period,
             latest.get("post_count") or 0,
             latest.get("channel_count") or 0,
             latest.get("telegraph_url") or "",
+            headlines,
         )
         kb = build_feed_edition_keyboard(user_id, period)
         try:
@@ -1532,12 +1602,15 @@ async def process_feed_autodeliveries(now: datetime | None = None) -> int:
             if res.status != "ok":
                 await _autodelivery_failed(user_id, period, now_dt, res.error_message or res.status)
                 continue
-            p_label = {"day": "день", "week": "неделю", "month": "месяц"}[period]
             text = (
-                f"🔔 <b>Автодоставка</b>\n"
-                f"📰 <b>Лента за {p_label} · {res.post_count} {_plural_ru(res.post_count, 'пост', 'поста', 'постов')} "
-                f"из {res.channel_count} {_plural_channel(res.channel_count)}</b>\n\n"
-                f'📖 <a href="{res.telegraph_url}">Открыть</a>'
+                "🔔 <b>Автодоставка</b>\n"
+                + format_feed_edition_message(
+                    period,
+                    res.post_count,
+                    res.channel_count,
+                    res.telegraph_url,
+                    res.headlines,
+                )
             )
             if _bot is None:  # не помечаем срок обработанным: выпуск не доставлен
                 await _autodelivery_failed(user_id, period, now_dt, "bot is not configured")
