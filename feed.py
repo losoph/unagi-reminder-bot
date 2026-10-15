@@ -6,6 +6,7 @@ Never imports main to avoid circular dependencies (pattern T14b).
 """
 
 import asyncio
+import contextlib
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -179,6 +180,22 @@ def configure(
         _fetch_semaphore = fetch_semaphore
 
 
+async def _run_db_call(func: Any, /, *args: Any) -> Any:
+    """Run a blocking DB call in a worker thread; if cancelled, let the thread finish first.
+
+    Cancelling an await on asyncio.to_thread does not stop the thread, so without this
+    a cancelled ingest (cancel_backfill_tasks on shutdown, feed build timeout) would
+    return while its thread is still reading or writing SQLite.
+    """
+    call = asyncio.ensure_future(asyncio.to_thread(func, *args))
+    try:
+        return await asyncio.shield(call)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            await call
+        raise
+
+
 async def ingest_window(
     channels: list[str] | set[str],
     window_start: datetime | str,
@@ -213,8 +230,8 @@ async def ingest_window(
         if not clean_username:
             return raw_channel, []
 
-        backfilled_at = await asyncio.to_thread(get_channel_feed_backfilled_at, clean_username)
-        cursor_str, _ = await asyncio.to_thread(get_channel_scan_cursor, clean_username)
+        backfilled_at = await _run_db_call(get_channel_feed_backfilled_at, clean_username)
+        cursor_str, _ = await _run_db_call(get_channel_scan_cursor, clean_username)
 
         if backfilled_at is not None and cursor_str is not None:
             cursor_dt = parse_db_datetime(cursor_str)
@@ -232,7 +249,7 @@ async def ingest_window(
             return clean_username, []
 
         try:
-            await asyncio.to_thread(upsert_channel_posts, clean_username, posts, source_name)
+            await _run_db_call(upsert_channel_posts, clean_username, posts, source_name)
         except Exception as exc:
             logger.warning("Failed to upsert channel posts for @%s: %s", clean_username, exc)
             return clean_username, posts
@@ -240,7 +257,7 @@ async def ingest_window(
         # Mark backfilled if full 30-day window was fetched with MTProto
         if (is_backfill or marker_dt <= thirty_days_ago) and source_name == "mtproto":
             try:
-                await asyncio.to_thread(set_channel_feed_backfilled_at, clean_username, now_dt)
+                await _run_db_call(set_channel_feed_backfilled_at, clean_username, now_dt)
             except Exception as exc:
                 logger.debug("Failed to set feed_backfilled_at for @%s: %s", clean_username, exc)
 
@@ -252,14 +269,14 @@ async def ingest_window(
                 cursor_dt = parse_db_datetime(cursor_str)
                 if marker_dt <= cursor_dt:
                     # No hole: we fetched from <= cursor_dt up to now
-                    await asyncio.to_thread(update_channel_scan_cursor, clean_username, max_time, max_id)
+                    await _run_db_call(update_channel_scan_cursor, clean_username, max_time, max_id)
                 else:
                     # Hole: marker_dt > cursor_dt. Rule 1.7: cursor must NOT be touched!
                     pass
             else:
                 # cursor_str is None: only advance cursor if full 30-day backfill
                 if is_backfill or marker_dt <= thirty_days_ago:
-                    await asyncio.to_thread(update_channel_scan_cursor, clean_username, max_time, max_id)
+                    await _run_db_call(update_channel_scan_cursor, clean_username, max_time, max_id)
 
         return clean_username, posts
 
