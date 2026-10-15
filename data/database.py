@@ -657,6 +657,18 @@ def init_db():
             )
             '''
         )
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS feed_autodelivery (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                period TEXT NOT NULL,
+                last_run_at DATETIME,
+                created_at DATETIME NOT NULL,
+                UNIQUE(user_id, period)
+            )
+            '''
+        )
         for statement in (
             "ALTER TABLE feed_subscriptions ADD COLUMN tag TEXT",
             "ALTER TABLE feed_subscriptions ADD COLUMN is_paused INTEGER DEFAULT 0",
@@ -671,6 +683,9 @@ def init_db():
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_feed_editions_lookup ON feed_editions(user_id, period, subs_hash, created_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_feed_autodelivery_user ON feed_autodelivery(user_id)"
         )
 
         _migrate_legacy_local_timestamps_to_utc(cursor)
@@ -2043,6 +2058,15 @@ def export_user_data(user_id) -> dict:
             ''',
             (user_id,),
         ).fetchall()
+        feed_autodelivery = conn.execute(
+            '''
+            SELECT period, last_run_at, created_at
+            FROM feed_autodelivery
+            WHERE user_id = ?
+            ORDER BY period
+            ''',
+            (user_id,),
+        ).fetchall()
 
     return {
         "reminders": [dict(row) for row in reminders],
@@ -2051,6 +2075,7 @@ def export_user_data(user_id) -> dict:
         "digest_settings": [dict(row) for row in digest_settings],
         "prefs": get_user_prefs(user_id),
         "feed": [dict(row) for row in feed_subscriptions],
+        "feed_autodelivery": [dict(row) for row in feed_autodelivery],
     }
 
 
@@ -3259,3 +3284,108 @@ def set_feed_user_onboarding_shown(user_id: int, shown_at: datetime | str | None
             (user_id, val),
         )
         conn.commit()
+
+
+def get_latest_feed_edition(user_id: int, period: str) -> dict | None:
+    """Вернуть последний сохранённый выпуск Ленты для пользователя и периода."""
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT id, user_id, period, window_start, window_end, subs_hash, telegraph_url,
+                   post_count, channel_count, created_at
+            FROM feed_editions
+            WHERE user_id = ? AND period = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            ''',
+            (user_id, period),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def enable_feed_autodelivery(user_id: int, period: str, now: datetime | None = None) -> None:
+    """Включить автодоставку Ленты для периода."""
+    now_dt = now or utc_now()
+    now_str = serialize_datetime(now_dt)
+    with get_connection() as conn:
+        conn.execute(
+            '''
+            INSERT INTO feed_autodelivery (user_id, period, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, period) DO UPDATE SET created_at = excluded.created_at
+            ''',
+            (user_id, period, now_str),
+        )
+        conn.commit()
+
+
+def disable_feed_autodelivery(user_id: int, period: str) -> bool:
+    """Отключить автодоставку Ленты для периода."""
+    with get_connection() as conn:
+        res = conn.execute(
+            '''
+            DELETE FROM feed_autodelivery
+            WHERE user_id = ? AND period = ?
+            ''',
+            (user_id, period),
+        )
+        conn.commit()
+        return res.rowcount > 0
+
+
+def get_feed_autodelivery(user_id: int, period: str) -> dict | None:
+    """Получить запись автодоставки Ленты."""
+    with get_connection() as conn:
+        row = conn.execute(
+            '''
+            SELECT id, user_id, period, last_run_at, created_at
+            FROM feed_autodelivery
+            WHERE user_id = ? AND period = ?
+            ''',
+            (user_id, period),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_user_feed_autodeliveries(user_id: int) -> list[dict]:
+    """Список всех включённых автодоставок пользователя (до 3 записей)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            '''
+            SELECT id, user_id, period, last_run_at, created_at
+            FROM feed_autodelivery
+            WHERE user_id = ?
+            ORDER BY period
+            ''',
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_all_feed_autodeliveries() -> list[dict]:
+    """Список всех включённых автодоставок всех пользователей для фонового цикла."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            '''
+            SELECT id, user_id, period, last_run_at, created_at
+            FROM feed_autodelivery
+            ORDER BY id
+            '''
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_feed_autodelivery_last_run(user_id: int, period: str, last_run_at: datetime | str) -> None:
+    """Обновить отметку последнего выполнения автодоставки."""
+    dt_str = serialize_datetime(last_run_at) if isinstance(last_run_at, datetime) else str(last_run_at)
+    with get_connection() as conn:
+        conn.execute(
+            '''
+            UPDATE feed_autodelivery
+            SET last_run_at = ?
+            WHERE user_id = ? AND period = ?
+            ''',
+            (dt_str, user_id, period),
+        )
+        conn.commit()
+
