@@ -2058,16 +2058,6 @@ def export_user_data(user_id) -> dict:
             ''',
             (user_id,),
         ).fetchall()
-        feed_autodelivery = conn.execute(
-            '''
-            SELECT period, last_run_at, created_at
-            FROM feed_autodelivery
-            WHERE user_id = ?
-            ORDER BY period
-            ''',
-            (user_id,),
-        ).fetchall()
-
     return {
         "reminders": [dict(row) for row in reminders],
         "bookmarks": [dict(row) for row in bookmarks],
@@ -2075,7 +2065,6 @@ def export_user_data(user_id) -> dict:
         "digest_settings": [dict(row) for row in digest_settings],
         "prefs": get_user_prefs(user_id),
         "feed": [dict(row) for row in feed_subscriptions],
-        "feed_autodelivery": [dict(row) for row in feed_autodelivery],
     }
 
 
@@ -3305,6 +3294,8 @@ def get_latest_feed_edition(user_id: int, period: str) -> dict | None:
 
 def enable_feed_autodelivery(user_id: int, period: str, now: datetime | None = None) -> None:
     """Включить автодоставку Ленты для периода."""
+    if period not in {"day", "week", "month"}:
+        raise ValueError(f"Unsupported feed period: {period}")
     now_dt = now or utc_now()
     now_str = serialize_datetime(now_dt)
     with get_connection() as conn:
@@ -3312,7 +3303,7 @@ def enable_feed_autodelivery(user_id: int, period: str, now: datetime | None = N
             '''
             INSERT INTO feed_autodelivery (user_id, period, created_at)
             VALUES (?, ?, ?)
-            ON CONFLICT(user_id, period) DO UPDATE SET created_at = excluded.created_at
+            ON CONFLICT(user_id, period) DO NOTHING
             ''',
             (user_id, period, now_str),
         )
@@ -3388,4 +3379,3 @@ def update_feed_autodelivery_last_run(user_id: int, period: str, last_run_at: da
             (dt_str, user_id, period),
         )
         conn.commit()
-

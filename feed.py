@@ -18,7 +18,7 @@ import time
 from typing import Any
 
 from aiogram import F, Router, types
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -169,6 +169,13 @@ def build_feed_edition_keyboard(user_id: int, period: str) -> InlineKeyboardMark
             [InlineKeyboardButton(text="🔙 К Ленте", callback_data="feed_main")],
         ]
     )
+
+
+def _parse_autodelivery_period(callback_data: str, prefix: str) -> str | None:
+    if not callback_data.startswith(prefix):
+        return None
+    period = callback_data.removeprefix(prefix)
+    return period if period in FEED_TO_DIGEST_PERIOD else None
 
 
 def get_fetch_semaphore() -> asyncio.Semaphore:
@@ -358,30 +365,22 @@ def get_autodelivery_due_time(
     autodelivery_row: dict | Any,
     now: datetime | None = None,
 ) -> datetime | None:
-    """Calculate the next autodelivery due time based on digest settings."""
-    if isinstance(autodelivery_row, dict):
-        last_run = autodelivery_row.get("last_run_at")
-        created = autodelivery_row.get("created_at")
-    else:
-        last_run = autodelivery_row["last_run_at"] if "last_run_at" in autodelivery_row.keys() else None
-        created = autodelivery_row["created_at"] if "created_at" in autodelivery_row.keys() else None
+    """Ближайший срок автодоставки после последней доставки (или после включения); None, если считать нечего.
 
-    base_str = last_run or created
-    if not base_str:
-        return None
-
-    base_dt = parse_db_datetime(base_str)
-    if base_dt.tzinfo is None:
-        base_dt = base_dt.replace(tzinfo=TZ)
-    else:
-        base_dt = base_dt.astimezone(TZ)
-
+    Срок не хранится: он считается по настройкам дайджеста соответствующего периода, поэтому смена времени
+    дайджеста подхватывается сама. Даты в БД — UTC, расписание — в APP_TIMEZONE. Возвращаемый срок может быть в
+    прошлом (бот простаивал): тогда выпуск придёт один раз, а `last_run_at = now` пропустит остальные пропущенные сроки.
+    """
+    keys = autodelivery_row.keys()
+    base_str = (autodelivery_row["last_run_at"] if "last_run_at" in keys else None) or (
+        autodelivery_row["created_at"] if "created_at" in keys else None
+    )
     digest_period = FEED_TO_DIGEST_PERIOD.get(period)
-    if not digest_period:
+    if not base_str or not digest_period:
         return None
-
-    settings = _resolve_digest_settings(user_id, digest_period, now=base_dt)
-    return _get_next_digest_time(digest_period, base_dt, settings)
+    base_local = parse_db_datetime(base_str).astimezone(TZ)
+    settings = _resolve_digest_settings(user_id, digest_period, now=base_local)
+    return _get_next_digest_time(digest_period, base_local, settings)
 
 
 async def _run_db_call(func: Any, /, *args: Any) -> Any:
@@ -703,7 +702,7 @@ async def render_personal_channels(
         )
         kb = build_personal_channels_keyboard(user_id, channels)
 
-    is_cb = isinstance(target, types.CallbackQuery) or hasattr(target, "message")
+    is_cb = isinstance(target, types.CallbackQuery)
     if edit and is_cb and target.message:
         try:
             await target.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
@@ -742,7 +741,7 @@ async def render_feed_main(target: types.Message | types.CallbackQuery, user_id:
     text = "\n\n".join(lines)
     kb = build_feed_main_keyboard(total, show_personal_btn=is_owner, autodeliveries=autodeliveries)
 
-    is_cb = isinstance(target, types.CallbackQuery) or hasattr(target, "message")
+    is_cb = isinstance(target, types.CallbackQuery)
     if edit and is_cb and target.message:
         try:
             await target.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
@@ -1380,10 +1379,13 @@ async def show_edition_or_feed(callback: types.CallbackQuery, user_id: int, peri
 @router.callback_query(F.data.startswith("feed_autodel_prompt_"))
 async def cb_feed_autodel_prompt(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    try:
-        period = callback.data.split("_")[3]
-    except (IndexError, ValueError):
-        await callback.answer("❌ Ошибка периода.")
+    period = _parse_autodelivery_period(callback.data, "feed_autodel_prompt_")
+    if period is None:
+        await callback.answer("Эта кнопка устарела. Открой /feed и выбери выпуск снова.", show_alert=True)
+        return
+    if await asyncio.to_thread(get_feed_autodelivery, user_id, period):
+        await callback.answer("Автодоставка уже включена.", show_alert=True)
+        await show_edition_or_feed(callback, user_id, period)
         return
 
     p_acc = {"day": "день", "week": "неделю", "month": "месяц"}.get(period, period)
@@ -1413,10 +1415,9 @@ async def cb_feed_autodel_prompt(callback: types.CallbackQuery):
 @router.callback_query(F.data.startswith("feed_autodel_confirm_"))
 async def cb_feed_autodel_confirm(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    try:
-        period = callback.data.split("_")[3]
-    except (IndexError, ValueError):
-        await callback.answer("❌ Ошибка периода.")
+    period = _parse_autodelivery_period(callback.data, "feed_autodel_confirm_")
+    if period is None:
+        await callback.answer("Эта кнопка устарела. Открой /feed и выбери выпуск снова.", show_alert=True)
         return
 
     await asyncio.to_thread(enable_feed_autodelivery, user_id, period)
@@ -1428,10 +1429,9 @@ async def cb_feed_autodel_confirm(callback: types.CallbackQuery):
 @router.callback_query(F.data.startswith("feed_autodel_cancel_"))
 async def cb_feed_autodel_cancel(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    try:
-        period = callback.data.split("_")[3]
-    except (IndexError, ValueError):
-        await callback.answer()
+    period = _parse_autodelivery_period(callback.data, "feed_autodel_cancel_")
+    if period is None:
+        await callback.answer("Эта кнопка устарела. Открой /feed и выбери выпуск снова.", show_alert=True)
         return
 
     await callback.answer()
@@ -1441,10 +1441,9 @@ async def cb_feed_autodel_cancel(callback: types.CallbackQuery):
 @router.callback_query(F.data.startswith("feed_autodel_off_"))
 async def cb_feed_autodel_off(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    try:
-        period = callback.data.split("_")[3]
-    except (IndexError, ValueError):
-        await callback.answer("❌ Ошибка периода.")
+    period = _parse_autodelivery_period(callback.data, "feed_autodel_off_")
+    if period is None:
+        await callback.answer("Эта кнопка устарела. Открой /feed и выбери выпуск снова.", show_alert=True)
         return
 
     await asyncio.to_thread(disable_feed_autodelivery, user_id, period)
@@ -1462,96 +1461,76 @@ async def cb_feed_autodel_off(callback: types.CallbackQuery):
                 await show_edition_or_feed(callback, user_id, period)
 
 
+AUTODELIVERY_MAX_FAILURES = 3
+_AUTODELIVERY_EMPTY_STATUSES = ("empty_channels", "all_paused", "empty_posts")
+
+
+async def _autodelivery_slot_done(user_id: int, period: str, now_dt: datetime) -> None:
+    """Срок обработан (доставлен, пуст или пропущен): следующий считается от этого момента."""
+    await asyncio.to_thread(update_feed_autodelivery_last_run, user_id, period, now_dt)
+    _autodelivery_failures.pop((user_id, period), None)
+
+
+async def _autodelivery_failed(user_id: int, period: str, now_dt: datetime, reason: Any) -> None:
+    """Неудача: повтор в следующем цикле, после AUTODELIVERY_MAX_FAILURES — пропуск до следующего срока (без сообщения)."""
+    key = (user_id, period)
+    failures = _autodelivery_failures.get(key, 0) + 1
+    _autodelivery_failures[key] = failures
+    logger.warning("feed_autodelivery failed user=%s period=%s attempt=%d/%d: %s", user_id, period, failures, AUTODELIVERY_MAX_FAILURES, reason)
+    if failures >= AUTODELIVERY_MAX_FAILURES:
+        logger.warning("feed_autodelivery skipping to next slot user=%s period=%s", user_id, period)
+        await _autodelivery_slot_done(user_id, period, now_dt)
+
+
 async def process_feed_autodeliveries(now: datetime | None = None) -> int:
-    """Check all active autodeliveries and execute due ones."""
+    """Выполняет наступившие автодоставки; возвращает число отправленных выпусков.
+
+    Один выпуск на срок: после отправки `last_run_at = now`, и следующий срок считается уже от него. Если процесс упадёт
+    между отправкой и записью, возможен один дубль — это осознанно предпочтено потерянному выпуску.
+    """
     now_dt = now or utc_now()
     records = await asyncio.to_thread(list_all_feed_autodeliveries)
-    if not records:
-        return 0
+    live = {(record["user_id"], record["period"]) for record in records}
+    for key in [key for key in _autodelivery_failures if key not in live]:
+        del _autodelivery_failures[key]
 
     sent_count = 0
-    now_local = now_dt.astimezone(TZ)
-
     for record in records:
-        user_id = record["user_id"]
-        period = record["period"]
-        if period not in ("day", "week", "month"):
-            continue
-
+        user_id, period = record["user_id"], record["period"]
         due_time = get_autodelivery_due_time(user_id, period, record, now=now_dt)
-        if due_time is None:
+        if due_time is None or now_dt.astimezone(TZ) < due_time:
             continue
-
-        if now_local < due_time:
-            continue
-
         try:
             res = await build_feed_edition(user_id, period, ignore_rate_limit=True, now=now_dt)
-            if res.status == "ok":
-                period_labels = {"day": "день", "week": "неделю", "month": "месяц"}
-                p_label = period_labels.get(period, period)
-                post_str = _plural_ru(res.post_count, "пост", "поста", "постов")
-                ch_str = _plural_channel(res.channel_count)
-                text = (
-                    f"🔔 <b>Автодоставка</b>\n"
-                    f"📰 <b>Лента за {p_label} · {res.post_count} {post_str} из {res.channel_count} {ch_str}</b>\n\n"
-                    f'📖 <a href="{res.telegraph_url}">Открыть</a>'
-                )
-                kb = build_feed_edition_keyboard(user_id, period)
-                if _bot:
-                    try:
-                        await _bot.send_message(
-                            user_id,
-                            text,
-                            parse_mode="HTML",
-                            reply_markup=kb,
-                            link_preview_options=LinkPreviewOptions(is_disabled=False),
-                        )
-                    except TelegramAPIError as exc:
-                        logger.warning("Failed to send autodelivery to user %s: %s", user_id, exc)
-                await asyncio.to_thread(update_feed_autodelivery_last_run, user_id, period, now_dt)
-                _autodelivery_failures.pop((user_id, period), None)
-                sent_count += 1
-            elif res.status in ("empty_channels", "all_paused", "empty_posts"):
-                await asyncio.to_thread(update_feed_autodelivery_last_run, user_id, period, now_dt)
-                _autodelivery_failures.pop((user_id, period), None)
-            else:
-                failures = _autodelivery_failures.get((user_id, period), 0) + 1
-                _autodelivery_failures[(user_id, period)] = failures
-                logger.warning(
-                    "feed_autodelivery failed user=%s period=%s attempt=%d/3: %s",
-                    user_id,
-                    period,
-                    failures,
-                    res.error_message,
-                )
-                if failures >= 3:
-                    logger.warning(
-                        "feed_autodelivery skipping to next period for user=%s period=%s after 3 failures",
-                        user_id,
-                        period,
-                    )
-                    await asyncio.to_thread(update_feed_autodelivery_last_run, user_id, period, now_dt)
-                    _autodelivery_failures.pop((user_id, period), None)
-        except Exception as exc:
-            failures = _autodelivery_failures.get((user_id, period), 0) + 1
-            _autodelivery_failures[(user_id, period)] = failures
-            logger.warning(
-                "feed_autodelivery exception user=%s period=%s attempt=%d/3: %s",
-                user_id,
-                period,
-                failures,
-                exc,
+            if res.status in _AUTODELIVERY_EMPTY_STATUSES:
+                await _autodelivery_slot_done(user_id, period, now_dt)
+                continue
+            if res.status != "ok":
+                await _autodelivery_failed(user_id, period, now_dt, res.error_message or res.status)
+                continue
+            p_label = {"day": "день", "week": "неделю", "month": "месяц"}[period]
+            text = (
+                f"🔔 <b>Автодоставка</b>\n"
+                f"📰 <b>Лента за {p_label} · {res.post_count} {_plural_ru(res.post_count, 'пост', 'поста', 'постов')} "
+                f"из {res.channel_count} {_plural_channel(res.channel_count)}</b>\n\n"
+                f'📖 <a href="{res.telegraph_url}">Открыть</a>'
             )
-            if failures >= 3:
-                logger.warning(
-                    "feed_autodelivery skipping to next period for user=%s period=%s after 3 failures",
+            if _bot is not None:
+                await _bot.send_message(
                     user_id,
-                    period,
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=build_feed_edition_keyboard(user_id, period),
+                    link_preview_options=LinkPreviewOptions(is_disabled=False),
                 )
-                await asyncio.to_thread(update_feed_autodelivery_last_run, user_id, period, now_dt)
-                _autodelivery_failures.pop((user_id, period), None)
-
+            await _autodelivery_slot_done(user_id, period, now_dt)
+            sent_count += 1
+        except TelegramForbiddenError:
+            await asyncio.to_thread(disable_feed_autodelivery, user_id, period)
+            _autodelivery_failures.pop((user_id, period), None)
+            logger.warning("feed_autodelivery disabled: bot blocked user=%s period=%s", user_id, period)
+        except Exception as exc:  # CancelledError — BaseException и сюда не попадает
+            await _autodelivery_failed(user_id, period, now_dt, exc)
     return sent_count
 
 
