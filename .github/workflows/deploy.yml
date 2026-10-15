@@ -31,4 +31,6 @@ jobs:
           script: |
             cd ~/projects/unagi-reminder-bot
             git pull origin main
+            # Снимок БД до пересборки (миграции только добавляют, но откат данных должен быть возможен). Нет снимка — нет деплоя.
+            python3 ops/aiqu/backup_db.py --db storage/bot_data.db || { echo "резервная копия не создана — деплой остановлен"; exit 1; }
             docker compose up -d --build

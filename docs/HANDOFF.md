@@ -46,7 +46,8 @@ PYTHON=~/.venvs/unagi/bin/python tools/agents/time_shift_tests.sh # +1d +7d +30d
 ```
 
 CI (`.github/workflows/deploy.yml`) на push в `main`: ruff → `docker build` → `unittest` в контейнере → SSH-деплой
-(`git pull origin main && docker compose up -d --build`). Секреты GitHub (`HOST`, `SSH_KEY`, `SSH_PORT`, `USERNAME`)
+(`git pull origin main` → снимок БД `ops/aiqu/backup_db.py` в `storage/backups/*-predeploy.db`, 14 последних; нет снимка — деплой
+останавливается → `docker compose up -d --build`). Секреты GitHub (`HOST`, `SSH_KEY`, `SSH_PORT`, `USERNAME`)
 обновлены 10.10 и указывают на `aiqu-new` (деплои 10–12.10 прошли). Docker локально не нужен: чистый экспорт `main`
 + свежий venv из `requirements.txt` + `ruff 0.16.8` дали те же результаты (проверено).
 
