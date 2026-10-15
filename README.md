@@ -118,3 +118,7 @@ docker compose up --build -d
 ```
 
 В контейнере база по умолчанию хранится в `/app/storage/bot_data.db`, это значение уже задано в `.env.example`.
+
+## Для разработчиков и агентов
+
+Состояние релиза, проверки, деплой и откат, работа с агентами — [docs/HANDOFF.md](docs/HANDOFF.md). Спринт «Лента» — [docs/sprint/2026-10-13-lenta-sprint.md](docs/sprint/2026-10-13-lenta-sprint.md).
