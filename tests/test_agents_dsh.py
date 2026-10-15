@@ -109,14 +109,15 @@ class DshRunTests(DshBase):
 
     def test_runaway_dsh_is_stopped_by_the_run_token_limit(self):
         events = " ".join(f"'{step_end(150000, 100).strip()}'" for _ in range(4))
-        self.set_fake(f"for e in {events}; do printf '%s\\n' \"$e\"; sleep 0.2; done\nwhile :; do sleep 1; done")
+        self.set_fake(f"echo $$ > '{self.dir}/agent.pid'\ntrap '' PIPE\nfor e in {events}; do printf '%s\\n' \"$e\"; sleep 0.2; done\nwhile :; do sleep 1; done")
         started = time.monotonic()
         proc = self.run_script("dsh_run.sh", self.worktree, self.brief, self.dir / "run.ndjson", "runaway", timeout=40)
         self.assertEqual(proc.returncode, 3, proc.stderr)
         self.assertLess(time.monotonic() - started, 25)
         log = (self.dir / "run.ndjson").read_text(encoding="utf-8")
         self.assertIn("budget_exceeded", log)
-        self.assertEqual(subprocess.run(["pgrep", "-f", str(self.fake)], capture_output=True).returncode, 1)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int((self.dir / "agent.pid").read_text(encoding="utf-8")), 0)
 
 
 class AgentsShTests(DshBase):
@@ -272,6 +273,10 @@ class AgentsShTests(DshBase):
 class PolicyTests(DshBase):
     def setUp(self):
         super().setUp()
+        fake_agy = self.dir / "bin" / "agy"  # agy есть не везде (в CI-контейнере нет): лестнице нужен только факт наличия
+        fake_agy.write_text("#!/bin/sh\n", encoding="utf-8")
+        fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+        self.env["PATH"] = f"{self.dir / 'bin'}:{os.environ['PATH']}"
         # Меняем только то, что отличается от текущего окружения, и возвращаем прежние значения (а не вычищаем окружение целиком).
         previous = {key: os.environ.get(key) for key, value in self.env.items() if os.environ.get(key) != value}
         os.environ.update({key: self.env[key] for key in previous})

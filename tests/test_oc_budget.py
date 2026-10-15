@@ -1,5 +1,6 @@
 """Проверки бюджета токенов opencode: предохранитель прогона, журнал спринта, отказ при пустом остатке."""
 
+import importlib.util
 import json
 import os
 import stat
@@ -87,6 +88,19 @@ class OcBudgetTests(unittest.TestCase):
         self.assertEqual(self.rows(), [])
         self.assertEqual(self.run_budget("snapshot").returncode, 1)
 
+    def test_proc_scan_finds_only_children_of_the_parent_matching_the_pattern(self):
+        # Разбор /proc без настоящего /proc: поддельное дерево каталогов (на образе без pkill именно оно используется).
+        module = importlib.util.module_from_spec(importlib.util.spec_from_file_location("oc_budget_t", BUDGET))
+        module.__spec__.loader.exec_module(module)
+        proc = Path(self.tmp.name) / "proc"
+        for pid, ppid, command in ((101, 7, "/bin/sh /x/bin/dsh --profile headless"), (102, 7, "python other"), (103, 8, "/bin/sh /x/bin/dsh --json"), (104, 7, "sleep 1")):
+            (proc / str(pid)).mkdir(parents=True)
+            (proc / str(pid) / "stat").write_text(f"{pid} (my cmd) S {ppid} 1 1 0\n", encoding="utf-8")  # имя процесса может содержать пробелы и скобки
+            (proc / str(pid) / "cmdline").write_bytes(command.replace(" ", "\0").encode())
+        (proc / "self").mkdir()
+        self.assertEqual(module._children_by_proc(7, "bin/dsh", str(proc)), [101])
+        self.assertEqual(module._children_by_proc(7, "bin/dsh", str(proc / "missing")), [])
+
     def test_check_refuses_when_sprint_budget_is_gone(self):
         self.assertEqual(self.run_budget("check").returncode, 0)
         self.run_budget("add", "95000", "spent")
@@ -108,7 +122,7 @@ class OcBudgetTests(unittest.TestCase):
         bin_dir.mkdir()
         fake = bin_dir / "opencode"
         fake.write_text(
-            "#!/bin/sh\ntrap '' PIPE\n"
+            f"#!/bin/sh\necho $$ > '{self.tmp.name}/agent.pid'\ntrap '' PIPE\n"
             f"for i in 1 2 3 4 5 6; do printf '%s\\n' '{finish(30000).strip()}'; sleep 0.2; done\nwhile :; do sleep 1; done\n",
             encoding="utf-8",
         )
@@ -128,7 +142,8 @@ class OcBudgetTests(unittest.TestCase):
         log = (Path(self.tmp.name) / "run.ndjson").read_text(encoding="utf-8")
         self.assertIn("budget_exceeded", log)
         self.assertIn('"code": 3', log)
-        self.assertEqual(subprocess.run(["pgrep", "-f", str(fake)], capture_output=True).returncode, 1)
+        with self.assertRaises(ProcessLookupError):  # процесс агента остановлен, не просто отвязан от конвейера
+            os.kill(int((Path(self.tmp.name) / "agent.pid").read_text(encoding="utf-8")), 0)
 
     def test_oc_run_refuses_to_start_without_budget(self):
         self.run_budget("add", "99000", "spent")

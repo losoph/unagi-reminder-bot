@@ -152,6 +152,60 @@ def cmd_check(tool):
     return 0
 
 
+def _children_by_proc(parent, pattern, proc_root):
+    """pid детей `parent` с `pattern` в командной строке — обход /proc (Linux, в том числе минимальные образы Docker без procps)."""
+    found = []
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return found
+    for name in entries:
+        if not name.isdigit() or int(name) == os.getpid():
+            continue
+        try:
+            with open(os.path.join(proc_root, name, "stat"), encoding="utf-8", errors="replace") as stat:
+                ppid = int(stat.read().rsplit(")", 1)[1].split()[1])
+            with open(os.path.join(proc_root, name, "cmdline"), "rb") as cmdline:
+                command = cmdline.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        except (OSError, ValueError, IndexError):
+            continue
+        if ppid == parent and pattern in command:
+            found.append(int(name))
+    return found
+
+
+def _children_by_ps(parent, pattern):
+    """То же через `ps` (macOS/BSD, где нет /proc)."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,command="], capture_output=True, text=True, check=False).stdout
+    except OSError:
+        return []
+    found = []
+    for line in out.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) == 3 and fields[1] == str(parent) and pattern in fields[2] and int(fields[0]) != os.getpid():
+            found.append(int(fields[0]))
+    return found
+
+
+def kill_siblings(pattern, parent=None, proc_root="/proc"):
+    """SIGTERM процессам — детям нашего родителя (run-скрипта), в командной строке которых есть `pattern`.
+
+    Порядок: pkill → обход /proc → ps. Предохранитель не должен падать в момент срабатывания, даже в образе без procps.
+    """
+    parent = parent or os.getppid()
+    try:
+        subprocess.run(["pkill", "-TERM", "-P", str(parent), "-f", pattern], check=False)
+        return
+    except FileNotFoundError:
+        pass
+    for pid in _children_by_proc(parent, pattern, proc_root) or _children_by_ps(parent, pattern):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
 def cmd_guard(tool, title):
     sprint, sprint_limit, run_limit, _ = config(tool)
     before = spent(sprint, tool)
@@ -178,8 +232,7 @@ def cmd_guard(tool, title):
                 sys.stdout.write(json.dumps(stop, ensure_ascii=False) + "\n")
                 sys.stdout.flush()
                 # SIGPIPE агент может перехватить — останавливаем соседа по конвейеру явно (дети run-скрипта).
-                pattern = os.environ.get("BUDGET_KILL_PATTERN") or KILL_PATTERN[tool]
-                subprocess.run(["pkill", "-TERM", "-P", str(os.getppid()), "-f", pattern], check=False)
+                kill_siblings(os.environ.get("BUDGET_KILL_PATTERN") or KILL_PATTERN[tool])
                 return 3
     except BrokenPipeError:
         pass
