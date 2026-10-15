@@ -90,6 +90,9 @@ def call_jev(body, key):
     except ValueError:
         print("некорректная настройка таймаута или порога Jev", file=sys.stderr)
         return None, 4
+    # Локальный адрес (тестовый сервер) идёт напрямую: системный прокси без NO_PROXY иначе ломает проверки в чужой вкладке.
+    local = parsed_url.hostname in {"localhost", "127.0.0.1", "::1"}
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({})) if local else urllib.request.build_opener()
     deadline = time.monotonic() + timeout
     for attempt in range(3):
         remaining = deadline - time.monotonic()
@@ -103,7 +106,7 @@ def call_jev(body, key):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=remaining) as result:
+            with opener.open(request, timeout=remaining) as result:
                 return json.loads(result.read()), 0
         except urllib.error.HTTPError as exc:
             if exc.code in (429, 529) and attempt < 2:
