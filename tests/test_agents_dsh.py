@@ -213,7 +213,7 @@ class AgentsShTests(DshBase):
         proc = self.run_script("agents.sh", "run", "opencode", "short-check", self.worktree, self.brief, self.dir / "o.ndjson", "OC", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         args = (self.dir / "oc-args.txt").read_text(encoding="utf-8").split("\n")
-        self.assertEqual(args[args.index("-m") + 1], "Tokenn/codex-5.3#low")  # эффорт Jev применён как вариант модели
+        self.assertEqual(args[args.index("-m") + 1], "Tokenn/codex-5.3")  # уровень мышления задан панелью Tokenn (Min): эффорт не передаётся
 
     def test_opencode_refuses_effort_without_a_defined_variant(self):
         fake_oc = self.dir / "bin" / "opencode"
@@ -291,10 +291,11 @@ class PolicyTests(DshBase):
         self.addCleanup(restore)
         self.policy = load("executor_policy")
 
-    def test_default_ladder_is_dsh_then_agy_and_opencode_is_never_chosen(self):
+    def test_ladder_is_dsh_then_agy_and_opencode_only_for_checks_and_audits(self):
         for kind in self.policy.KINDS:
-            self.assertEqual(self.policy.executor_order(kind)[:2], ["dsh", "agy"])
-            self.assertNotIn("opencode", self.policy.executor_order(kind))
+            order = self.policy.executor_order(kind)
+            self.assertEqual(order[:2], ["dsh", "agy"])
+            self.assertEqual("opencode" in order, kind in ("review", "adversarial-review", "merge-audit", "short-check"), kind)
         self.assertEqual(self.policy.choose("review")["executor"], "dsh")
 
     def test_exhausted_dsh_budget_falls_back_to_agy(self):

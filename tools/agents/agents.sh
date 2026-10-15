@@ -10,7 +10,8 @@
 #                                                       # короткая сверка: вопрос + ≤24 КБ контекста, без инструментов, ответ ≤200 слов
 #   agents.sh watch <dsh|opencode|agy> <log>           # живой монитор (ошибки, коммиты, красные тесты, итог прогона, расход токенов)
 #   agents.sh route <agent> <kind> "<описание>" [--dry-run]   # только выбор модели (Jev или статическая политика)
-#   agents.sh report                                   # что решил Jev, откаты и стоимость решений
+#   agents.sh report                                   # что решил Jev, откаты, стоимость решений и качество выдачи агентов
+#   agents.sh rate <agent> <model> <title> <good|partial|bad> [заметка]   # оценка выдачи (журнал .agents/quality.ndjson)
 # kind: executor-complex | executor-ux | review | adversarial-review | docs | merge-audit | short-check
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -57,8 +58,11 @@ run_agent() {
       echo "⛔ opencode запускается только с решением Jev (нужен OPENROUTER_API_KEY в ~/.config/agent-tools/env или окружении); откат на статическую политику запрещён." >&2
       return 4
     fi
-    # эффорт тоже выбирает Jev: он применяется как вариант модели (#low|#medium|#high)
-    exec "$SCRIPT_DIR/oc_run.sh" "$worktree" "$model" "$brief" "$log" "$title" --effort "$effort" "$@"
+    # Уровень мышления Tokenn выставлен владельцем в панели (Min) и не регулируется (16.10): Jev выбирает только модель.
+    # OC_EFFORT_FROM_JEV=on вернёт передачу эффорта вариантом модели (#low|#medium|#high).
+    local effort_args=()
+    [ "${OC_EFFORT_FROM_JEV:-off}" != on ] || effort_args=(--effort "$effort")
+    exec "$SCRIPT_DIR/oc_run.sh" "$worktree" "$model" "$brief" "$log" "$title" ${effort_args[@]+"${effort_args[@]}"} "$@"
   fi
   # dsh: Jev выбирает модель (V4.1 Flash | V4 Pro) и эффорт off|low|high|max — те же значения принимает dsh_run.sh
   exec "$SCRIPT_DIR/dsh_run.sh" "$worktree" "$brief" "$log" "$title" --model "$model" --effort "$effort" "$@"
@@ -105,7 +109,8 @@ case "$cmd" in
   run) run_agent "$@" ;;
   check) check_agent "$@" ;;
   watch) watch_agent "$@" ;;
-  report) "$PY" "$SCRIPT_DIR/jev_report.py" "$@" ;;
+  report) "$PY" "$SCRIPT_DIR/jev_report.py" "$@"; "$PY" "$SCRIPT_DIR/quality.py" report ;;
+  rate) "$PY" "$SCRIPT_DIR/quality.py" rate "$@" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac
