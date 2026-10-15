@@ -3346,7 +3346,7 @@ def list_user_feed_autodeliveries(user_id: int) -> list[dict]:
             SELECT id, user_id, period, last_run_at, created_at
             FROM feed_autodelivery
             WHERE user_id = ?
-            ORDER BY period
+            ORDER BY CASE period WHEN 'day' THEN 1 WHEN 'week' THEN 2 ELSE 3 END
             ''',
             (user_id,),
         ).fetchall()

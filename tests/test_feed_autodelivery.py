@@ -25,6 +25,11 @@ def noon() -> datetime:
     return datetime.now(TZ).replace(hour=12, minute=0, second=0, microsecond=0)
 
 
+def after_slot(minutes: int = 30) -> datetime:
+    """Завтра 07:00 + minutes — первый срок дневной автодоставки, включённой сегодня в полдень (07:00 по умолчанию в тестах)."""
+    return (noon() + timedelta(days=1)).replace(hour=7, minute=0) + timedelta(minutes=minutes)
+
+
 def utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
@@ -142,7 +147,7 @@ class StorageTests(AutodeliveryBase):
 
 class ProcessTests(AutodeliveryBase):
     async def test_due_slot_sends_once_and_next_cycle_in_same_slot_is_silent(self):
-        now = noon() + timedelta(days=1, hours=1)  # завтра 13:00: срок 07:00 наступил
+        now = after_slot()  # завтра 07:30: срок 07:00 наступил
         self.enable(1, "day", noon())
         build = AsyncMock(return_value=result())
         sent, bot = await self.run_cycle(now, build)
@@ -163,25 +168,56 @@ class ProcessTests(AutodeliveryBase):
         bot.send_message.assert_not_awaited()
 
     async def test_only_due_users_get_a_message(self):
-        now = noon() + timedelta(days=1, hours=1)
+        now = after_slot()
         self.enable(1, "day", noon())
-        self.enable(2, "day", now - timedelta(minutes=30))  # включил недавно: ближайший срок завтра
+        self.enable(2, "day", now - timedelta(minutes=10))  # включил недавно: ближайший срок завтра
         build = AsyncMock(return_value=result())
         sent, bot = await self.run_cycle(now, build)
         self.assertEqual(sent, 1)
         self.assertEqual(bot.send_message.await_args.args[0], 1)
 
-    async def test_long_downtime_yields_one_catch_up_edition(self):
-        now = noon() + timedelta(days=10)
+    async def test_slot_missed_within_grace_is_still_delivered_once(self):
         self.enable(1, "day", noon())
         build = AsyncMock(return_value=result())
-        sent, _ = await self.run_cycle(now, build)
+        sent, _ = await self.run_cycle(after_slot(minutes=feed.FEED_AUTODELIVERY_GRACE_MINUTES - 1), build)  # например, рестарт при деплое
         self.assertEqual(sent, 1)
-        sent, _ = await self.run_cycle(now + timedelta(minutes=2), build)
-        self.assertEqual((sent, build.await_count), (0, 1))
+
+    async def test_long_downtime_skips_the_stale_slot_silently_and_restarts_the_schedule(self):
+        self.enable(1, "day", noon())
+        build = AsyncMock(return_value=result())
+        now = noon() + timedelta(days=10)
+        sent, bot = await self.run_cycle(now, build)
+        self.assertEqual((sent, build.await_count), (0, 0))
+        bot.send_message.assert_not_awaited()
+        self.assertEqual(self.row(1, "day")["last_run_at"], database.serialize_datetime(utc(now)))
+        next_slot = (now + timedelta(days=1)).replace(hour=7, minute=0)
+        sent, _ = await self.run_cycle(next_slot + timedelta(minutes=5), build)
+        self.assertEqual((sent, build.await_count), (1, 1))
+
+    async def test_moving_digest_time_later_today_does_not_fire_off_schedule_or_twice(self):
+        # Последний выпуск вчера в 07:00; в 06:00 сегодня время дайджеста перенесли на 20:00 (слот «вчера 20:00» уже в прошлом).
+        yesterday_slot = (noon() - timedelta(days=1)).replace(hour=7, minute=0)
+        self.enable(1, "day", yesterday_slot - timedelta(days=3), last_run=yesterday_slot)
+        self.settings["daily"] = {"send_hour": 20, "send_minute": 0}
+        build = AsyncMock(return_value=result())
+        early = noon().replace(hour=6)
+        sent, bot = await self.run_cycle(early, build)
+        self.assertEqual((sent, build.await_count), (0, 0))
+        bot.send_message.assert_not_awaited()
+        sent, bot = await self.run_cycle(noon().replace(hour=20, minute=1), build, bot)
+        self.assertEqual((sent, bot.send_message.await_count), (1, 1))
+
+    async def test_already_building_is_retried_without_counting_a_failure(self):
+        self.enable(1, "day", noon())
+        build = AsyncMock(side_effect=[result("already_building"), result()])
+        sent, _ = await self.run_cycle(after_slot(), build)
+        self.assertEqual((sent, feed._autodelivery_failures), (0, {}))
+        self.assertIsNone(self.row(1, "day")["last_run_at"])
+        sent, _ = await self.run_cycle(after_slot(minutes=32), build)
+        self.assertEqual(sent, 1)
 
     async def test_failures_retry_then_skip_the_slot_without_user_message(self):
-        now = noon() + timedelta(days=1, hours=1)
+        now = after_slot()
         self.enable(1, "day", noon())
         build = AsyncMock(return_value=result("error", error_message="сборка не удалась"))
         bot = SimpleNamespace(send_message=AsyncMock())
@@ -198,7 +234,7 @@ class ProcessTests(AutodeliveryBase):
         bot.send_message.assert_not_awaited()
 
     async def test_success_after_failure_resets_the_counter(self):
-        now = noon() + timedelta(days=1, hours=1)
+        now = after_slot()
         self.enable(1, "day", noon())
         build = AsyncMock(side_effect=[result("timeout"), result()])
         await self.run_cycle(now, build)
@@ -207,7 +243,7 @@ class ProcessTests(AutodeliveryBase):
         self.assertEqual((sent, feed._autodelivery_failures), (1, {}))
 
     async def test_exception_in_build_counts_as_failure_and_loop_continues(self):
-        now = noon() + timedelta(days=1, hours=1)
+        now = after_slot()
         self.enable(1, "day", noon())
         self.enable(2, "day", noon())
         build = AsyncMock(side_effect=[RuntimeError("boom"), result()])
@@ -217,7 +253,7 @@ class ProcessTests(AutodeliveryBase):
         self.assertEqual(feed._autodelivery_failures, {(1, "day"): 1})
 
     async def test_send_error_is_a_retryable_failure_and_keeps_the_slot_open(self):
-        now = noon() + timedelta(days=1, hours=1)
+        now = after_slot()
         self.enable(1, "day", noon())
         bot = SimpleNamespace(send_message=AsyncMock(side_effect=TelegramAPIError(method=object(), message="flood")))
         sent, _ = await self.run_cycle(now, AsyncMock(return_value=result()), bot)
@@ -226,7 +262,7 @@ class ProcessTests(AutodeliveryBase):
         self.assertEqual(feed._autodelivery_failures, {(1, "day"): 1})
 
     async def test_unconfigured_bot_does_not_consume_the_slot(self):
-        now = noon() + timedelta(days=1, hours=1)
+        now = after_slot()
         self.enable(1, "day", noon())
         with patch("feed.build_feed_edition", new=AsyncMock(return_value=result())), patch.object(feed, "_bot", None):
             sent = await feed.process_feed_autodeliveries(now=utc(now))
@@ -235,7 +271,7 @@ class ProcessTests(AutodeliveryBase):
         self.assertEqual(feed._autodelivery_failures, {(1, "day"): 1})
 
     async def test_blocked_bot_disables_autodelivery_instead_of_retrying_forever(self):
-        now = noon() + timedelta(days=1, hours=1)
+        now = after_slot()
         self.enable(1, "day", noon())
         bot = SimpleNamespace(send_message=AsyncMock(side_effect=TelegramForbiddenError(method=object(), message="blocked")))
         build = AsyncMock(return_value=result())
@@ -248,7 +284,7 @@ class ProcessTests(AutodeliveryBase):
     async def test_empty_results_advance_the_slot_without_a_message(self):
         for status in ("empty_channels", "all_paused", "empty_posts"):
             with self.subTest(status=status):
-                now = noon() + timedelta(days=1, hours=1)
+                now = after_slot()
                 self.enable(5, "day", noon())
                 database.update_feed_autodelivery_last_run(5, "day", utc(noon()))
                 sent, bot = await self.run_cycle(now, AsyncMock(return_value=result(status)))
@@ -330,6 +366,26 @@ class ScreenTests(AutodeliveryBase):
         callbacks = [b.callback_data for row in markup.inline_keyboard for b in row]
         self.assertIn("feed_autodel_off_week", callbacks)
         self.assertNotIn("feed_autodel_off_day", callbacks)
+
+    async def test_weekly_schedule_text_is_anchored_to_activation_not_to_today(self):
+        created = noon() - timedelta(days=3)  # включена три дня назад: день недели по умолчанию — день включения
+        self.enable(1, "week", created)
+        self.settings["weekly"] = {"send_hour": 7, "send_minute": 0, "weekday": created.weekday()}
+        with patch.object(feed, "_resolve_digest_settings_fn", lambda user_id, period, now=None: {
+            "send_hour": 7, "send_minute": 0, "weekday": (now or datetime.now(TZ)).weekday(), "month_day": 1, "monthly_mode": "date",
+        }):
+            target = SimpleNamespace(answer=AsyncMock())
+            with patch.object(feed, "is_session_owner", return_value=False):
+                await feed.render_feed_main(target, 1)
+        text = target.answer.await_args.args[0]
+        self.assertIn(feed._WEEKDAY_ACC_RU[created.weekday()], text)
+        if created.weekday() != datetime.now(TZ).weekday():
+            self.assertNotIn(f"в {feed._WEEKDAY_ACC_RU[datetime.now(TZ).weekday()]} в", text)
+
+    def test_enabled_list_is_ordered_day_week_month(self):
+        for period in ("month", "week", "day"):
+            self.enable(1, period, noon())
+        self.assertEqual([r["period"] for r in database.list_user_feed_autodeliveries(1)], ["day", "week", "month"])
 
     async def test_prompt_text_names_the_digest_schedule_and_asks_confirmation(self):
         callback = CallbackTests.callback(1, "feed_autodel_prompt_day")

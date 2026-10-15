@@ -75,6 +75,7 @@ FEED_MIN_INTERVAL_SECONDS = int(os.getenv("FEED_MIN_INTERVAL_SECONDS", "60"))
 FEED_BUILD_TIMEOUT_SECONDS = int(os.getenv("FEED_BUILD_TIMEOUT_SECONDS", "120"))
 FEED_PUBLISH_TIMEOUT_SECONDS = int(os.getenv("FEED_PUBLISH_TIMEOUT_SECONDS", "30"))
 FEED_AUTODELIVERY_CHECK_SECONDS = int(os.getenv("FEED_AUTODELIVERY_CHECK_SECONDS", "120"))
+FEED_AUTODELIVERY_GRACE_MINUTES = int(os.getenv("FEED_AUTODELIVERY_GRACE_MINUTES", "90"))
 
 FEED_TO_DIGEST_PERIOD = {"day": "daily", "week": "weekly", "month": "monthly"}
 DIGEST_TO_FEED_PERIOD = {"daily": "day", "weekly": "week", "monthly": "month"}
@@ -359,6 +360,25 @@ def _get_next_digest_time(
     return candidate
 
 
+def _autodelivery_base(autodelivery_row: dict | Any) -> datetime | None:
+    """Точка отсчёта расписания: последняя доставка или момент включения (в поясе приложения)."""
+    keys = autodelivery_row.keys()
+    base_str = (autodelivery_row["last_run_at"] if "last_run_at" in keys else None) or (
+        autodelivery_row["created_at"] if "created_at" in keys else None
+    )
+    return parse_db_datetime(base_str).astimezone(TZ) if base_str else None
+
+
+def autodelivery_schedule_settings(user_id: int, period: str, autodelivery_row: dict | Any) -> dict[str, int | str] | None:
+    """Настройки дайджеста для расписания автодоставки. Без сохранённых настроек день недели/месяца по умолчанию
+    берётся от точки отсчёта, а не от «сегодня»: срок и текст на экране /feed не «плывут» по дням."""
+    digest_period = FEED_TO_DIGEST_PERIOD.get(period)
+    base_local = _autodelivery_base(autodelivery_row)
+    if not digest_period or base_local is None:
+        return None
+    return _resolve_digest_settings(user_id, digest_period, now=base_local)
+
+
 def get_autodelivery_due_time(
     user_id: int,
     period: str,
@@ -369,17 +389,13 @@ def get_autodelivery_due_time(
 
     Срок не хранится: он считается по настройкам дайджеста соответствующего периода, поэтому смена времени
     дайджеста подхватывается сама. Даты в БД — UTC, расписание — в APP_TIMEZONE. Возвращаемый срок может быть в
-    прошлом (бот простаивал): тогда выпуск придёт один раз, а `last_run_at = now` пропустит остальные пропущенные сроки.
+    прошлом (бот простаивал или сменили время дайджеста) — см. FEED_AUTODELIVERY_GRACE_MINUTES в process_feed_autodeliveries.
     """
-    keys = autodelivery_row.keys()
-    base_str = (autodelivery_row["last_run_at"] if "last_run_at" in keys else None) or (
-        autodelivery_row["created_at"] if "created_at" in keys else None
-    )
     digest_period = FEED_TO_DIGEST_PERIOD.get(period)
-    if not base_str or not digest_period:
+    base_local = _autodelivery_base(autodelivery_row)
+    settings = autodelivery_schedule_settings(user_id, period, autodelivery_row)
+    if digest_period is None or base_local is None or settings is None:
         return None
-    base_local = parse_db_datetime(base_str).astimezone(TZ)
-    settings = _resolve_digest_settings(user_id, digest_period, now=base_local)
     return _get_next_digest_time(digest_period, base_local, settings)
 
 
@@ -735,7 +751,7 @@ async def render_feed_main(target: types.Message | types.CallbackQuery, user_id:
             p = ad["period"]
             p_nom = p_names.get(p, p)
             digest_p = FEED_TO_DIGEST_PERIOD.get(p, "weekly")
-            settings = _resolve_digest_settings(user_id, digest_p)
+            settings = autodelivery_schedule_settings(user_id, p, ad) or _resolve_digest_settings(user_id, digest_p)
             sched_str = _format_digest_schedule(digest_p, settings)
             lines.append(f"🔔 <b>Автодоставка</b>: {p_nom} — {sched_str}")
     text = "\n\n".join(lines)
@@ -1500,10 +1516,18 @@ async def process_feed_autodeliveries(now: datetime | None = None) -> int:
         due_time = get_autodelivery_due_time(user_id, period, record, now=now_dt)
         if due_time is None or now_dt.astimezone(TZ) < due_time:
             continue
+        if now_dt.astimezone(TZ) - due_time > timedelta(minutes=FEED_AUTODELIVERY_GRACE_MINUTES):
+            # Слот давно прошёл (долгий простой или время дайджеста перенесли на «уже прошедшее» сегодня): не шлём
+            # внеплановый выпуск и не дублируем настоящий — отсчёт идёт заново от текущего момента.
+            logger.info("feed_autodelivery stale slot skipped user=%s period=%s due=%s", user_id, period, due_time.isoformat())
+            await _autodelivery_slot_done(user_id, period, now_dt)
+            continue
         try:
             res = await build_feed_edition(user_id, period, ignore_rate_limit=True, now=now_dt)
             if res.status in _AUTODELIVERY_EMPTY_STATUSES:
                 await _autodelivery_slot_done(user_id, period, now_dt)
+                continue
+            if res.status == "already_building":  # идёт ручная сборка этого пользователя: не считаем неудачей, повтор в следующем цикле
                 continue
             if res.status != "ok":
                 await _autodelivery_failed(user_id, period, now_dt, res.error_message or res.status)
