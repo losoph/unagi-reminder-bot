@@ -1515,14 +1515,16 @@ async def process_feed_autodeliveries(now: datetime | None = None) -> int:
                 f"из {res.channel_count} {_plural_channel(res.channel_count)}</b>\n\n"
                 f'📖 <a href="{res.telegraph_url}">Открыть</a>'
             )
-            if _bot is not None:
-                await _bot.send_message(
-                    user_id,
-                    text,
-                    parse_mode="HTML",
-                    reply_markup=build_feed_edition_keyboard(user_id, period),
-                    link_preview_options=LinkPreviewOptions(is_disabled=False),
-                )
+            if _bot is None:  # не помечаем срок обработанным: выпуск не доставлен
+                await _autodelivery_failed(user_id, period, now_dt, "bot is not configured")
+                continue
+            await _bot.send_message(
+                user_id,
+                text,
+                parse_mode="HTML",
+                reply_markup=build_feed_edition_keyboard(user_id, period),
+                link_preview_options=LinkPreviewOptions(is_disabled=False),
+            )
             await _autodelivery_slot_done(user_id, period, now_dt)
             sent_count += 1
         except TelegramForbiddenError:

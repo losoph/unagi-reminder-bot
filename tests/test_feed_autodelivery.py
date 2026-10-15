@@ -225,6 +225,15 @@ class ProcessTests(AutodeliveryBase):
         self.assertIsNone(self.row(1, "day")["last_run_at"])
         self.assertEqual(feed._autodelivery_failures, {(1, "day"): 1})
 
+    async def test_unconfigured_bot_does_not_consume_the_slot(self):
+        now = noon() + timedelta(days=1, hours=1)
+        self.enable(1, "day", noon())
+        with patch("feed.build_feed_edition", new=AsyncMock(return_value=result())), patch.object(feed, "_bot", None):
+            sent = await feed.process_feed_autodeliveries(now=utc(now))
+        self.assertEqual(sent, 0)
+        self.assertIsNone(self.row(1, "day")["last_run_at"])
+        self.assertEqual(feed._autodelivery_failures, {(1, "day"): 1})
+
     async def test_blocked_bot_disables_autodelivery_instead_of_retrying_forever(self):
         now = noon() + timedelta(days=1, hours=1)
         self.enable(1, "day", noon())
