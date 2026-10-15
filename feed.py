@@ -1030,7 +1030,7 @@ async def build_feed_edition(
                 medians_by_channel[u_chan.lower()] = med
 
             # Rank feed
-            items = rank_feed(candidates, medians_by_channel, period, now_dt)
+            items = await asyncio.to_thread(rank_feed, candidates, medians_by_channel, period, now_dt)
             if not items:
                 duration_ms = int((time.monotonic() - start_mono) * 1000)
                 logger.info(

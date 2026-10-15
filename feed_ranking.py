@@ -39,6 +39,16 @@ _TEXT_CLEAN_RE = re.compile(r"[^\w\s]", re.UNICODE)
 _SPACE_RE = re.compile(r"\s+")
 _HALF_LIVES = {"day": 12.0, "week": 72.0, "month": 240.0}
 _CAPS = {"day": 5, "week": 10, "month": 20}
+# Текстовое сравнение: порог, окно и дешёвый предварительный отсев.
+_CLUSTER_SIMILARITY = 0.6
+_CLUSTER_WINDOW_SECONDS = 36 * 3600
+_CLUSTER_TOP_TEXTS = 300
+_SHINGLE_SIZE = 6
+# Дешёвый предварительный отсев: настоящие почти-дубли делят длинные подстроки.
+# Порог намеренно низкий, чтобы не терять реальные почти-дубли; это практическая
+# оценка, а не доказанная верхняя граница, поэтому пары с экстремальными
+# посимвольными правками теоретически могут быть пропущены.
+_MIN_SHINGLE_MATCHES = 10
 
 
 @dataclass
@@ -228,27 +238,65 @@ def cluster_candidates(candidates: list[dict]) -> list[dict]:
             else:
                 keyed[("url", url)] = index
     # Текстовая кластеризация ограничена топ-300; прямой источник и URL остаются без этого лимита.
-    text_candidates = sorted(candidates, key=lambda candidate: (-candidate["score"], _tie_key(candidate["post"])))[:300]
-    normalized = [_normalized_text(str(candidate["post"].get("text") or "")) for candidate in text_candidates]
-    candidate_positions = {id(candidate): index for index, candidate in enumerate(candidates)}
-    eligible_text = [(i, text_candidates[i], text) for i, text in enumerate(normalized)
-                     if len(text) >= _CLUSTER_MIN_TEXT]
-    for left_pos, (_, left_candidate, left_text) in enumerate(eligible_text):
-        left_time = _utc(left_candidate["post"]["time"])
-        left_index = candidate_positions[id(left_candidate)]
-        matcher = difflib.SequenceMatcher(None, left_text, "")
-        for _, right_candidate, right_text in eligible_text[left_pos + 1:]:
-            right_index = candidate_positions[id(right_candidate)]
+    text_candidates = sorted(candidates, key=lambda candidate: (-candidate["score"], _tie_key(candidate["post"])))[:_CLUSTER_TOP_TEXTS]
+    positions = {id(candidate): index for index, candidate in enumerate(candidates)}
+    eligible = []
+    for order, candidate in enumerate(text_candidates):
+        text = _normalized_text(str(candidate["post"].get("text") or ""))
+        if len(text) < _CLUSTER_MIN_TEXT:
+            continue
+        eligible.append((
+            positions[id(candidate)],
+            order,
+            text,
+            _utc(candidate["post"]["time"]).timestamp(),
+            Counter(text),
+            len(text),
+            frozenset(text[start:start + _SHINGLE_SIZE] for start in range(len(text) - _SHINGLE_SIZE + 1)),
+        ))
+    # Скользящее окно по времени заменяет перебор всех пар: сравниваются ровно пары
+    # в пределах 36 ч. Ориентация ratio() сохраняется как в исходнике (a — текст,
+    # идущий раньше по score-порядку), иначе autojunk даёт другой результат.
+    eligible.sort(key=lambda entry: (entry[3], entry[0]))
+    matchers: dict[int, difflib.SequenceMatcher] = {}
+    eligible_count = len(eligible)
+    for left_pos in range(eligible_count):
+        left_index, left_order, left_text, left_time, left_chars, left_len, left_shingles = eligible[left_pos]
+        for right_pos in range(left_pos + 1, eligible_count):
+            right_index, right_order, right_text, right_time, right_chars, right_len, right_shingles = eligible[right_pos]
+            if right_time - left_time > _CLUSTER_WINDOW_SECONDS:
+                break
             if uf.find(left_index) == uf.find(right_index):
                 continue
-            if abs((left_time - _utc(right_candidate["post"]["time"])).total_seconds()) > 36 * 3600:
+            total_len = left_len + right_len
+            # Точные верхние оценки до дорогого ratio(): длины (real_quick_ratio)
+            # и мультимножество символов (quick_ratio).
+            if 2 * min(left_len, right_len) < _CLUSTER_SIMILARITY * total_len:
                 continue
-            matcher.set_seq2(right_text)
-            if matcher.quick_ratio() >= 0.6 and matcher.ratio() >= 0.6:
+            if left_text == right_text:
+                uf.union(left_index, right_index)
+                continue
+            if left_len <= right_len:
+                common = sum(min(amount, right_chars.get(char, 0)) for char, amount in left_chars.items())
+            else:
+                common = sum(min(amount, left_chars.get(char, 0)) for char, amount in right_chars.items())
+            if 2 * common < _CLUSTER_SIMILARITY * total_len:
+                continue
+            if len(left_shingles & right_shingles) < _MIN_SHINGLE_MATCHES:
+                continue
+            if left_order < right_order:
+                first_text, second_order, second_text = left_text, right_order, right_text
+            else:
+                first_text, second_order, second_text = right_text, left_order, left_text
+            matcher = matchers.get(second_order)
+            if matcher is None:
+                matcher = difflib.SequenceMatcher(None, "", second_text)
+                matchers[second_order] = matcher
+            matcher.set_seq1(first_text)
+            if matcher.ratio() >= _CLUSTER_SIMILARITY:
                 uf.union(left_index, right_index)
     groups: dict[int, list[dict]] = defaultdict(list)
     # Map identity rather than dict equality (candidate dictionaries can nest mutable objects).
-    positions = {id(candidate): i for i, candidate in enumerate(candidates)}
     for candidate in candidates:
         groups[uf.find(positions[id(candidate)])].append(candidate)
     clusters = []
