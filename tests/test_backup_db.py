@@ -20,10 +20,12 @@ class BackupDbTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.db = self.root / "bot_data.db"
-        with sqlite3.connect(self.db) as conn:
+        # `with sqlite3.connect()` только коммитит, но не закрывает: живое соединение делит WAL-индекс внутри процесса и маскирует порчу файла.
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("CREATE TABLE reminders (id INTEGER PRIMARY KEY, text TEXT)")
             conn.executemany("INSERT INTO reminders (text) VALUES (?)", [("a",), ("b",), ("c",)])
+            conn.commit()
         self.dir = self.root / "backups"
 
     def test_snapshot_is_consistent_copy_with_private_mode(self):
