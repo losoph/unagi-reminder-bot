@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import os
 import tempfile
+import threading
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -352,6 +353,38 @@ class FixesT21bTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(cancelled)
         self.assertTrue(task.done())
+        self.assertEqual(len(feed._backfill_tasks), 0)
+
+    async def test_item13_cancel_backfill_tasks_waits_for_db_thread(self):
+        """A backfill cancelled mid DB call is awaited until its worker thread stops touching SQLite."""
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        self.addCleanup(release.set)
+
+        def blocking_backfilled_at(_username):
+            started.set()
+            release.wait(5)
+            finished.set()
+            return None
+
+        with (
+            patch.object(feed, "_backfill_hook", None),
+            patch.object(feed, "_channel_source", MagicMock()),
+            patch.object(feed, "get_channel_feed_backfilled_at", blocking_backfilled_at),
+        ):
+            task = feed.schedule_channel_backfill("chan_cancel_db")
+            self.assertTrue(await asyncio.to_thread(started.wait, 5))
+
+            cancel = asyncio.create_task(feed.cancel_backfill_tasks())
+            await asyncio.sleep(0.05)
+            self.assertFalse(cancel.done(), "cancel_backfill_tasks returned while the DB thread was still running")
+
+            release.set()
+            await cancel
+
+        self.assertTrue(finished.is_set())
+        self.assertTrue(task.cancelled())
         self.assertEqual(len(feed._backfill_tasks), 0)
 
 
