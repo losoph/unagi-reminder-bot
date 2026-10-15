@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
-from collections import defaultdict
-from datetime import datetime, timezone
+import re
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+FEED_POST_CHARS = max(1, int(os.getenv("FEED_POST_CHARS", "320")))
 
-FEED_POST_CHARS = max(1, int(os.getenv("FEED_POST_CHARS", "600")))
+_MONTHS_RU = ["", "янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+_SENTENCE_END_RE = re.compile(r"[.!?…]+(?=\s|$)")
 
 
 def compact_number(value) -> str:
@@ -47,48 +50,164 @@ def _plural_ru(number: int, one: str, few: str, many: str) -> str:
 
 
 def _plural_channel(number: int) -> str:
-    return _plural_ru(number, "канала", "каналов", "каналов")
+    return _plural_ru(number, "канал", "канала", "каналов")
 
 
-def _truncate_text(text: str, limit: int) -> str:
-    text = text.strip()
+def _truncate_by_word(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    if not text:
+        return ""
     if len(text) <= limit:
         return text
-    return text[: max(0, limit - 1)].rstrip() + "…"
+    cut_limit = max(0, limit - 1)
+    last_space = text[:cut_limit].rfind(" ")
+    if last_space != -1:
+        return text[:last_space].rstrip() + "…"
+    return text[:cut_limit] + "…"
 
 
-def _first_sentence(text: str) -> tuple[str, str]:
-    for index, char in enumerate(text):
-        if char in ".!?…" and (index + 1 == len(text) or text[index + 1].isspace()):
-            return text[: index + 1].strip(), text[index + 1 :].strip()
-    return text, ""
+_ABBREVIATIONS = {"г", "руб", "коп", "ул", "д", "стр", "корп", "кв", "т", "см", "мм", "км", "кг", "шт"}
 
 
-def _post_nodes(item, rank: int, post_chars: int, tz=timezone.utc) -> list[dict]:
+def _find_sentence_boundary(text: str) -> int | None:
+    for m in _SENTENCE_END_RE.finditer(text):
+        pos = m.start()
+        prefix = text[:pos].rstrip()
+        words = prefix.split()
+        if not words:
+            continue
+        token = words[-1]
+        if len(words) == 1 and token.isdigit():
+            continue
+        if token.lower() in _ABBREVIATIONS:
+            continue
+        return m.end()
+    return None
+
+
+def _extract_title_and_rest(raw_text: str, title_limit: int = 90) -> tuple[str, str]:
+    text = raw_text.strip()
+    if not text:
+        return "", ""
+
+    newline_pos = text.find("\n")
+    punct_end = _find_sentence_boundary(text)
+
+    first_end = None
+    if newline_pos != -1 and punct_end is not None:
+        first_end = min(newline_pos, punct_end)
+    elif newline_pos != -1:
+        first_end = newline_pos
+    elif punct_end is not None:
+        first_end = punct_end
+
+    if first_end is not None:
+        candidate = text[:first_end].strip()
+        candidate_clean = " ".join(candidate.split())
+        if len(candidate_clean) <= title_limit and candidate_clean:
+            title = candidate_clean
+            if title.endswith(".") and not title.endswith("..") and not title.endswith("…"):
+                title = title[:-1].rstrip()
+            rest = text[first_end:].strip()
+            return title, rest
+
+    clean_text = " ".join(text.split())
+    if len(clean_text) <= title_limit:
+        title = clean_text
+        if title.endswith(".") and not title.endswith("..") and not title.endswith("…"):
+            title = title[:-1].rstrip()
+        return title, ""
+
+    cut_limit = max(0, title_limit - 1)
+    last_space = clean_text[:cut_limit].rfind(" ")
+    if last_space != -1:
+        title = clean_text[:last_space].rstrip() + "…"
+        rest = clean_text[last_space:].lstrip()
+    else:
+        title = clean_text[:cut_limit] + "…"
+        rest = clean_text[cut_limit:].lstrip()
+    return title, rest
+
+
+def _format_excerpt(rest: str, limit: int = 320) -> str:
+    return _truncate_by_word(rest, limit)
+
+
+def _human_badge(badge: str) -> str:
+    badge = badge.strip()
+    m_fwd = re.search(r"×(\d+)\s+пересылок", badge)
+    if m_fwd:
+        n = int(m_fwd.group(1))
+        times_str = _plural_ru(n, "раз", "раза", "раз")
+        return f"🔥 в {n} {times_str} больше пересылок, чем обычно"
+    m_reach = re.search(r"×(\d+)\s+к\s+норме", badge)
+    if m_reach:
+        n = int(m_reach.group(1))
+        times_str = _plural_ru(n, "раз", "раза", "раз")
+        return f"🔥 в {n} {times_str} больше просмотров, чем обычно"
+    if badge == "🆕":
+        return "🆕 Свежее"
+    return badge
+
+
+def _format_post_time(post_time: datetime, now: datetime, tz=timezone.utc) -> str:
+    p_tz = _aware_utc(post_time).astimezone(tz)
+    n_tz = _aware_utc(now).astimezone(tz)
+    p_date = p_tz.date()
+    n_date = n_tz.date()
+    if p_date == n_date:
+        return f"сегодня, {p_tz:%H:%M}"
+    if p_date == n_date - timedelta(days=1):
+        return f"вчера, {p_tz:%H:%M}"
+    return f"{p_tz.day} {_MONTHS_RU[p_tz.month]}, {p_tz:%H:%M}"
+
+
+def _post_nodes(item, post_chars: int, now: datetime, tz=timezone.utc) -> list[dict]:
     post = item.post
-    title = str(item.channel_title or post.get("channel_username") or "Канал")
-    nodes = [{"tag": "h4", "children": [f"{rank}. {title}"]}]
-    time_value = _aware_utc(post["time"]).astimezone(tz)
-    parts = [f"👁 {compact_number(post.get('views'))}", f"↗️ {compact_number(post.get('forwards'))}"]
+    raw_text = str(post.get("text") or "")
+    title, rest = _extract_title_and_rest(raw_text)
+    channel_name = str(item.channel_title or post.get("channel_username") or "Канал")
+    if not title:
+        title = channel_name
+
+    nodes: list[dict] = [{"tag": "h4", "children": [title]}]
+
+    time_str = _format_post_time(post["time"], now, tz)
+    nodes.append({"tag": "p", "children": [{"tag": "i", "children": [f"{channel_name} · {time_str}"]}]})
+
+    excerpt = _format_excerpt(rest, post_chars)
+    if excerpt:
+        nodes.append({"tag": "blockquote", "children": [excerpt]})
+
+    metrics = []
+    if post.get("views") is not None:
+        metrics.append(f"👁 {compact_number(post['views'])}")
+    if post.get("forwards") is not None:
+        metrics.append(f"↗ {compact_number(post['forwards'])}")
     if post.get("reactions_total") is not None:
-        parts.append(f"❤️ {compact_number(post['reactions_total'])}")
+        metrics.append(f"❤ {compact_number(post['reactions_total'])}")
     if post.get("replies") is not None:
-        parts.append(f"💬 {compact_number(post['replies'])}")
-    parts.extend(item.badges or [])
-    parts.append(time_value.strftime("%d.%m %H:%M"))
-    nodes.append({"tag": "p", "children": [" · ".join(parts)]})
+        metrics.append(f"💬 {compact_number(post['replies'])}")
 
-    text = _truncate_text(str(post.get("text") or ""), post_chars)
-    if text:
-        first, rest = _first_sentence(text)
-        children = [{"tag": "b", "children": [first]}]
-        if rest:
-            children.append(" " + rest)
-        nodes.append({"tag": "p", "children": children})
+    human_badges = [_human_badge(b) for b in (item.badges or [])]
+    if item.is_ad and not any("Реклама" in b for b in human_badges):
+        human_badges.append("📢 Реклама")
 
-    links = []
-    if post.get("link"):
-        links.append({"tag": "a", "attrs": {"href": str(post["link"])}, "children": ["Читать"]})
+    prefix_items = metrics + human_badges
+
+    children: list = []
+    if prefix_items:
+        prefix_text = " · ".join(prefix_items)
+        if post.get("link"):
+            children.extend([
+                prefix_text + " · ",
+                {"tag": "a", "attrs": {"href": str(post["link"])}, "children": ["Читать в канале →"]},
+            ])
+        else:
+            children.append(prefix_text)
+    elif post.get("link"):
+        children.append({"tag": "a", "attrs": {"href": str(post["link"])}, "children": ["Читать в канале →"]})
+
     unique_related = {}
     primary = str(post.get("channel_username") or "").casefold()
     for related in item.also_in:
@@ -96,24 +215,28 @@ def _post_nodes(item, rank: int, post_chars: int, tz=timezone.utc) -> list[dict]
         if not channel or channel == primary or channel in unique_related:
             continue
         unique_related[channel] = related
+
+    related_links = []
     for related in unique_related.values():
-        channel_name = str(related.get("channel_title") or related.get("channel_username") or "Канал")
+        rel_channel = str(related.get("channel_title") or related.get("channel_username") or "Канал")
         if related.get("link"):
-            links.append({"tag": "a", "attrs": {"href": str(related["link"])}, "children": [channel_name]})
-    if links:
-        children = []
-        if post.get("link"):
-            children.extend([links[0]])
-            related_links = links[1:]
+            related_links.append({"tag": "a", "attrs": {"href": str(related["link"])}, "children": [rel_channel]})
         else:
-            related_links = links
-        if related_links:
+            related_links.append(rel_channel)
+
+    if related_links:
+        if children:
             children.append(" · также в: ")
-            for index, link in enumerate(related_links):
-                if index:
-                    children.append(", ")
-                children.append(link)
+        else:
+            children.append("также в: ")
+        for idx, r_link in enumerate(related_links):
+            if idx > 0:
+                children.append(", ")
+            children.append(r_link)
+
+    if children:
         nodes.append({"tag": "p", "children": children})
+
     return nodes
 
 
@@ -127,6 +250,20 @@ def _period_range(period: str, now: datetime, tz=timezone.utc) -> str:
     start = now.timestamp() - hours * 3600
     start_dt = datetime.fromtimestamp(start, tz=timezone.utc).astimezone(tz)
     return f"{start_dt:%d.%m}–{now:%d.%m}"
+
+
+def _intro_date(period: str, now: datetime, tz=timezone.utc) -> str:
+    now_tz = _aware_utc(now).astimezone(tz)
+    if period == "day":
+        return f"{now_tz.day} {_MONTHS_RU[now_tz.month]}"
+    hours = {"week": 168, "month": 720}.get(period)
+    if hours is None:
+        raise ValueError("period должен быть day, week или month")
+    start = now_tz.timestamp() - hours * 3600
+    start_dt = datetime.fromtimestamp(start, tz=timezone.utc).astimezone(tz)
+    if start_dt.month == now_tz.month and start_dt.year == now_tz.year:
+        return f"{start_dt.day}–{now_tz.day} {_MONTHS_RU[now_tz.month]}"
+    return f"{start_dt.day} {_MONTHS_RU[start_dt.month]} – {now_tz.day} {_MONTHS_RU[now_tz.month]}"
 
 
 def build_feed_title(period: str, now: datetime, *, tz=timezone.utc) -> str:
@@ -158,12 +295,37 @@ def render_feed(
         channels.update(str(post.get("channel_username") or "").casefold() for item in items for post in item.also_in)
         channel_count = len(channels)
 
+    posts_str = f"{len(items)} {_plural_ru(len(items), 'пост', 'поста', 'постов')}"
+    channels_str = f"{channel_count} {_plural_channel(channel_count)}"
+    date_str = _intro_date(period, now, tz)
+
     nodes: list[dict] = [
-        {"tag": "p", "children": [
-            f"{len(items)} {_plural_ru(len(items), 'пост', 'поста', 'постов')} из {channel_count} {_plural_channel(channel_count)} · отбор по охвату и пересылкам · окно {_period_range(period, now, tz)}"
-        ]},
+        {"tag": "p", "children": [{"tag": "i", "children": [f"{posts_str} · {channels_str} · {date_str}"]}]},
         {"tag": "hr"},
     ]
+
+    # Блок «Главное» (h3) — первые 5 по рангу постов, если постов >= 3
+    if len(items) >= 3:
+        top_items = sorted(items, key=lambda it: it.rank)[:5]
+        nodes.append({"tag": "h3", "children": ["Главное"]})
+        li_nodes = []
+        for it in top_items:
+            p_text = str(it.post.get("text") or "")
+            t_str, _ = _extract_title_and_rest(p_text)
+            ch_name = str(it.channel_title or it.post.get("channel_username") or "Канал")
+            if not t_str:
+                t_str = ch_name
+            if it.post.get("link"):
+                title_node = {"tag": "b", "children": [{"tag": "a", "attrs": {"href": str(it.post["link"])}, "children": [t_str]}]}
+            else:
+                title_node = {"tag": "b", "children": [t_str]}
+            suffix = f" — {ch_name}"
+            if it.post.get("views") is not None:
+                suffix += f" · 👁 {compact_number(it.post['views'])}"
+            li_nodes.append({"tag": "li", "children": [title_node, suffix]})
+        nodes.append({"tag": "ol", "children": li_nodes})
+
+    # Группировка по разделам-тегам
     groups: dict[str | None, list] = defaultdict(list)
     for item in items:
         tag = str(item.tag).strip() if item.tag else None
@@ -180,22 +342,36 @@ def render_feed(
         )
     )
 
-    rank = 1
+    total_cards = sum(len(group) for _, group in ordered_groups)
+    card_index = 0
     for tag, group in ordered_groups:
-        # Внутри раздела сохраняется глобальный score-порядок, заданный rank_feed.
         group = sorted(group, key=lambda item: item.rank)
         if has_tagged:
             heading = "Без тега" if tag is None else f"#{tag} · {len(group)}"
             nodes.append({"tag": "h3", "children": [heading]})
         for item in group:
-            nodes.extend(_post_nodes(item, rank, limit, tz))
-            rank += 1
+            nodes.extend(_post_nodes(item, limit, now, tz))
+            card_index += 1
+            if card_index < total_cards:
+                nodes.append({"tag": "hr"})
+
+    # Подвал: счетчики каналов и информационные плашки
+    counts = Counter()
+    for item in items:
+        name = str(item.post.get("channel_username") or item.channel_title or "Канал").lstrip("@")
+        counts[name] += 1
+    sorted_channels = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0].casefold()))
+    if sorted_channels:
+        ch_str = ", ".join(f"{name} ({cnt})" for name, cnt in sorted_channels)
+        nodes.append({"tag": "p", "children": [f"Каналы в выпуске: {ch_str}"]})
+
     if has_web_source:
         nodes.append({"tag": "p", "children": ["ℹ️ Метрики части каналов неполные"]})
     if incomplete_channels:
         nodes.append({"tag": "p", "children": [
             f"ℹ️ Часть каналов не загрузилась: {', '.join(incomplete_channels)}"
         ]})
+
     return nodes
 
 
