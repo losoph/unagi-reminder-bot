@@ -858,12 +858,27 @@ def replace_sent_reminder_with_pending(
     send_at: str,
     text_preview: str = "",
     source_name: str = "",
+    undo: dict | None = None,
 ) -> int:
-    """Atomically insert a new pending reminder and remove the delivered row."""
+    """Atomically insert a new pending reminder and remove the delivered row.
+    If undo is provided (dict with optional original_text, original_message_id),
+    saves a snapshot of the old row to reschedule_undo_history before deleting it.
+    Any failure in snapshot rolls back the transaction.
+    """
     created_at = serialize_datetime(utc_now())
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            old_row_dict = None
+            if undo is not None:
+                row = conn.execute(
+                    "SELECT * FROM scheduled_messages WHERE id = ? AND user_id = ?",
+                    (old_db_id, user_id),
+                ).fetchone()
+                if not row:
+                    raise ValueError("Scheduled row missing or already changed")
+                old_row_dict = dict(row)
+
             # Copy tag, full_text, note, source_url from the delivered row so a reschedule keeps them.
             cur = conn.execute(
                 """
@@ -882,6 +897,42 @@ def replace_sent_reminder_with_pending(
             )
             if del_cur.rowcount != 1:
                 raise ValueError("Scheduled row missing or already changed")
+
+            if undo is not None and old_row_dict is not None:
+                original_text = undo.get("original_text", "")
+                original_message_id = undo.get("original_message_id")
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO reschedule_undo_history (
+                        new_pending_id, user_id, old_reminder_id, message_id, delivered_message_id,
+                        delivered_at, old_send_at, created_at, text_preview, source_name,
+                        tag, full_text, note, source_url, delivery_status,
+                        original_text, original_message_id, created_timestamp, is_undone
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    """,
+                    (
+                        new_id,
+                        user_id,
+                        old_row_dict["id"],
+                        old_row_dict.get("message_id"),
+                        old_row_dict.get("delivered_message_id"),
+                        old_row_dict.get("delivered_at"),
+                        old_row_dict.get("send_at"),
+                        old_row_dict.get("created_at"),
+                        old_row_dict.get("text_preview"),
+                        old_row_dict.get("source_name"),
+                        old_row_dict.get("tag"),
+                        old_row_dict.get("full_text"),
+                        old_row_dict.get("note"),
+                        old_row_dict.get("source_url"),
+                        old_row_dict.get("delivery_status") or "sent",
+                        original_text,
+                        original_message_id,
+                        datetime.now(UTC).timestamp(),
+                    ),
+                )
+
             conn.commit()
             return new_id
         except Exception:
@@ -2759,6 +2810,14 @@ def cleanup_old_records(now_str: str) -> dict[str, int]:
             """,
             (now_str,),
         ).rowcount
+        reschedule_undo_deleted = conn.execute(
+            """
+            DELETE FROM reschedule_undo_history
+            WHERE created_timestamp IS NOT NULL
+              AND created_timestamp < unixepoch(datetime(?, '-1 day'))
+            """,
+            (now_str,),
+        ).rowcount
         conn.commit()
 
     return {
@@ -2771,6 +2830,7 @@ def cleanup_old_records(now_str: str) -> dict[str, int]:
         "digest_alerts_deleted": digest_alerts_deleted,
         "ai_usage_deleted": ai_usage_deleted,
         "feed_editions_deleted": feed_editions_deleted,
+        "reschedule_undo_deleted": reschedule_undo_deleted,
     }
 
 

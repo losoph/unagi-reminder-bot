@@ -17,7 +17,6 @@ from data.database import (
     get_recent_delivered_reminder,
     get_reminder_by_id,
     replace_sent_reminder_with_pending,
-    save_reschedule_undo,
     serialize_datetime,
     undo_followup_reschedule,
     update_reminder_note,
@@ -669,18 +668,14 @@ async def handle_followup_text_reschedule(
             serialize_datetime(scheduled_time),
             preview,
             candidate.get("source_name") or "",
+            undo={
+                "original_text": text,
+                "original_message_id": message.message_id,
+            },
         )
     except Exception:
         logger.exception("replace_sent_reminder_with_pending failed in followup reschedule")
         return False
-
-    save_reschedule_undo(
-        new_pending_id=new_db_id,
-        user_id=user_id,
-        old_reminder=candidate,
-        original_text=text,
-        original_message_id=message.message_id,
-    )
 
     confirmation = (
         f"✅ Отложил «{html.escape(preview)}» на {format_when(scheduled_time, current_now)}."
