@@ -92,7 +92,7 @@ CI (`.github/workflows/deploy.yml`) на push в `main`: ruff → `docker build`
   постороннего запуска agy указывать разговор явно или начинать новый. Супервизор `agy_supervise.sh` на повторных попытках откатывает
   дерево (обрывки в `.agy/partial-*`) — если нужно сохранить работу, `AGY_KEEP_TREE=1`.
 - **Единая точка входа для агентов (с 16.10):** `tools/agents/agents.sh help` — `status`, `pick`, `run`, `check`, `watch`, `route`, `report`. Исполнитель по умолчанию — **dsh**
-  (DeepSeek Harness, `npx dsh web`, ключ хранит сам dsh); opencode — только короткие сверки и только с решением Jev (бюджет 300 тыс. токенов на спринт, `budget.json`).
+  (DeepSeek Harness, `npx dsh web`, ключ хранит сам dsh); opencode — только короткие сверки и только с решением Jev (бюджет 5 млн токенов на сессию, `budget.json`, `budget.json`).
   Приоритет экономии токенов: opencode > deepseek > Jev > Claude > agy. Подробности, калибровка расхода и эффорт Off/Low/High/Max — `tools/agents/README.md`.
 - **Простые решения через Jev:** `tools/agents/decide.sh "вопрос" вариант=описание … --default <безопасный>` — закрытый список, порог
   уверенности 0.7, эскалация к человеку (код 10); журнал `.agents/decisions.ndjson`. Только советует: push, откат прода, удаление данных

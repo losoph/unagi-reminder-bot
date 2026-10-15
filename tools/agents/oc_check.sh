@@ -5,7 +5,7 @@
 #   git -C <worktree> diff HEAD~1 -- feed.py > /tmp/ctx.diff && oc_check.sh T24c "Есть ли гонка в process_feed_autodeliveries?" /tmp/ctx.diff
 #
 # Контекст обрезается до OC_CHECK_MAX_BYTES (24000). Прогон ограничен бюджетом (oc_budget.py): лимит одного прогона —
-# OC_RUN_TOKEN_LIMIT (по умолчанию 40000 из budget.json), остаток спринта проверяется до запуска. Модель по умолчанию — из route.sh (review).
+# OC_RUN_TOKEN_LIMIT (по умолчанию из budget.json), остаток спринта проверяется до запуска. Модель по умолчанию — из route.sh (review).
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 [ $# -ge 3 ] || { echo "использование: oc_check.sh <title> \"<вопрос>\" <файл-контекст> [модель]" >&2; exit 2; }
