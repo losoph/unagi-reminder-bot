@@ -4,9 +4,10 @@ set -euo pipefail
 agy_log="${AGY_LOG_DIR:-.agy}/session.ndjson"
 oc_log="${OC_LOG:-}"
 routes="${AGENT_ROUTE_LOG:-.agents/routes.ndjson}"
-python3 - "$agy_log" "$oc_log" "$routes" <<'PY'
+decisions="${AGENT_DECISION_LOG:-.agents/decisions.ndjson}"
+python3 - "$agy_log" "$oc_log" "$routes" "$decisions" <<'PY'
 import json, os, sys
-agy_path, oc_path, route_path = sys.argv[1:]
+agy_path, oc_path, route_path, decision_path = sys.argv[1:]
 routes = {}
 jev_cost = 0.0
 jev_seen = False
@@ -59,4 +60,14 @@ for row in rows:
     print("agent={agent} title={title} selected_model={selected} actual_model={model} input={input_tokens} output={output_tokens} total={total_tokens} cost={cost}".format(selected=selected or "-", **row))
 if jev_seen:
     print(f"jev_decisions cost={jev_cost:.8f}")
+decided = human = 0
+decision_cost = 0.0
+for item in read(decision_path):
+    decided += 1
+    human += item.get("choice") == "ASK_HUMAN"
+    cost = (item.get("meta") or {}).get("cost")
+    if isinstance(cost, (int, float)):
+        decision_cost += cost
+if decided:
+    print(f"decide count={decided} human={human} cost={decision_cost:.8f}")
 PY

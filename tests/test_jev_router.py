@@ -11,6 +11,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# Личный файл ключей разработчика не должен менять результат тестов (route.sh читает его, если ключ не задан).
+os.environ.setdefault("AGENT_ENV_FILE", os.devnull)
 ROUTER = ROOT / "tools" / "agents" / "routers" / "jev_decide.py"
 ROUTE = ROOT / "tools" / "agents" / "route.sh"
 

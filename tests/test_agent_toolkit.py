@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# Личный файл ключей разработчика не должен менять результат тестов (route.sh читает его, если ключ не задан).
+os.environ.setdefault("AGENT_ENV_FILE", os.devnull)
 TOOLS = ROOT / "tools" / "agents"
 
 

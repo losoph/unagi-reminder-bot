@@ -71,6 +71,65 @@ def request_payload(task, candidates):
     return payload, encoded
 
 
+def call_jev(body, key):
+    """POST к Jev с повтором 429/529 под общим таймаутом. Возвращает (ответ, код_ошибки); коды как у decide()."""
+    url = os.environ.get("JEV_URL", "https://openrouter.ai/api/v1/systemone")
+    parsed_url = urlsplit(url)
+    if parsed_url.scheme != "https" and not (
+        parsed_url.scheme == "http" and parsed_url.hostname in {"localhost", "127.0.0.1", "::1"}
+    ):
+        print("JEV_URL должен использовать HTTPS (HTTP разрешён только для localhost)", file=sys.stderr)
+        return None, 4
+    if not parsed_url.hostname or parsed_url.username or parsed_url.password:
+        print("некорректный JEV_URL", file=sys.stderr)
+        return None, 4
+    try:
+        timeout = float(os.environ.get("JEV_TIMEOUT", "10"))
+        if timeout <= 0:
+            raise ValueError
+    except ValueError:
+        print("некорректная настройка таймаута или порога Jev", file=sys.stderr)
+        return None, 4
+    deadline = time.monotonic() + timeout
+    for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print("исчерпан общий таймаут Jev", file=sys.stderr)
+            return None, 5
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=remaining) as result:
+                return json.loads(result.read()), 0
+        except urllib.error.HTTPError as exc:
+            if exc.code in (429, 529) and attempt < 2:
+                pause = 0.2 * (2**attempt)
+                remaining = deadline - time.monotonic()
+                if remaining <= pause:
+                    time.sleep(max(remaining, 0))
+                    print("исчерпан общий таймаут Jev", file=sys.stderr)
+                    return None, 5
+                time.sleep(pause)
+                continue
+            print(f"ошибка HTTP Jev: {exc.code}", file=sys.stderr)
+            return None, 5
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # Не выводим тело/заголовки запроса: они могут содержать секреты.
+            print(f"сетевая ошибка Jev: {type(exc).__name__}", file=sys.stderr)
+            return None, 5
+        except http.client.HTTPException:
+            print("ошибка HTTP-протокола Jev", file=sys.stderr)
+            return None, 5
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            print("Jev вернул некорректный JSON", file=sys.stderr)
+            return None, 4
+    return None, 5
+
+
 def decide(task, candidates):
     key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("TYPESAFE_API_KEY")
     if not key:
@@ -83,64 +142,17 @@ def decide(task, candidates):
         print(f"не удалось подготовить запрос Jev: {exc}", file=sys.stderr)
         return 4
 
-    url = os.environ.get("JEV_URL", "https://openrouter.ai/api/v1/systemone")
-    parsed_url = urlsplit(url)
-    if parsed_url.scheme != "https" and not (
-        parsed_url.scheme == "http" and parsed_url.hostname in {"localhost", "127.0.0.1", "::1"}
-    ):
-        print("JEV_URL должен использовать HTTPS (HTTP разрешён только для localhost)", file=sys.stderr)
-        return 4
-    if not parsed_url.hostname or parsed_url.username or parsed_url.password:
-        print("некорректный JEV_URL", file=sys.stderr)
-        return 4
     try:
-        timeout = float(os.environ.get("JEV_TIMEOUT", "10"))
         min_confidence = float(os.environ.get("JEV_MIN_CONFIDENCE", "0.4"))
-        if timeout <= 0 or not 0 <= min_confidence <= 1:
+        if not 0 <= min_confidence <= 1:
             raise ValueError
     except ValueError:
         print("некорректная настройка таймаута или порога Jev", file=sys.stderr)
         return 4
     started = time.monotonic()
-    deadline = started + timeout
-    response = None
-    for attempt in range(3):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            print("исчерпан общий таймаут Jev", file=sys.stderr)
-            return 5
-        request = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=remaining) as result:
-                response = json.loads(result.read())
-            break
-        except urllib.error.HTTPError as exc:
-            if exc.code in (429, 529) and attempt < 2:
-                pause = 0.2 * (2**attempt)
-                remaining = deadline - time.monotonic()
-                if remaining <= pause:
-                    time.sleep(max(remaining, 0))
-                    print("исчерпан общий таймаут Jev", file=sys.stderr)
-                    return 5
-                time.sleep(pause)
-                continue
-            print(f"ошибка HTTP Jev: {exc.code}", file=sys.stderr)
-            return 5
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            # Не выводим тело/заголовки запроса: они могут содержать секреты.
-            print(f"сетевая ошибка Jev: {type(exc).__name__}", file=sys.stderr)
-            return 5
-        except http.client.HTTPException:
-            print("ошибка HTTP-протокола Jev", file=sys.stderr)
-            return 5
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            print("Jev вернул некорректный JSON", file=sys.stderr)
-            return 4
+    response, code = call_jev(body, key)
+    if code:
+        return code
 
     try:
         if not isinstance(response, dict):

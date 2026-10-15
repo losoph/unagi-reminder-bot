@@ -3,6 +3,8 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 POLICY="$SCRIPT_DIR/routing.json"
+. "$SCRIPT_DIR/agent_env.sh"
+agent_env_load OPENROUTER_API_KEY TYPESAFE_API_KEY
 PYTHON="${PYTHON:-python3}"
 [[ $# -ge 2 ]] || { echo "использование: route.sh <agy|opencode|claude> <task-kind> [описание] [--dry-run]" >&2; exit 2; }
 agent="$1" kind="$2"; shift 2
