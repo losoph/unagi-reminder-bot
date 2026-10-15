@@ -8,10 +8,12 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-FEED_POST_CHARS = max(1, int(os.getenv("FEED_POST_CHARS", "320")))
+FEED_POST_CHARS = max(1, int(os.getenv("FEED_POST_CHARS", "300")))
 
 _MONTHS_RU = ["", "янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+_WEEKDAYS_RU = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 _SENTENCE_END_RE = re.compile(r"[.!?…]+(?=\s|$)")
+_ABBREVIATIONS = {"г", "руб", "коп", "ул", "д", "стр", "корп", "кв", "т", "см", "мм", "км", "кг", "шт"}
 
 
 def compact_number(value) -> str:
@@ -49,8 +51,15 @@ def _plural_ru(number: int, one: str, few: str, many: str) -> str:
     return one if last == 1 else few if 2 <= last <= 4 else many
 
 
-def _plural_channel(number: int) -> str:
+def _plural_channel_nominative(number: int) -> str:
     return _plural_ru(number, "канал", "канала", "каналов")
+
+
+_plural_channel = _plural_channel_nominative
+
+
+def _plural_channel_genitive(number: int) -> str:
+    return _plural_ru(number, "канала", "каналов", "каналов")
 
 
 def _truncate_by_word(text: str, limit: int) -> str:
@@ -64,9 +73,6 @@ def _truncate_by_word(text: str, limit: int) -> str:
     if last_space != -1:
         return text[:last_space].rstrip() + "…"
     return text[:cut_limit] + "…"
-
-
-_ABBREVIATIONS = {"г", "руб", "коп", "ул", "д", "стр", "корп", "кв", "т", "см", "мм", "км", "кг", "шт"}
 
 
 def _find_sentence_boundary(text: str) -> int | None:
@@ -129,8 +135,53 @@ def _extract_title_and_rest(raw_text: str, title_limit: int = 90) -> tuple[str, 
     return title, rest
 
 
-def _format_excerpt(rest: str, limit: int = 320) -> str:
-    return _truncate_by_word(rest, limit)
+def _extract_essence(raw_text: str, title: str, max_sentences: int = 2, limit: int = 300) -> str:
+    clean_raw = " ".join(raw_text.split())
+    if not clean_raw or len(clean_raw) < len(title) + 40:
+        return ""
+
+    prefix = title.rstrip("…").strip()
+    idx = clean_raw.find(prefix) if prefix else 0
+    if idx != -1:
+        rest = clean_raw[idx + len(prefix):].lstrip(" .!?…:;-")
+    else:
+        rest = clean_raw
+
+    rest = " ".join(rest.split())
+    if not rest:
+        return ""
+
+    sentences: list[str] = []
+    current = rest
+    for _ in range(max_sentences):
+        b = _find_sentence_boundary(current)
+        if b is not None:
+            sentences.append(current[:b].strip())
+            current = current[b:].strip()
+            if not current:
+                break
+        else:
+            if current:
+                sentences.append(current.strip())
+            break
+
+    if not sentences:
+        return ""
+
+    if len(sentences) == 1:
+        text = sentences[0]
+    else:
+        combined = " ".join(sentences[:max_sentences])
+        if len(combined) <= limit:
+            text = combined
+        elif len(sentences[0]) <= limit and len(sentences[0]) >= 40:
+            text = sentences[0]
+        else:
+            text = combined
+
+    if len(text) <= limit:
+        return text
+    return _truncate_by_word(text, limit)
 
 
 def _human_badge(badge: str) -> str:
@@ -145,8 +196,16 @@ def _human_badge(badge: str) -> str:
         n = int(m_reach.group(1))
         times_str = _plural_ru(n, "раз", "раза", "раз")
         return f"🔥 в {n} {times_str} больше просмотров, чем обычно"
-    if badge == "🆕":
-        return "🆕 Свежее"
+    m_pin = re.search(r"(\d+)\s+канал", badge)
+    if m_pin:
+        n = int(m_pin.group(1))
+        return f"📌 писали {n} {_plural_channel_nominative(n)}"
+    if badge.startswith("📌"):
+        return badge
+    if "🆕" in badge:
+        return "🆕 новость"
+    if "реклама" in badge.lower():
+        return "📢 реклама"
     return badge
 
 
@@ -159,84 +218,84 @@ def _format_post_time(post_time: datetime, now: datetime, tz=timezone.utc) -> st
         return f"сегодня, {p_tz:%H:%M}"
     if p_date == n_date - timedelta(days=1):
         return f"вчера, {p_tz:%H:%M}"
-    return f"{p_tz.day} {_MONTHS_RU[p_tz.month]}, {p_tz:%H:%M}"
+    return f"{_WEEKDAYS_RU[p_tz.weekday()]} {p_tz:%d.%m, %H:%M}"
 
 
-def _post_nodes(item, post_chars: int, now: datetime, tz=timezone.utc) -> list[dict]:
+def _channel_display_name(item_or_post) -> str:
+    if hasattr(item_or_post, "channel_title") and item_or_post.channel_title:
+        return str(item_or_post.channel_title)
+    if isinstance(item_or_post, dict):
+        return str(item_or_post.get("channel_title") or item_or_post.get("channel_username") or "Канал")
+    post = getattr(item_or_post, "post", {})
+    return str(post.get("channel_title") or post.get("channel_username") or "Канал")
+
+
+def _full_card_nodes(item, post_chars: int, now: datetime, tz=timezone.utc) -> list[dict]:
     post = item.post
     raw_text = str(post.get("text") or "")
-    title, rest = _extract_title_and_rest(raw_text)
-    channel_name = str(item.channel_title or post.get("channel_username") or "Канал")
-    if not title:
-        title = channel_name
+    title, _ = _extract_title_and_rest(raw_text)
+    channel_name = _channel_display_name(item)
+
+    if not title or title.casefold() == channel_name.casefold():
+        title = "Без названия"
 
     nodes: list[dict] = [{"tag": "h4", "children": [title]}]
 
-    time_str = _format_post_time(post["time"], now, tz)
-    nodes.append({"tag": "p", "children": [{"tag": "i", "children": [f"{channel_name} · {time_str}"]}]})
+    essence = _extract_essence(raw_text, title, max_sentences=2, limit=post_chars)
+    if essence:
+        nodes.append({"tag": "p", "children": [essence]})
 
-    excerpt = _format_excerpt(rest, post_chars)
-    if excerpt:
-        nodes.append({"tag": "blockquote", "children": [excerpt]})
+    time_str = _format_post_time(post["time"], now, tz)
+    meta_children: list = [{"tag": "i", "children": [f"{channel_name} · {time_str}"]}]
+
+    primary = str(post.get("channel_username") or "").casefold()
+    unique_related = []
+    seen_channels = {primary} if primary else set()
+    for related in item.also_in:
+        rel_ch = str(related.get("channel_username") or "").casefold()
+        if not rel_ch or rel_ch in seen_channels:
+            continue
+        seen_channels.add(rel_ch)
+        unique_related.append(related)
+
+    if unique_related:
+        meta_children.append(" · также: ")
+        top_related = unique_related[:4]
+        for idx, related in enumerate(top_related):
+            if idx > 0:
+                meta_children.append(", ")
+            rel_channel = _channel_display_name(related)
+            if related.get("link"):
+                meta_children.append({"tag": "a", "attrs": {"href": str(related["link"])}, "children": [rel_channel]})
+            else:
+                meta_children.append(rel_channel)
+        if len(unique_related) > 4:
+            rem = len(unique_related) - 4
+            meta_children.append(f" (+{rem})")
+
+    if post.get("link"):
+        meta_children.append(" · ")
+        meta_children.append({"tag": "a", "attrs": {"href": str(post["link"])}, "children": ["Читать →"]})
 
     metrics = []
     if post.get("views") is not None:
         metrics.append(f"👁 {compact_number(post['views'])}")
     if post.get("forwards") is not None:
         metrics.append(f"↗ {compact_number(post['forwards'])}")
-    if post.get("reactions_total") is not None:
+    if post.get("reactions_total") is not None and post["reactions_total"] > 0:
         metrics.append(f"❤ {compact_number(post['reactions_total'])}")
-    if post.get("replies") is not None:
+    if post.get("replies") is not None and post["replies"] > 0:
         metrics.append(f"💬 {compact_number(post['replies'])}")
 
     human_badges = [_human_badge(b) for b in (item.badges or [])]
-    if item.is_ad and not any("Реклама" in b for b in human_badges):
-        human_badges.append("📢 Реклама")
+    if item.is_ad and not any("реклама" in b.lower() for b in human_badges):
+        human_badges.append("📢 реклама")
 
-    prefix_items = metrics + human_badges
+    meta_items = metrics + human_badges
+    if meta_items:
+        meta_children.append(" · " + " · ".join(meta_items))
 
-    children: list = []
-    if prefix_items:
-        prefix_text = " · ".join(prefix_items)
-        if post.get("link"):
-            children.extend([
-                prefix_text + " · ",
-                {"tag": "a", "attrs": {"href": str(post["link"])}, "children": ["Читать в канале →"]},
-            ])
-        else:
-            children.append(prefix_text)
-    elif post.get("link"):
-        children.append({"tag": "a", "attrs": {"href": str(post["link"])}, "children": ["Читать в канале →"]})
-
-    unique_related = {}
-    primary = str(post.get("channel_username") or "").casefold()
-    for related in item.also_in:
-        channel = str(related.get("channel_username") or "").casefold()
-        if not channel or channel == primary or channel in unique_related:
-            continue
-        unique_related[channel] = related
-
-    related_links = []
-    for related in unique_related.values():
-        rel_channel = str(related.get("channel_title") or related.get("channel_username") or "Канал")
-        if related.get("link"):
-            related_links.append({"tag": "a", "attrs": {"href": str(related["link"])}, "children": [rel_channel]})
-        else:
-            related_links.append(rel_channel)
-
-    if related_links:
-        if children:
-            children.append(" · также в: ")
-        else:
-            children.append("также в: ")
-        for idx, r_link in enumerate(related_links):
-            if idx > 0:
-                children.append(", ")
-            children.append(r_link)
-
-    if children:
-        nodes.append({"tag": "p", "children": children})
-
+    nodes.append({"tag": "p", "children": meta_children})
     return nodes
 
 
@@ -266,6 +325,23 @@ def _intro_date(period: str, now: datetime, tz=timezone.utc) -> str:
     return f"{start_dt.day} {_MONTHS_RU[start_dt.month]} – {now_tz.day} {_MONTHS_RU[now_tz.month]}"
 
 
+def _extract_text_nodes(node) -> list[str]:
+    texts: list[str] = []
+    if isinstance(node, str):
+        texts.append(node)
+    elif isinstance(node, dict):
+        for child in node.get("children", []):
+            texts.extend(_extract_text_nodes(child))
+    elif isinstance(node, list):
+        for item in node:
+            texts.extend(_extract_text_nodes(item))
+    return texts
+
+
+def _count_words(nodes) -> int:
+    return sum(len(text.split()) for text in _extract_text_nodes(nodes))
+
+
 def build_feed_title(period: str, now: datetime, *, tz=timezone.utc) -> str:
     labels = {"day": "день", "week": "неделю", "month": "месяц"}
     if period not in labels:
@@ -290,47 +366,59 @@ def render_feed(
     now = _aware_utc(now)
     tz = _zone(tz)
     limit = FEED_POST_CHARS if post_chars is None else max(1, post_chars)
+
     if channel_count is None:
-        channels = {str(item.post.get("channel_username") or "").casefold() for item in items}
-        channels.update(str(post.get("channel_username") or "").casefold() for item in items for post in item.also_in)
+        channels = {str(item.post.get("channel_username") or item.channel_title or "").casefold() for item in items}
+        channels.update(
+            str(post.get("channel_username") or post.get("channel_title") or "").casefold()
+            for item in items
+            for post in item.also_in
+        )
+        channels.discard("")
         channel_count = len(channels)
 
-    posts_str = f"{len(items)} {_plural_ru(len(items), 'пост', 'поста', 'постов')}"
-    channels_str = f"{channel_count} {_plural_channel(channel_count)}"
-    date_str = _intro_date(period, now, tz)
+    sorted_items = sorted(items, key=lambda it: it.rank)
 
-    nodes: list[dict] = [
-        {"tag": "p", "children": [{"tag": "i", "children": [f"{posts_str} · {channels_str} · {date_str}"]}]},
-        {"tag": "hr"},
-    ]
+    max_full = 6 if period == "day" else (8 if period == "week" else 10)
+    channel_card_counts: Counter = Counter()
+    full_items = []
+    short_candidates = []
 
-    # Блок «Главное» (h3) — первые 5 по рангу постов, если постов >= 3
+    for it in sorted_items:
+        ch_key = str(it.post.get("channel_username") or it.channel_title or "канал").strip().casefold()
+        if len(full_items) < max_full and channel_card_counts[ch_key] < 2:
+            full_items.append(it)
+            channel_card_counts[ch_key] += 1
+        else:
+            short_candidates.append(it)
+
+    body_nodes: list[dict] = []
+
     if len(items) >= 3:
-        top_items = sorted(items, key=lambda it: it.rank)[:5]
-        nodes.append({"tag": "h3", "children": ["Главное"]})
-        li_nodes = []
+        max_glavnoe = 3 if period == "day" else 5
+        top_items = sorted_items[:max_glavnoe]
+        glavnoe_li = []
         for it in top_items:
             p_text = str(it.post.get("text") or "")
-            t_str, _ = _extract_title_and_rest(p_text)
-            ch_name = str(it.channel_title or it.post.get("channel_username") or "Канал")
+            t_str, _ = _extract_title_and_rest(p_text, title_limit=90)
             if not t_str:
-                t_str = ch_name
-            if it.post.get("link"):
-                title_node = {"tag": "b", "children": [{"tag": "a", "attrs": {"href": str(it.post["link"])}, "children": [t_str]}]}
+                t_str = "Без названия"
+            essence_glavnoe = _extract_essence(p_text, t_str, max_sentences=1, limit=140)
+            b_node = {"tag": "b", "children": [t_str]}
+            if essence_glavnoe:
+                li_children = [b_node, f" — {essence_glavnoe}"]
             else:
-                title_node = {"tag": "b", "children": [t_str]}
-            suffix = f" — {ch_name}"
-            if it.post.get("views") is not None:
-                suffix += f" · 👁 {compact_number(it.post['views'])}"
-            li_nodes.append({"tag": "li", "children": [title_node, suffix]})
-        nodes.append({"tag": "ol", "children": li_nodes})
+                li_children = [b_node]
+            glavnoe_li.append({"tag": "li", "children": li_children})
+        body_nodes.append({"tag": "h3", "children": ["Главное"]})
+        body_nodes.append({"tag": "ul", "children": glavnoe_li})
 
-    # Группировка по разделам-тегам
     groups: dict[str | None, list] = defaultdict(list)
-    for item in items:
+    for item in full_items:
         tag = str(item.tag).strip() if item.tag else None
         groups[tag or None].append(item)
     has_tagged = any(tag is not None for tag in groups)
+
     ordered_groups = []
     if groups.get(None):
         ordered_groups.append((None, groups[None]))
@@ -342,38 +430,85 @@ def render_feed(
         )
     )
 
-    total_cards = sum(len(group) for _, group in ordered_groups)
+    total_full_cards = len(full_items)
     card_index = 0
-    for tag, group in ordered_groups:
-        group = sorted(group, key=lambda item: item.rank)
-        if has_tagged:
-            heading = "Без тега" if tag is None else f"#{tag} · {len(group)}"
-            nodes.append({"tag": "h3", "children": [heading]})
-        for item in group:
-            nodes.extend(_post_nodes(item, limit, now, tz))
-            card_index += 1
-            if card_index < total_cards:
-                nodes.append({"tag": "hr"})
 
-    # Подвал: счетчики каналов и информационные плашки
-    counts = Counter()
+    if not has_tagged and full_items:
+        body_nodes.append({"tag": "h3", "children": ["Сюжеты"]})
+        for item in full_items:
+            body_nodes.extend(_full_card_nodes(item, limit, now, tz))
+            card_index += 1
+            if card_index in (1, 2, 3) and card_index < total_full_cards:
+                body_nodes.append({"tag": "hr"})
+    elif has_tagged:
+        for tag, group in ordered_groups:
+            heading = "Без тега" if tag is None else f"#{tag} · {len(group)}"
+            body_nodes.append({"tag": "h3", "children": [heading]})
+            for item in group:
+                body_nodes.extend(_full_card_nodes(item, limit, now, tz))
+                card_index += 1
+                if card_index in (1, 2, 3) and card_index < total_full_cards:
+                    body_nodes.append({"tag": "hr"})
+
+    short_items = []
+    for it in short_candidates:
+        raw_text = str(it.post.get("text") or "")
+        clean_text = " ".join(raw_text.split())
+        if not it.post.get("link") or len(clean_text) < 40:
+            continue
+        short_items.append(it)
+        if len(short_items) == 25:
+            break
+
+    if short_items:
+        short_li = []
+        for it in short_items:
+            raw_text = str(it.post.get("text") or "")
+            short_title, _ = _extract_title_and_rest(raw_text, title_limit=80)
+            if not short_title:
+                short_title = "Без названия"
+            ch_name = _channel_display_name(it)
+            link_node = {"tag": "a", "attrs": {"href": str(it.post["link"])}, "children": [short_title]}
+            suffix = f" — {ch_name}"
+            if it.post.get("views") is not None:
+                suffix += f" · 👁 {compact_number(it.post['views'])}"
+            short_li.append({"tag": "li", "children": [link_node, suffix]})
+        body_nodes.append({"tag": "h3", "children": ["Коротко"]})
+        body_nodes.append({"tag": "ul", "children": short_li})
+
+    counts: Counter = Counter()
     for item in items:
-        name = str(item.post.get("channel_username") or item.channel_title or "Канал").lstrip("@")
+        name = _channel_display_name(item).lstrip("@")
         counts[name] += 1
     sorted_channels = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0].casefold()))
     if sorted_channels:
-        ch_str = ", ".join(f"{name} ({cnt})" for name, cnt in sorted_channels)
-        nodes.append({"tag": "p", "children": [f"Каналы в выпуске: {ch_str}"]})
+        if len(sorted_channels) <= 8:
+            ch_str = ", ".join(f"{name} ({cnt})" for name, cnt in sorted_channels)
+        else:
+            top_8 = sorted_channels[:8]
+            rem = len(sorted_channels) - 8
+            ch_str = ", ".join(f"{name} ({cnt})" for name, cnt in top_8) + f" · +{rem}"
+        body_nodes.append({"tag": "p", "children": [f"Каналы в выпуске: {ch_str}"]})
 
     if has_web_source:
-        nodes.append({"tag": "p", "children": ["ℹ️ Метрики части каналов неполные"]})
+        body_nodes.append({"tag": "p", "children": ["ℹ️ Метрики части каналов неполные"]})
     if incomplete_channels:
-        nodes.append({"tag": "p", "children": [
+        body_nodes.append({"tag": "p", "children": [
             f"ℹ️ Часть каналов не загрузилась: {', '.join(incomplete_channels)}"
         ]})
 
-    return nodes
+    labels = {"day": "день", "week": "неделю", "month": "месяц"}
+    date_str = _intro_date(period, now, tz)
+    posts_str = f"{len(items)} {_plural_ru(len(items), 'пост', 'поста', 'постов')}"
+    channels_str = f"{channel_count} {_plural_channel_genitive(channel_count)}"
+    intro_base = f"Лента за {labels[period]} · {date_str} — {posts_str} из {channels_str} · ≈"
+    intro_base_words = len(intro_base.split()) + 2
+    total_words = intro_base_words + _count_words(body_nodes)
+    minutes = max(1, round(total_words / 180))
+    intro_text = f"Лента за {labels[period]} · {date_str} — {posts_str} из {channels_str} · ≈{minutes} мин чтения"
+    intro_node = {"tag": "p", "children": [{"tag": "i", "children": [intro_text]}]}
+
+    return [intro_node] + body_nodes
 
 
-# Публичное имя для вызовов, следующих глагольному стилю остальных рендереров.
 build_feed_content = render_feed
