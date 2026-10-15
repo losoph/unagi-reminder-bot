@@ -735,6 +735,10 @@ def init_db():
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_feed_autodelivery_user ON feed_autodelivery(user_id)"
         )
+        try:
+            cursor.execute("ALTER TABLE feed_editions ADD COLUMN headlines TEXT")
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть
 
         _migrate_legacy_local_timestamps_to_utc(cursor)
         cursor.execute(
@@ -3369,8 +3373,9 @@ def save_feed_edition(
     telegraph_url: str,
     post_count: int,
     channel_count: int,
+    headlines: list[str] | None = None,
 ) -> int:
-    """Сохранить запись о собранном выпуске Ленты в кеш."""
+    """Сохранить запись о собранном выпуске Ленты в кеш (заголовки «Главного» — JSON, чтобы кеш-попадание не пересчитывало ранжирование)."""
     w_start = normalize_feed_datetime(window_start)
     w_end = normalize_feed_datetime(window_end)
     created_at = serialize_datetime(utc_now())
@@ -3379,9 +3384,9 @@ def save_feed_edition(
             '''
             INSERT INTO feed_editions (
                 user_id, period, window_start, window_end, subs_hash, telegraph_url,
-                post_count, channel_count, created_at
+                post_count, channel_count, created_at, headlines
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''',
             (
                 user_id,
@@ -3393,6 +3398,7 @@ def save_feed_edition(
                 post_count,
                 channel_count,
                 created_at,
+                json.dumps(headlines, ensure_ascii=False) if headlines else None,
             ),
         )
         conn.commit()
@@ -3410,7 +3416,7 @@ def get_feed_edition(
         row = conn.execute(
             '''
             SELECT id, user_id, period, window_start, window_end, subs_hash, telegraph_url,
-                   post_count, channel_count, created_at
+                   post_count, channel_count, created_at, headlines
             FROM feed_editions
             WHERE user_id = ? AND period = ? AND subs_hash = ?
             ORDER BY id DESC
@@ -3470,7 +3476,7 @@ def get_latest_feed_edition(user_id: int, period: str) -> dict | None:
         row = conn.execute(
             '''
             SELECT id, user_id, period, window_start, window_end, subs_hash, telegraph_url,
-                   post_count, channel_count, created_at
+                   post_count, channel_count, created_at, headlines
             FROM feed_editions
             WHERE user_id = ? AND period = ?
             ORDER BY created_at DESC

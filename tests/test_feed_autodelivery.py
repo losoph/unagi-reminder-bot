@@ -160,6 +160,27 @@ class ProcessTests(AutodeliveryBase):
         sent, bot = await self.run_cycle(now + timedelta(minutes=2), build, bot)
         self.assertEqual((sent, build.await_count, bot.send_message.await_count), (0, 1, 1))
 
+    async def test_delivered_message_shows_main_headlines(self):
+        now = after_slot()
+        self.enable(1, "day", noon())
+        build = AsyncMock(return_value=result(headlines=["Первый <b>", "Второй & третий"]))
+        sent, bot = await self.run_cycle(now, build)
+        self.assertEqual(sent, 1)
+        text = bot.send_message.await_args.args[1]
+        self.assertIn("Главное:", text)
+        self.assertIn("• Первый &lt;b&gt;", text)
+        self.assertIn("• Второй &amp; третий", text)
+        self.assertLess(len(text), 1000)
+
+    async def test_delivered_message_without_headlines_has_no_main_block(self):
+        now = after_slot()
+        self.enable(1, "day", noon())
+        build = AsyncMock(return_value=result())
+        sent, bot = await self.run_cycle(now, build)
+        self.assertEqual(sent, 1)
+        text = bot.send_message.await_args.args[1]
+        self.assertNotIn("Главное:", text)
+
     async def test_not_due_yet_does_nothing(self):
         self.enable(1, "day", noon())
         build = AsyncMock(return_value=result())

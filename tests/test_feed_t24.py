@@ -187,6 +187,7 @@ class FeedT24Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(res1.telegraph_url, published_url)
             self.assertEqual(res1.post_count, 1)
             self.assertEqual(res1.channel_count, 1)
+            self.assertEqual(res1.headlines, ["Отличная новость технологий для Ленты."])
             mock_pub.assert_called_once()
 
             # Verify log single line with cache=miss
@@ -200,6 +201,7 @@ class FeedT24Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(res2.status, "ok")
             self.assertTrue(res2.cached)
             self.assertEqual(res2.telegraph_url, published_url)
+            self.assertEqual(res2.headlines, res1.headlines)
             # publish_page MUST NOT be called again
             mock_pub.assert_not_called()
 
