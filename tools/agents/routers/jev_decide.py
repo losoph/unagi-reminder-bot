@@ -18,7 +18,11 @@ class DecisionError(Exception):
     """Ошибка ответа или запроса Jev."""
 
 
-def request_payload(task, candidates):
+DEFAULT_EFFORTS = {"low": "Низкий", "medium": "Средний", "high": "Высокий"}
+
+
+def request_payload(task, candidates, efforts=None):
+    efforts = efforts or DEFAULT_EFFORTS
     compact_candidates = dict(candidates)
     description = task.get("description", "")
 
@@ -41,7 +45,7 @@ def request_payload(task, candidates):
                 "effort": {
                     "type": "choice",
                     "instructions": "Какой уровень усилий нужен для этой задачи?",
-                    "criteria": {"low": "Низкий", "medium": "Средний", "high": "Высокий"},
+                    "criteria": dict(efforts),
                 },
                 "escalate": {
                     "type": "noul",
@@ -133,14 +137,15 @@ def call_jev(body, key):
     return None, 5
 
 
-def decide(task, candidates):
+def decide(task, candidates, efforts=None):
+    efforts = efforts or DEFAULT_EFFORTS
     key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("TYPESAFE_API_KEY")
     if not key:
         print("нет ключа OpenRouter", file=sys.stderr)
         return 3
 
     try:
-        payload, body = request_payload(task, candidates)
+        payload, body = request_payload(task, candidates, efforts)
     except (TypeError, ValueError, DecisionError) as exc:
         print(f"не удалось подготовить запрос Jev: {exc}", file=sys.stderr)
         return 4
@@ -170,7 +175,7 @@ def decide(task, candidates):
         confidence = float(model_answer["confidence"])
         escalate = float(escalate_answer["noul"])
         probability = float(probabilities[model])
-        if model not in candidates or effort not in ("low", "medium", "high"):
+        if model not in candidates or effort not in efforts:
             raise ValueError
         if not isinstance(probabilities, dict) or any(key not in candidates for key in probabilities):
             raise ValueError
@@ -224,6 +229,9 @@ def main():
         candidate_ids = policy["candidates"][agent]
         descriptions = policy.get("candidate_descriptions", {}).get(agent, {})
         candidates = {key: descriptions.get(key, key) for key in candidate_ids}
+        levels = (policy.get("efforts") or {}).get(agent) or (policy.get("efforts") or {}).get("default") or list(DEFAULT_EFFORTS)
+        described = (policy.get("effort_descriptions") or {}).get(agent) or (policy.get("effort_descriptions") or {}).get("default") or {}
+        efforts = {level: described.get(level) or DEFAULT_EFFORTS.get(level, level) for level in levels}
         if not isinstance(candidates, dict) or not candidates:
             raise ValueError
         if any(not isinstance(value, (dict, str)) for value in candidates.values()):
@@ -231,7 +239,7 @@ def main():
     except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError):
         print("некорректная задача или конфигурация маршрутизации", file=sys.stderr)
         return 4
-    return decide(task, candidates)
+    return decide(task, candidates, efforts)
 
 
 if __name__ == "__main__":

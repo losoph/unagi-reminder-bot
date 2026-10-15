@@ -1,6 +1,7 @@
 {
   "sprint": "economy-2026-10-16",
-  "sprint_tokens": 300000,
-  "run_tokens": 40000,
-  "min_remaining_to_start": 15000
+  "tools": {
+    "opencode": {"sprint_tokens": 300000, "run_tokens": 40000, "min_remaining_to_start": 15000},
+    "dsh": {"sprint_tokens": 3000000, "run_tokens": 400000, "min_remaining_to_start": 50000}
+  }
 }

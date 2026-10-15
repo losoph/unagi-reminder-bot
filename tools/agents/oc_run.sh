@@ -2,18 +2,31 @@
 # Запускает одно задание opencode, одновременно показывая понятную ленту и сохраняя NDJSON.
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ "$#" -lt 5 ] || [ "$#" -gt 6 ]; then
-  echo "использование: oc_run.sh <worktree> <model> <brief.md> <log.ndjson> <title> [--review]" >&2
+if [ "$#" -lt 5 ]; then
+  echo "использование: oc_run.sh <worktree> <model> <brief.md> <log.ndjson> <title> [--review] [--effort low|medium|high]" >&2
   exit 2
 fi
-WORKTREE="$1" MODEL="$2" BRIEF="$3" LOG="$4" TITLE="$5" MODE="${6:-}"
-if [ -n "$MODE" ] && [ "$MODE" != "--review" ]; then echo "неизвестный режим: $MODE" >&2; exit 2; fi
+WORKTREE="$1" MODEL="$2" BRIEF="$3" LOG="$4" TITLE="$5"; shift 5
+MODE="" EFFORT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --review) MODE="--review"; shift ;;
+    --effort) EFFORT="${2:?нужен уровень}"; shift 2 ;;
+    *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
+  esac
+done
+case "$EFFORT" in ""|low|medium|high) ;; *) echo "неверный эффорт opencode: $EFFORT (low|medium|high)" >&2; exit 2 ;; esac
 [[ "$WORKTREE" = /* ]] || WORKTREE="$PWD/$WORKTREE"
 [[ "$BRIEF" = /* ]] || BRIEF="$PWD/$BRIEF"
 [[ "$LOG" = /* ]] || LOG="$PWD/$LOG"
 [ -d "$WORKTREE" ] || { echo "worktree не найден: $WORKTREE" >&2; exit 2; }
 [ -r "$BRIEF" ] || { echo "бриф не читается: $BRIEF" >&2; exit 2; }
 mkdir -p "$(dirname "$LOG")"
+# Эффорт — вариант модели (`provider/model#variant`); без определённого варианта суффикс молча ничего не делает, поэтому отказываем.
+if [ -n "$EFFORT" ]; then
+  python3 "$SCRIPT_DIR/oc_variants.py" has "$MODEL" "$EFFORT" || { echo "у ${MODEL} нет варианта \"${EFFORT}\" в конфиге opencode: tools/agents/oc_variants.py apply" >&2; exit 5; }
+  MODEL="$MODEL#$EFFORT"
+fi
 # Режим экономии токенов: нет остатка бюджета спринта — не запускаем (OC_BUDGET=off отключает проверку осознанно).
 if [ "${OC_BUDGET:-on}" != "off" ]; then python3 "$SCRIPT_DIR/oc_budget.py" check || exit 3; fi
 cd "$WORKTREE" || exit 1

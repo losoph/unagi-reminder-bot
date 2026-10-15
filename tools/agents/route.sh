@@ -6,7 +6,7 @@ POLICY="$SCRIPT_DIR/routing.json"
 . "$SCRIPT_DIR/agent_env.sh"
 agent_env_load OPENROUTER_API_KEY TYPESAFE_API_KEY
 PYTHON="${PYTHON:-python3}"
-[[ $# -ge 2 ]] || { echo "использование: route.sh <agy|opencode|claude> <task-kind> [описание] [--dry-run]" >&2; exit 2; }
+[[ $# -ge 2 ]] || { echo "использование: route.sh <agy|opencode|dsh|claude> <task-kind> [описание] [--dry-run]" >&2; exit 2; }
 agent="$1" kind="$2"; shift 2
 dry_run=0
 args=()
@@ -18,7 +18,7 @@ for arg in "$@"; do
   esac
 done
 description="${args[*]:-}"
-case "$agent" in agy|opencode|claude) ;; *) echo "неподдерживаемый агент: $agent" >&2; exit 2;; esac
+case "$agent" in agy|opencode|dsh|claude) ;; *) echo "неподдерживаемый агент: $agent" >&2; exit 2;; esac
 task="$("$PYTHON" - "$agent" "$kind" "$description" <<'PY'
 import json, sys
 print(json.dumps({"agent": sys.argv[1], "task_kind": sys.argv[2], "title": sys.argv[3], "description": sys.argv[3]}, ensure_ascii=False))
@@ -59,6 +59,7 @@ elif [ "${AGENT_ROUTER:-}" != "static" ] && [ -z "${AGENT_ROUTER_CMD:-}" ] && [ 
 fi
 if [ -z "$parsed" ] && [ -n "${AGENT_ROUTER_CMD:-}" ]; then
   candidates="$("$PYTHON" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["candidates"]))' "$POLICY")"
+  efforts_json="$("$PYTHON" -c 'import json,sys; e=json.load(open(sys.argv[1])).get("efforts",{}); print(json.dumps(e.get(sys.argv[2]) or e.get("default") or ["low","medium","high"]))' "$POLICY" "$agent")"
   if command -v timeout >/dev/null 2>&1; then
     timeout_bin="$(command -v timeout)"
   elif command -v perl >/dev/null 2>&1; then
@@ -79,13 +80,13 @@ if [ -z "$parsed" ] && [ -n "${AGENT_ROUTER_CMD:-}" ]; then
       router_ok=0
     fi
     if [ "$router_ok" = 1 ]; then
-      if parsed="$(printf '%s' "$response" | AGENT_TASK="$task" AGENT_CANDIDATES="$candidates" "$PYTHON" -c '
+      if parsed="$(printf '%s' "$response" | AGENT_TASK="$task" AGENT_CANDIDATES="$candidates" AGENT_EFFORTS="$efforts_json" "$PYTHON" -c '
 import json, os, sys
 d=json.load(sys.stdin)
 agent=json.loads(os.environ["AGENT_TASK"])["agent"]
 choices=json.loads(os.environ["AGENT_CANDIDATES"])[agent]
 assert d["model"] in choices
-assert d["effort"] in ("low", "medium", "high")
+assert d["effort"] in json.loads(os.environ["AGENT_EFFORTS"])
 assert isinstance(d["reason"], str) and d["reason"].strip()
 print(json.dumps(d, ensure_ascii=False))
 ' 2>/dev/null)"; then
@@ -111,7 +112,8 @@ agent, kind=sys.argv[2:]
 try:
     answer=policy["tasks"][kind][agent]
     assert answer["model"] in policy["candidates"][agent]
-    assert answer["effort"] in ("low", "medium", "high")
+    efforts=policy.get("efforts", {}).get(agent) or policy.get("efforts", {}).get("default") or ["low", "medium", "high"]
+    assert answer["effort"] in efforts
 except (KeyError, AssertionError) as exc:
     raise SystemExit(f"ошибка политики маршрутизации: {exc}")
 print(json.dumps(answer, ensure_ascii=False))
