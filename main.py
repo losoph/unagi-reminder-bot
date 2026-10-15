@@ -414,6 +414,13 @@ def format_digest_schedule(period: str, settings: dict[str, int | str]) -> str:
     return f"{month_day}-го числа в {time_part}"
 
 
+feed.configure(
+    get_next_digest_time=get_next_digest_time,
+    format_digest_schedule=format_digest_schedule,
+    resolve_digest_settings=resolve_digest_settings,
+)
+
+
 def build_digest_channel_actions(sub_id: int, current_period: str, is_paused: bool = False) -> InlineKeyboardMarkup:
     if is_paused:
         toggle = InlineKeyboardButton(text="▶️ Возобновить", callback_data=f"dresume_{sub_id}")
@@ -5448,6 +5455,7 @@ async def main():
         asyncio.create_task(check_digests(), name="digest-scheduler"),
         asyncio.create_task(cleanup_database(), name="database-cleanup"),
         asyncio.create_task(run_watchdog_loop(bot), name="watchdog-monitor"),
+        asyncio.create_task(feed.run_autodelivery_loop(), name="feed-autodelivery"),
     ]
     logger.info("✅ Бот успешно запущен")
     logger.info("📋 Фоновые процессы:")
@@ -5455,6 +5463,7 @@ async def main():
     logger.info("  • Дайджесты: проверка каждые %d мин (оптимизировано с 1 мин)", DIGEST_CHECK_INTERVAL_SECONDS // 60)
     logger.info("  • Очистка БД: раз в %d часов", CLEANUP_INTERVAL_SECONDS // 3600)
     logger.info("  • Watchdog: проверка каждые %d сек", WATCHDOG_CHECK_INTERVAL_SECONDS)
+    logger.info("  • Автодоставка Ленты: проверка каждые %d сек", feed.FEED_AUTODELIVERY_CHECK_SECONDS)
     logger.info("🚀 Ожидаю входящих сообщений...")
     try:
         await dp.start_polling(bot)

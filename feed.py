@@ -18,7 +18,7 @@ import time
 from typing import Any
 
 from aiogram import F, Router, types
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -28,16 +28,23 @@ from data.database import (
     add_feed_subscription,
     count_feed_subscriptions,
     delete_feed_subscription,
+    disable_feed_autodelivery,
+    enable_feed_autodelivery,
     get_channel_feed_backfilled_at,
     get_channel_scan_cursor,
+    get_digest_settings,
+    get_feed_autodelivery,
     get_feed_candidate_posts,
     get_feed_edition,
     get_feed_subscription,
     get_feed_subscription_by_username,
     get_feed_user_onboarding_shown,
+    get_latest_feed_edition,
     get_subscription_by_id,
+    list_all_feed_autodeliveries,
     list_feed_subscriptions,
     list_feed_tags,
+    list_user_feed_autodeliveries,
     normalize_channel_username,
     normalize_feed_tag,
     parse_db_datetime,
@@ -48,6 +55,7 @@ from data.database import (
     set_feed_tag,
     set_feed_user_onboarding_shown,
     update_channel_scan_cursor,
+    update_feed_autodelivery_last_run,
     upsert_channel_posts,
     utc_now,
 )
@@ -55,6 +63,7 @@ from feed_ranking import rank_feed
 from feed_render import _plural_channel, _plural_ru, build_feed_title, render_feed
 from ranking import get_channel_medians
 from telegraph_publisher import publish_page
+from time_utils import TZ
 from user_prefs import user_tz
 
 logger = logging.getLogger(__name__)
@@ -65,15 +74,24 @@ FEED_CACHE_MINUTES = int(os.getenv("FEED_CACHE_MINUTES", "15"))
 FEED_MIN_INTERVAL_SECONDS = int(os.getenv("FEED_MIN_INTERVAL_SECONDS", "60"))
 FEED_BUILD_TIMEOUT_SECONDS = int(os.getenv("FEED_BUILD_TIMEOUT_SECONDS", "120"))
 FEED_PUBLISH_TIMEOUT_SECONDS = int(os.getenv("FEED_PUBLISH_TIMEOUT_SECONDS", "30"))
+FEED_AUTODELIVERY_CHECK_SECONDS = int(os.getenv("FEED_AUTODELIVERY_CHECK_SECONDS", "120"))
+FEED_AUTODELIVERY_GRACE_MINUTES = int(os.getenv("FEED_AUTODELIVERY_GRACE_MINUTES", "90"))
+
+FEED_TO_DIGEST_PERIOD = {"day": "daily", "week": "weekly", "month": "monthly"}
+DIGEST_TO_FEED_PERIOD = {"daily": "day", "weekly": "week", "monthly": "month"}
 
 _bot: Any = None
 _channel_source: Any = None
 _backfill_hook: Any = None
 _fetch_semaphore: asyncio.Semaphore | None = None
+_get_next_digest_time_fn: Any = None
+_format_digest_schedule_fn: Any = None
+_resolve_digest_settings_fn: Any = None
 _backfill_tasks: dict[str, asyncio.Task] = {}
 _user_build_locks: dict[int, asyncio.Lock] = {}
 _last_build_time: dict[int, float] = {}
 _building_users: set[int] = set()
+_autodelivery_failures: dict[tuple[int, str], int] = {}
 
 
 @dataclass
@@ -130,6 +148,17 @@ def build_feed_period_keyboard() -> InlineKeyboardMarkup:
 
 
 def build_feed_edition_keyboard(user_id: int, period: str) -> InlineKeyboardMarkup:
+    autodel = get_feed_autodelivery(user_id, period)
+    if autodel:
+        autodel_btn = InlineKeyboardButton(
+            text="🔕 Не присылать",
+            callback_data=f"feed_autodel_off_{period}",
+        )
+    else:
+        autodel_btn = InlineKeyboardButton(
+            text="🔔 Присылать автоматически",
+            callback_data=f"feed_autodel_prompt_{period}",
+        )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -137,9 +166,17 @@ def build_feed_edition_keyboard(user_id: int, period: str) -> InlineKeyboardMark
                 InlineKeyboardButton(text="🗓 Неделя", callback_data="feed_period_week"),
                 InlineKeyboardButton(text="📆 Месяц", callback_data="feed_period_month"),
             ],
+            [autodel_btn],
             [InlineKeyboardButton(text="🔙 К Ленте", callback_data="feed_main")],
         ]
     )
+
+
+def _parse_autodelivery_period(callback_data: str, prefix: str) -> str | None:
+    if not callback_data.startswith(prefix):
+        return None
+    period = callback_data.removeprefix(prefix)
+    return period if period in FEED_TO_DIGEST_PERIOD else None
 
 
 def get_fetch_semaphore() -> asyncio.Semaphore:
@@ -167,9 +204,13 @@ def configure(
     channel_source: Any = None,
     backfill_hook: Any = None,
     fetch_semaphore: Any = None,
+    get_next_digest_time: Any = None,
+    format_digest_schedule: Any = None,
+    resolve_digest_settings: Any = None,
 ) -> None:
     """Inject bot, channel source, backfill hook and semaphore without importing main."""
     global _bot, _channel_source, _backfill_hook, _fetch_semaphore
+    global _get_next_digest_time_fn, _format_digest_schedule_fn, _resolve_digest_settings_fn
     if bot is not None:
         _bot = bot
     if channel_source is not None:
@@ -180,6 +221,182 @@ def configure(
         _backfill_hook = backfill_hook
     if fetch_semaphore is not None:
         _fetch_semaphore = fetch_semaphore
+    if get_next_digest_time is not None:
+        _get_next_digest_time_fn = get_next_digest_time
+    if format_digest_schedule is not None:
+        _format_digest_schedule_fn = format_digest_schedule
+    if resolve_digest_settings is not None:
+        _resolve_digest_settings_fn = resolve_digest_settings
+
+
+_WEEKDAY_ACC_RU = {
+    0: "понедельник",
+    1: "вторник",
+    2: "среду",
+    3: "четверг",
+    4: "пятницу",
+    5: "субботу",
+    6: "воскресенье",
+}
+_WEEKDAY_NOM_RU = {
+    0: "понедельник",
+    1: "вторник",
+    2: "среда",
+    3: "четверг",
+    4: "пятница",
+    5: "суббота",
+    6: "воскресенье",
+}
+
+
+def _resolve_digest_settings(user_id: int, digest_period: str, now: datetime | None = None) -> dict[str, int | str]:
+    if _resolve_digest_settings_fn is not None:
+        try:
+            return _resolve_digest_settings_fn(user_id, digest_period, now=now)
+        except Exception:
+            pass
+    now_dt = now or datetime.now(TZ)
+    defaults: dict[str, int | str] = {
+        "send_hour": 7,
+        "send_minute": 0,
+        "weekday": now_dt.weekday(),
+        "month_day": now_dt.day,
+        "monthly_mode": "date",
+    }
+    try:
+        raw_stored = get_digest_settings(user_id).get(digest_period)
+        if raw_stored:
+            stored = dict(raw_stored)
+            res = dict(defaults)
+            for k in defaults:
+                if k in stored and stored[k] is not None:
+                    res[k] = stored[k]
+            return res
+    except Exception:
+        pass
+    return defaults
+
+
+def _format_digest_schedule(digest_period: str, settings: dict[str, int | str]) -> str:
+    if _format_digest_schedule_fn is not None:
+        try:
+            return _format_digest_schedule_fn(digest_period, settings)
+        except Exception:
+            pass
+    time_part = f"{int(settings.get('send_hour', 7)):02d}:{int(settings.get('send_minute', 0)):02d}"
+    if digest_period == "daily":
+        return f"каждый день в {time_part}"
+    w = int(settings.get("weekday", 0)) % 7
+    if digest_period == "weekly":
+        return f"в {_WEEKDAY_ACC_RU[w]} в {time_part}"
+    month_day = int(settings.get("month_day", 1))
+    if settings.get("monthly_mode") == "weekday":
+        occurrence = ((month_day - 1) // 7) + 1
+        return f"{occurrence}-й {_WEEKDAY_NOM_RU[w]} месяца в {time_part}"
+    return f"{month_day}-го числа в {time_part}"
+
+
+def _get_next_digest_time(
+    digest_period: str,
+    now: datetime | None = None,
+    settings: dict[str, int | str] | None = None,
+) -> datetime:
+    if _get_next_digest_time_fn is not None:
+        return _get_next_digest_time_fn(digest_period, now=now, settings=settings)
+
+    now = now or datetime.now(TZ)
+    if settings is None:
+        settings = {
+            "send_hour": 7,
+            "send_minute": 0,
+            "weekday": now.weekday(),
+            "month_day": now.day,
+            "monthly_mode": "date",
+        }
+    send_hour = int(settings.get("send_hour", 7))
+    send_minute = int(settings.get("send_minute", 0))
+
+    if digest_period == "daily":
+        candidate = now.replace(hour=send_hour, minute=send_minute, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate
+
+    if digest_period == "weekly":
+        target_weekday = int(settings.get("weekday", now.weekday()))
+        days_ahead = (target_weekday - now.weekday()) % 7
+        candidate = (now + timedelta(days=days_ahead)).replace(
+            hour=send_hour, minute=send_minute, second=0, microsecond=0
+        )
+        if candidate <= now:
+            candidate += timedelta(days=7)
+        return candidate
+
+    # monthly
+    import calendar
+    month_day = min(max(int(settings.get("month_day", now.day)), 1), 31)
+    monthly_mode = str(settings.get("monthly_mode", "date"))
+
+    def build_candidate(year: int, month: int) -> datetime:
+        if monthly_mode == "weekday":
+            target_weekday = int(settings.get("weekday", now.weekday()))
+            month_days = calendar.monthrange(year, month)[1]
+            matching_days = [
+                day for day in range(1, month_days + 1)
+                if datetime(year, month, day, tzinfo=TZ).weekday() == target_weekday
+            ]
+            occurrence = ((month_day - 1) // 7) + 1
+            idx = min(max(occurrence, 1), len(matching_days)) - 1
+            day = matching_days[idx] if matching_days else 1
+        else:
+            day = min(month_day, calendar.monthrange(year, month)[1])
+        return datetime(year, month, day, send_hour, send_minute, tzinfo=TZ)
+
+    candidate = build_candidate(now.year, now.month)
+    if candidate <= now:
+        year = now.year + (1 if now.month == 12 else 0)
+        month = 1 if now.month == 12 else now.month + 1
+        candidate = build_candidate(year, month)
+    return candidate
+
+
+def _autodelivery_base(autodelivery_row: dict | Any) -> datetime | None:
+    """Точка отсчёта расписания: последняя доставка или момент включения (в поясе приложения)."""
+    keys = autodelivery_row.keys()
+    base_str = (autodelivery_row["last_run_at"] if "last_run_at" in keys else None) or (
+        autodelivery_row["created_at"] if "created_at" in keys else None
+    )
+    return parse_db_datetime(base_str).astimezone(TZ) if base_str else None
+
+
+def autodelivery_schedule_settings(user_id: int, period: str, autodelivery_row: dict | Any) -> dict[str, int | str] | None:
+    """Настройки дайджеста для расписания автодоставки. Без сохранённых настроек день недели/месяца по умолчанию
+    берётся от точки отсчёта, а не от «сегодня»: срок и текст на экране /feed не «плывут» по дням."""
+    digest_period = FEED_TO_DIGEST_PERIOD.get(period)
+    base_local = _autodelivery_base(autodelivery_row)
+    if not digest_period or base_local is None:
+        return None
+    return _resolve_digest_settings(user_id, digest_period, now=base_local)
+
+
+def get_autodelivery_due_time(
+    user_id: int,
+    period: str,
+    autodelivery_row: dict | Any,
+    now: datetime | None = None,
+) -> datetime | None:
+    """Ближайший срок автодоставки после последней доставки (или после включения); None, если считать нечего.
+
+    Срок не хранится: он считается по настройкам дайджеста соответствующего периода, поэтому смена времени
+    дайджеста подхватывается сама. Даты в БД — UTC, расписание — в APP_TIMEZONE. Возвращаемый срок может быть в
+    прошлом (бот простаивал или сменили время дайджеста) — см. FEED_AUTODELIVERY_GRACE_MINUTES в process_feed_autodeliveries.
+    """
+    digest_period = FEED_TO_DIGEST_PERIOD.get(period)
+    base_local = _autodelivery_base(autodelivery_row)
+    settings = autodelivery_schedule_settings(user_id, period, autodelivery_row)
+    if digest_period is None or base_local is None or settings is None:
+        return None
+    return _get_next_digest_time(digest_period, base_local, settings)
 
 
 async def _run_db_call(func: Any, /, *args: Any) -> Any:
@@ -385,7 +602,11 @@ def set_cached_personal_channels(user_id: int, channels: list[dict]) -> None:
     _personal_channels_cache[user_id] = (now_ts, channels)
 
 
-def build_feed_main_keyboard(total_channels: int, show_personal_btn: bool = False) -> InlineKeyboardMarkup:
+def build_feed_main_keyboard(
+    total_channels: int,
+    show_personal_btn: bool = False,
+    autodeliveries: list[dict] | None = None,
+) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(text="☀️ День", callback_data="feed_period_day"),
@@ -403,6 +624,17 @@ def build_feed_main_keyboard(total_channels: int, show_personal_btn: bool = Fals
         rows.append([
             InlineKeyboardButton(text="➕ Из моих подписок", callback_data="feed_personal")
         ])
+    if autodeliveries:
+        p_names = {"day": "день", "week": "неделю", "month": "месяц"}
+        for ad in autodeliveries:
+            p = ad["period"]
+            p_name = p_names.get(p, p)
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"🔕 Отключить автодоставку ({p_name})",
+                    callback_data=f"feed_autodel_off_{p}",
+                )
+            ])
     rows.append([
         InlineKeyboardButton(text="ℹ️ Как добавить", callback_data="feed_help")
     ])
@@ -486,14 +718,15 @@ async def render_personal_channels(
         )
         kb = build_personal_channels_keyboard(user_id, channels)
 
-    if edit and isinstance(target, types.CallbackQuery) and target.message:
+    is_cb = isinstance(target, types.CallbackQuery)
+    if edit and is_cb and target.message:
         try:
             await target.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
             return
         except TelegramAPIError:
             pass
 
-    if isinstance(target, types.CallbackQuery) and target.message:
+    if is_cb and target.message:
         await target.message.answer(text, parse_mode="HTML", reply_markup=kb)
     elif hasattr(target, "answer"):
         await target.answer(text, parse_mode="HTML", reply_markup=kb)
@@ -509,17 +742,30 @@ async def render_feed_main(target: types.Message | types.CallbackQuery, user_id:
             return
 
     total = count_feed_subscriptions(user_id, include_paused=True)
-    text = f"📰 <b>Лента</b> — главное из {total} каналов"
-    kb = build_feed_main_keyboard(total, show_personal_btn=is_owner)
+    autodeliveries = await asyncio.to_thread(list_user_feed_autodeliveries, user_id)
 
-    if edit and isinstance(target, types.CallbackQuery) and target.message:
+    lines = [f"📰 <b>Лента</b> — главное из {total} каналов"]
+    if autodeliveries:
+        p_names = {"day": "день", "week": "неделя", "month": "месяц"}
+        for ad in autodeliveries:
+            p = ad["period"]
+            p_nom = p_names.get(p, p)
+            digest_p = FEED_TO_DIGEST_PERIOD.get(p, "weekly")
+            settings = autodelivery_schedule_settings(user_id, p, ad) or _resolve_digest_settings(user_id, digest_p)
+            sched_str = _format_digest_schedule(digest_p, settings)
+            lines.append(f"🔔 <b>Автодоставка</b>: {p_nom} — {sched_str}")
+    text = "\n\n".join(lines)
+    kb = build_feed_main_keyboard(total, show_personal_btn=is_owner, autodeliveries=autodeliveries)
+
+    is_cb = isinstance(target, types.CallbackQuery)
+    if edit and is_cb and target.message:
         try:
             await target.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
             return
         except TelegramAPIError:
             pass
 
-    if isinstance(target, types.CallbackQuery) and target.message:
+    if is_cb and target.message:
         await target.message.answer(text, parse_mode="HTML", reply_markup=kb)
     elif hasattr(target, "answer"):
         await target.answer(text, parse_mode="HTML", reply_markup=kb)
@@ -1115,6 +1361,225 @@ async def cb_feed_period(callback: types.CallbackQuery):
                 await callback.message.edit_text(err_text, parse_mode="HTML", reply_markup=kb)
             except TelegramAPIError:
                 await callback.message.answer(err_text, parse_mode="HTML", reply_markup=kb)
+
+
+# ---------------------------------------------------------------------------
+# Autodelivery UX and Execution (T24c)
+# ---------------------------------------------------------------------------
+
+
+async def show_edition_or_feed(callback: types.CallbackQuery, user_id: int, period: str):
+    """Restore feed edition message or fall back to /feed main screen."""
+    latest = await asyncio.to_thread(get_latest_feed_edition, user_id, period)
+    if latest and callback.message:
+        text = format_feed_edition_message(
+            period,
+            latest.get("post_count") or 0,
+            latest.get("channel_count") or 0,
+            latest.get("telegraph_url") or "",
+        )
+        kb = build_feed_edition_keyboard(user_id, period)
+        try:
+            await callback.message.edit_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=kb,
+                link_preview_options=LinkPreviewOptions(is_disabled=False),
+            )
+            return
+        except TelegramAPIError:
+            pass
+    await render_feed_main(callback, user_id, edit=True)
+
+
+@router.callback_query(F.data.startswith("feed_autodel_prompt_"))
+async def cb_feed_autodel_prompt(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    period = _parse_autodelivery_period(callback.data, "feed_autodel_prompt_")
+    if period is None:
+        await callback.answer("Эта кнопка устарела. Открой /feed и выбери выпуск снова.", show_alert=True)
+        return
+    if await asyncio.to_thread(get_feed_autodelivery, user_id, period):
+        await callback.answer("Автодоставка уже включена.", show_alert=True)
+        await show_edition_or_feed(callback, user_id, period)
+        return
+
+    p_acc = {"day": "день", "week": "неделю", "month": "месяц"}.get(period, period)
+    digest_p = FEED_TO_DIGEST_PERIOD.get(period, "weekly")
+    settings = _resolve_digest_settings(user_id, digest_p)
+    sched_str = _format_digest_schedule(digest_p, settings)
+    text = (
+        f"Лента за {p_acc} будет приходить {sched_str} — в то же время, "
+        f"что дайджест этого периода (меняется в настройках дайджеста)"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Включить", callback_data=f"feed_autodel_confirm_{period}"),
+                InlineKeyboardButton(text="Отмена", callback_data=f"feed_autodel_cancel_{period}"),
+            ]
+        ]
+    )
+    if callback.message:
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramAPIError:
+            pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("feed_autodel_confirm_"))
+async def cb_feed_autodel_confirm(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    period = _parse_autodelivery_period(callback.data, "feed_autodel_confirm_")
+    if period is None:
+        await callback.answer("Эта кнопка устарела. Открой /feed и выбери выпуск снова.", show_alert=True)
+        return
+
+    await asyncio.to_thread(enable_feed_autodelivery, user_id, period)
+    p_acc = {"day": "день", "week": "неделю", "month": "месяц"}.get(period, period)
+    await callback.answer(f"✅ Автодоставка за {p_acc} включена!", show_alert=True)
+    await show_edition_or_feed(callback, user_id, period)
+
+
+@router.callback_query(F.data.startswith("feed_autodel_cancel_"))
+async def cb_feed_autodel_cancel(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    period = _parse_autodelivery_period(callback.data, "feed_autodel_cancel_")
+    if period is None:
+        await callback.answer("Эта кнопка устарела. Открой /feed и выбери выпуск снова.", show_alert=True)
+        return
+
+    await callback.answer()
+    await show_edition_or_feed(callback, user_id, period)
+
+
+@router.callback_query(F.data.startswith("feed_autodel_off_"))
+async def cb_feed_autodel_off(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    period = _parse_autodelivery_period(callback.data, "feed_autodel_off_")
+    if period is None:
+        await callback.answer("Эта кнопка устарела. Открой /feed и выбери выпуск снова.", show_alert=True)
+        return
+
+    await asyncio.to_thread(disable_feed_autodelivery, user_id, period)
+    p_acc = {"day": "день", "week": "неделю", "month": "месяц"}.get(period, period)
+    await callback.answer(f"🔕 Автодоставка за {p_acc} отключена.", show_alert=True)
+
+    if callback.message and "главное из" in (callback.message.text or ""):
+        await render_feed_main(callback, user_id, edit=True)
+    else:
+        kb = build_feed_edition_keyboard(user_id, period)
+        if callback.message:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=kb)
+            except TelegramAPIError:
+                await show_edition_or_feed(callback, user_id, period)
+
+
+AUTODELIVERY_MAX_FAILURES = 3
+_AUTODELIVERY_EMPTY_STATUSES = ("empty_channels", "all_paused", "empty_posts")
+
+
+async def _autodelivery_slot_done(user_id: int, period: str, now_dt: datetime) -> None:
+    """Срок обработан (доставлен, пуст или пропущен): следующий считается от этого момента."""
+    await asyncio.to_thread(update_feed_autodelivery_last_run, user_id, period, now_dt)
+    _autodelivery_failures.pop((user_id, period), None)
+
+
+async def _autodelivery_failed(user_id: int, period: str, now_dt: datetime, reason: Any) -> None:
+    """Неудача: повтор в следующем цикле, после AUTODELIVERY_MAX_FAILURES — пропуск до следующего срока (без сообщения)."""
+    key = (user_id, period)
+    failures = _autodelivery_failures.get(key, 0) + 1
+    _autodelivery_failures[key] = failures
+    logger.warning("feed_autodelivery failed user=%s period=%s attempt=%d/%d: %s", user_id, period, failures, AUTODELIVERY_MAX_FAILURES, reason)
+    if failures >= AUTODELIVERY_MAX_FAILURES:
+        logger.warning("feed_autodelivery skipping to next slot user=%s period=%s", user_id, period)
+        await _autodelivery_slot_done(user_id, period, now_dt)
+
+
+async def process_feed_autodeliveries(now: datetime | None = None) -> int:
+    """Выполняет наступившие автодоставки; возвращает число отправленных выпусков.
+
+    Один выпуск на срок: после отправки `last_run_at = now`, и следующий срок считается уже от него. Если процесс упадёт
+    между отправкой и записью, возможен один дубль — это осознанно предпочтено потерянному выпуску.
+    """
+    now_dt = now or utc_now()
+    records = await asyncio.to_thread(list_all_feed_autodeliveries)
+    live = {(record["user_id"], record["period"]) for record in records}
+    for key in [key for key in _autodelivery_failures if key not in live]:
+        del _autodelivery_failures[key]
+
+    sent_count = 0
+    for record in records:
+        user_id, period = record["user_id"], record["period"]
+        due_time = get_autodelivery_due_time(user_id, period, record, now=now_dt)
+        if due_time is None or now_dt.astimezone(TZ) < due_time:
+            continue
+        if now_dt.astimezone(TZ) - due_time > timedelta(minutes=FEED_AUTODELIVERY_GRACE_MINUTES):
+            # Слот давно прошёл (долгий простой или время дайджеста перенесли на «уже прошедшее» сегодня): не шлём
+            # внеплановый выпуск и не дублируем настоящий — отсчёт идёт заново от текущего момента.
+            logger.info("feed_autodelivery stale slot skipped user=%s period=%s due=%s", user_id, period, due_time.isoformat())
+            await _autodelivery_slot_done(user_id, period, now_dt)
+            continue
+        try:
+            res = await build_feed_edition(user_id, period, ignore_rate_limit=True, now=now_dt)
+            if res.status in _AUTODELIVERY_EMPTY_STATUSES:
+                await _autodelivery_slot_done(user_id, period, now_dt)
+                continue
+            if res.status == "already_building":  # идёт ручная сборка этого пользователя: не считаем неудачей, повтор в следующем цикле
+                continue
+            if res.status != "ok":
+                await _autodelivery_failed(user_id, period, now_dt, res.error_message or res.status)
+                continue
+            p_label = {"day": "день", "week": "неделю", "month": "месяц"}[period]
+            text = (
+                f"🔔 <b>Автодоставка</b>\n"
+                f"📰 <b>Лента за {p_label} · {res.post_count} {_plural_ru(res.post_count, 'пост', 'поста', 'постов')} "
+                f"из {res.channel_count} {_plural_channel(res.channel_count)}</b>\n\n"
+                f'📖 <a href="{res.telegraph_url}">Открыть</a>'
+            )
+            if _bot is None:  # не помечаем срок обработанным: выпуск не доставлен
+                await _autodelivery_failed(user_id, period, now_dt, "bot is not configured")
+                continue
+            await _bot.send_message(
+                user_id,
+                text,
+                parse_mode="HTML",
+                reply_markup=build_feed_edition_keyboard(user_id, period),
+                link_preview_options=LinkPreviewOptions(is_disabled=False),
+            )
+            await _autodelivery_slot_done(user_id, period, now_dt)
+            sent_count += 1
+        except TelegramForbiddenError:
+            await asyncio.to_thread(disable_feed_autodelivery, user_id, period)
+            _autodelivery_failures.pop((user_id, period), None)
+            logger.warning("feed_autodelivery disabled: bot blocked user=%s period=%s", user_id, period)
+        except Exception as exc:  # CancelledError — BaseException и сюда не попадает
+            await _autodelivery_failed(user_id, period, now_dt, exc)
+    return sent_count
+
+
+async def run_autodelivery_loop() -> None:
+    """Background service checking and delivering feed editions."""
+    logger.info(
+        "🔔 Фоновый сервис автодоставки Ленты запущен (проверка каждые %d сек)",
+        FEED_AUTODELIVERY_CHECK_SECONDS,
+    )
+    while True:
+        try:
+            await process_feed_autodeliveries()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception(
+                "Ошибка в цикле автодоставки Ленты, повтор через %d сек",
+                FEED_AUTODELIVERY_CHECK_SECONDS,
+            )
+        try:
+            await asyncio.sleep(FEED_AUTODELIVERY_CHECK_SECONDS)
+        except asyncio.CancelledError:
+            break
 
 
 # ---------------------------------------------------------------------------
