@@ -5,7 +5,10 @@
     oc_budget.py status                # расход и остаток
     oc_budget.py add <токены> <метка> [--note текст] [--reference]   # занести расход вручную; --reference — только справочно
     oc_budget.py guard --title <метка> # фильтр NDJSON opencode: stdin → stdout, при превышении выходит с кодом 3
+    oc_budget.py snapshot              # токены opencode за сегодня по `opencode stats` (OC_STATS_CMD меняет команду)
+    oc_budget.py settle --title <метка> --before <N> [--guard-file <файл>]   # доучесть расход прогона по разнице snapshot
 
+Поток событий не содержит последний шаг прогона, поэтому после прогона расход сверяется с `opencode stats` (источник истины).
 Считается input + output + reasoning из событий step_finish (у opencode каждый шаг заново присылает весь контекст, поэтому
 длинные прогоны дорогие). Лимиты — budget.json рядом, переопределяются OC_SPRINT, OC_SPRINT_TOKEN_LIMIT, OC_RUN_TOKEN_LIMIT.
 Журнал — OC_LEDGER (по умолчанию ~/.config/agent-tools/oc-ledger.ndjson): строки {ts, sprint, title, tokens, counted}.
@@ -71,6 +74,45 @@ def step_tokens(event):
     return sum(int(tokens.get(key) or 0) for key in ("input", "output", "reasoning"))
 
 
+def stats_total():
+    """Токены opencode за сегодня (input + output + reasoning) или None, если статистика недоступна."""
+    command = os.environ.get("OC_STATS_CMD") or "opencode stats --standalone --days 0 --json"
+    try:
+        out = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60, check=False).stdout
+        tokens = json.loads(out)["tokens"]
+        return sum(int(tokens.get(key) or 0) for key in ("input", "output", "reasoning"))
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        return None
+
+
+def cmd_snapshot():
+    total = stats_total()
+    if total is None:
+        return 1
+    print(total)
+    return 0
+
+
+def cmd_settle(title, before, guard_file):
+    after = stats_total()
+    sprint, sprint_limit, _, _ = config()
+    guarded = 0
+    if guard_file:
+        try:
+            with open(guard_file, encoding="utf-8") as stream:
+                guarded = int(stream.read().strip() or 0)
+        except (OSError, ValueError):
+            guarded = 0
+    extra = 0
+    if after is not None and before is not None and after >= before:  # отрицательная разница — сменились сутки
+        extra = max((after - before) - guarded, 0)
+        if extra:
+            append(sprint, f"{title} (по opencode stats)", extra)
+    used = spent(sprint)
+    print(f"бюджет opencode: прогон ≈ {guarded + extra} токенов, спринт {used}/{sprint_limit}, остаток {max(sprint_limit - used, 0)}", file=sys.stderr)
+    return 0
+
+
 def cmd_status():
     sprint, sprint_limit, run_limit, _ = config()
     used = spent(sprint)
@@ -120,6 +162,10 @@ def cmd_guard(title):
     finally:
         if used:
             append(sprint, title, used)
+        count_file = os.environ.get("OC_GUARD_COUNT_FILE")
+        if count_file:
+            with open(count_file, "w", encoding="utf-8") as stream:
+                stream.write(str(used))
     return 0
 
 
@@ -137,6 +183,13 @@ def main(argv):
         note = rest[rest.index("--note") + 1] if "--note" in rest and rest.index("--note") + 1 < len(rest) else ""
         append(sprint, rest[1], int(rest[0]), counted="--reference" not in rest, note=note)
         return cmd_status()
+    if cmd == "snapshot":
+        return cmd_snapshot()
+    if cmd == "settle" and "--title" in rest and "--before" in rest:
+        def opt(name):
+            return rest[rest.index(name) + 1] if name in rest and rest.index(name) + 1 < len(rest) else None
+        before = opt("--before")
+        return cmd_settle(opt("--title"), int(before) if before and before.isdigit() else None, opt("--guard-file"))
     if cmd == "guard" and "--title" in rest and rest.index("--title") + 1 < len(rest):
         return cmd_guard(rest[rest.index("--title") + 1])
     print(__doc__, file=sys.stderr)

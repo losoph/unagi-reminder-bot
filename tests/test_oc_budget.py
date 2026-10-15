@@ -30,6 +30,7 @@ class OcBudgetTests(unittest.TestCase):
             "OC_SPRINT": "test-sprint",
             "OC_SPRINT_TOKEN_LIMIT": "100000",
             "OC_RUN_TOKEN_LIMIT": "50000",
+            "OC_STATS_CMD": "exit 1",  # настоящий `opencode stats` в тестах не вызываем
         }
 
     def run_budget(self, *args, input_text=None, env=None):
@@ -64,6 +65,27 @@ class OcBudgetTests(unittest.TestCase):
         self.run_budget("add", "5000000", "before economy", "--reference", "--note", "справочно")
         self.assertIn("used=0", self.run_budget("status").stdout)
         self.assertFalse(self.rows()[0]["counted"])
+
+    def stats_env(self, total):
+        stats = Path(self.tmp.name) / "stats.json"
+        stats.write_text(json.dumps({"tokens": {"input": total, "output": 0, "reasoning": 0}}), encoding="utf-8")
+        return self.env | {"OC_STATS_CMD": f"cat '{stats}'"}
+
+    def test_settle_adds_what_the_event_stream_missed(self):
+        guard_file = Path(self.tmp.name) / "guard.count"
+        guard_file.write_text("20000", encoding="utf-8")
+        before = self.run_budget("snapshot", env=self.stats_env(1000)).stdout.strip()
+        self.assertEqual(before, "1000")
+        proc = self.run_budget("settle", "--title", "T", "--before", before, "--guard-file", str(guard_file), env=self.stats_env(31000))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual([(r["title"], r["tokens"]) for r in self.rows()], [("T (по opencode stats)", 10000)])
+        self.assertIn("спринт 10000/100000", proc.stderr)
+
+    def test_settle_skips_negative_delta_and_missing_stats(self):
+        self.run_budget("settle", "--title", "day-rollover", "--before", "9000", env=self.stats_env(100))
+        self.run_budget("settle", "--title", "no-stats", "--before", "100")  # OC_STATS_CMD=exit 1
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.run_budget("snapshot").returncode, 1)
 
     def test_check_refuses_when_sprint_budget_is_gone(self):
         self.assertEqual(self.run_budget("check").returncode, 0)

@@ -17,6 +17,8 @@ mkdir -p "$(dirname "$LOG")"
 # Режим экономии токенов: нет остатка бюджета спринта — не запускаем (OC_BUDGET=off отключает проверку осознанно).
 if [ "${OC_BUDGET:-on}" != "off" ]; then python3 "$SCRIPT_DIR/oc_budget.py" check || exit 3; fi
 cd "$WORKTREE" || exit 1
+GUARD_COUNT="$(mktemp "${TMPDIR:-/tmp}/oc-guard.XXXXXX")"; trap 'rm -f "$GUARD_COUNT"' EXIT
+BEFORE=""; [ "${OC_BUDGET:-on}" = "off" ] || BEFORE="$(python3 "$SCRIPT_DIR/oc_budget.py" snapshot 2>/dev/null || true)"
 
 # Текст команды фиксированным ASCII: он одинаково безопасно проходит аргументы CLI и терминальные кодировки.
 MESSAGE="Read the task brief, complete it, run the relevant checks, and commit the changes locally."
@@ -26,7 +28,7 @@ fi
 
 # --standalone не использует фоновый сервис opencode: сервис может не видеть ключ провайдера текущего shell и отвечать 401.
 # Предохранитель — прямой потомок этого скрипта (не подоболочка), чтобы остановить соседа `opencode run` по родителю.
-GUARD=(python3 -u "$SCRIPT_DIR/oc_budget.py" guard --title "$TITLE")
+GUARD=(env OC_GUARD_COUNT_FILE="$GUARD_COUNT" python3 -u "$SCRIPT_DIR/oc_budget.py" guard --title "$TITLE")
 [ "${OC_BUDGET:-on}" != "off" ] || GUARD=(cat)
 set +e
 opencode run --standalone --auto --thinking --format json -m "$MODEL" --title "$TITLE" -f "$BRIEF" "$MESSAGE" \
@@ -37,6 +39,8 @@ set -e
 code="${codes[0]}"
 # Предохранитель оборвал поток (код 3): opencode получает SIGPIPE, фиксируем причину, а не «ошибку модели».
 [ "${codes[1]:-0}" = 3 ] && { code=3; echo "⛔ бюджет токенов opencode исчерпан — прогон остановлен" >&2; }
+# Поток не содержит последний шаг прогона: доучитываем расход по `opencode stats` (источник истины).
+[ "${OC_BUDGET:-on}" = "off" ] || python3 "$SCRIPT_DIR/oc_budget.py" settle --title "$TITLE" --before "$BEFORE" --guard-file "$GUARD_COUNT" || true
 python3 - "$LOG" "$TITLE" "$code" <<'PY'
 import json, sys
 with open(sys.argv[1], "a", encoding="utf-8") as log:
