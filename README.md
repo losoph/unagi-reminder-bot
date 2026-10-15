@@ -61,6 +61,8 @@ python main.py
 - `DEEPSEEK_BASE_URL` - базовый URL API DeepSeek (по умолчанию `https://api.deepseek.com`)
 - `DEEPSEEK_MODEL` - модель DeepSeek (по умолчанию `deepseek-chat`)
 - `AI_DAILY_LIMIT` - лимит ИИ-запросов в сутки на пользователя (0 = без лимита)
+- `FEED_AI_SUMMARY` - включает необязательный ИИ-обзор «Главное за период» на странице Ленты (`on` по умолчанию, `off` — выключить)
+- `FEED_AI_TIMEOUT_SECONDS` - предельное время ожидания ИИ-обзора Ленты (по умолчанию 20 секунд); при ошибке или таймауте страница публикуется без обзора
 - `MAX_IMPORT_SUBSCRIPTIONS` / `MAX_IMPORT_BOOKMARKS` / `MAX_IMPORT_REMINDERS` / `MAX_IMPORT_FILE_BYTES` - лимиты импорта JSON
 - `CHANNEL_SOURCE` - источник контента: `auto` (по умолчанию), `mtproto` или `web`
 - `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` / `TELEGRAM_USER_SESSION` - реквизиты пользовательской MTProto-сессии; при их наличии каналы читаются нативно

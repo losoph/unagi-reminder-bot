@@ -136,6 +136,55 @@ def build_feed_title(period: str, now: datetime, *, tz=timezone.utc) -> str:
     return f"Лента за {labels[period]} · {_period_range(period, now, _zone(tz))}"[:256]
 
 
+def _overview_nodes(overview: str) -> list[dict]:
+    """Блок «Главное за период» из уже очищенного ИИ-обзора."""
+    lines = [line.strip() for line in str(overview).splitlines() if line.strip()]
+    body_parts = []
+    topics = ""
+    for line in lines:
+        if line.startswith("Темы:"):
+            topics = line
+        else:
+            body_parts.append(line)
+    if not topics:
+        combined = " ".join(body_parts).strip()
+        marker = combined.find("Темы:")
+        if marker > 0:
+            body_parts = [combined[:marker].strip()]
+            topics = combined[marker:].strip()
+        elif marker == 0:
+            body_parts = []
+            topics = combined
+    body = " ".join(body_parts).strip()
+    children = []
+    if body:
+        children.append({"tag": "p", "children": [body]})
+    if topics:
+        children.append({"tag": "p", "children": [{"tag": "i", "children": [topics]}]})
+    if not children:
+        return []
+    return [
+        {"tag": "h3", "children": ["Главное за период"]},
+        {"tag": "blockquote", "children": children},
+    ]
+
+
+def _drop_glavnoe(nodes: list[dict]) -> list[dict]:
+    """Убирает детерминированный блок «Главное»: при наличии обзора он лишний."""
+    result: list[dict] = []
+    index = 0
+    while index < len(nodes):
+        node = nodes[index]
+        if node.get("tag") == "h3" and node.get("children") == ["Главное"]:
+            index += 1
+            if index < len(nodes) and nodes[index].get("tag") in ("ul", "ol"):
+                index += 1
+            continue
+        result.append(node)
+        index += 1
+    return result
+
+
 def render_feed(
     items: list,
     *,
@@ -145,6 +194,7 @@ def render_feed(
     has_web_source: bool = False,
     incomplete_channels: list[str] | None = None,
     post_chars: int | None = None,
+    overview: str | None = None,
     tz=timezone.utc,
 ) -> list[dict]:
     """Строит Telegraph nodes для уже ранжированных FeedItem без публикации и I/O."""
@@ -162,8 +212,10 @@ def render_feed(
         {"tag": "p", "children": [
             f"{len(items)} {_plural_ru(len(items), 'пост', 'поста', 'постов')} из {channel_count} {_plural_channel(channel_count)} · отбор по охвату и пересылкам · окно {_period_range(period, now, tz)}"
         ]},
-        {"tag": "hr"},
     ]
+    if overview:
+        nodes.extend(_overview_nodes(overview))
+    nodes.append({"tag": "hr"})
     groups: dict[str | None, list] = defaultdict(list)
     for item in items:
         tag = str(item.tag).strip() if item.tag else None
@@ -196,6 +248,8 @@ def render_feed(
         nodes.append({"tag": "p", "children": [
             f"ℹ️ Часть каналов не загрузилась: {', '.join(incomplete_channels)}"
         ]})
+    if overview:
+        nodes = _drop_glavnoe(nodes)
     return nodes
 
 

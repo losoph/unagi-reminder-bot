@@ -153,6 +153,7 @@ from time_utils import (  # noqa: E402
     _DAY_PART_HOURS,
     TIME_TEXT_EXAMPLES,
     TZ,
+    ai_today_key,
     build_standard_message_keyboard,
     build_time_selection_keyboard,
     describe_quick_times,
@@ -3109,7 +3110,7 @@ async def cmd_check(message: types.Message, state: FSMContext):
 
 
 def _ai_today_key() -> str:
-    return local_now().strftime("%Y-%m-%d")
+    return ai_today_key()
 
 
 def _ai_limit_reached(user_id: int) -> bool:

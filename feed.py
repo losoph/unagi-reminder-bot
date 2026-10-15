@@ -59,6 +59,7 @@ from data.database import (
     upsert_channel_posts,
     utc_now,
 )
+from feed_ai import FEED_AI_TIMEOUT_SECONDS, build_overview
 from feed_ranking import rank_feed
 from feed_render import _plural_channel, _plural_ru, build_feed_title, render_feed
 from ranking import get_channel_medians
@@ -1051,6 +1052,25 @@ async def build_feed_edition(
             # User timezone
             tz = await asyncio.to_thread(user_tz, user_id)
 
+            # Необязательный ИИ-обзор: сбой/таймаут/лимит — просто без абзаца.
+            ai_state = "off"
+            overview = None
+            try:
+                overview = await asyncio.wait_for(
+                    build_overview(items, period=period, user_id=user_id, now=now_dt),
+                    timeout=FEED_AI_TIMEOUT_SECONDS + 1,
+                )
+                if overview:
+                    ai_state = "on"
+            except (TimeoutError, asyncio.TimeoutError):
+                overview = None
+                ai_state = "fail"
+                logger.warning("feed_ai overview timeout user=%s period=%s", user_id, period)
+            except Exception:
+                overview = None
+                ai_state = "fail"
+                logger.exception("feed_ai overview failed user=%s period=%s", user_id, period)
+
             # Telegraph render and publish
             title = build_feed_title(period, now_dt, tz=tz)
             has_web = any(p.get("source") == "web" for p in candidates)
@@ -1068,6 +1088,7 @@ async def build_feed_edition(
                     )
                     for username in failed_channels
                 ],
+                overview=overview,
                 tz=tz,
             )
 
@@ -1113,7 +1134,7 @@ async def build_feed_edition(
             _last_build_time[user_id] = time.time()
             duration_ms = int((time.monotonic() - start_mono) * 1000)
             logger.info(
-                "feed_build user=%s period=%s channels=%d candidates=%d clusters=%d items=%d refreshed=%d cache=miss duration_ms=%d",
+                "feed_build user=%s period=%s channels=%d candidates=%d clusters=%d items=%d refreshed=%d cache=miss ai=%s duration_ms=%d",
                 user_id,
                 period,
                 len(unique_channels),
@@ -1121,6 +1142,7 @@ async def build_feed_edition(
                 len(items),
                 len(items),
                 total_refreshed,
+                ai_state,
                 duration_ms,
             )
 
