@@ -71,7 +71,11 @@ class FeedRenderTests(unittest.TestCase):
         self.assertEqual(compact_number(None), "—")
 
     def test_card_view_h4_is_post_title_not_channel(self):
-        rendered = render_feed([item(text="Заголовок поста важный и понятный. Текст новости дальше подробно раскрывает суть события.")], period="day", now=NOW)
+        rendered = render_feed(
+            [item(text="Заголовок поста важный и понятный. Текст новости дальше подробно раскрывает суть события.")],
+            period="day",
+            now=NOW,
+        )
         h4_nodes = [n for n in rendered if n.get("tag") == "h4"]
         self.assertEqual(len(h4_nodes), 1)
         self.assertEqual(h4_nodes[0]["children"], ["Заголовок поста важный и понятный"])
@@ -101,15 +105,15 @@ class FeedRenderTests(unittest.TestCase):
         self.assertIn("https://t.me/alpha/1", nodes)
 
     def test_word_truncation(self):
-        long_phrase = "Очень длинная первая фраза поста без знаков препинания которая точно превышает лимит девяносто символов и должна аккуратно обрезаться по слову"
+        long_phrase = "Очень длинная первая фраза поста без знаков препинания которая точно превышает лимит сто сорок символов и должна аккуратно обрезаться по границе слова с многоточием"
         t = render_feed([item(text=long_phrase)], period="day", now=NOW)
         h4_text = [n for n in t if n.get("tag") == "h4"][0]["children"][0]
-        self.assertLessEqual(len(h4_text), 90)
+        self.assertLessEqual(len(h4_text), 140)
         self.assertTrue(h4_text.endswith("…"))
         self.assertFalse(h4_text.endswith(" …"))
         self.assertTrue(h4_text[:-1] in long_phrase)
 
-        long_rest = "Короткий заголовок здесь. " + ("Слово " * 80)
+        long_rest = "Короткий заголовок здесь новости. " + ("Слово " * 80)
         nodes = render_feed([item(text=long_rest)], period="day", now=NOW)
         p_nodes = [n for n in nodes if n.get("tag") == "p"]
         essence_text = p_nodes[1]["children"][0]
@@ -117,58 +121,67 @@ class FeedRenderTests(unittest.TestCase):
         self.assertTrue(essence_text.endswith("…"))
 
     def test_title_without_dot(self):
-        t1 = render_feed([item(text="Первое предложение. Второе предложение с подробностями новости.")], period="day", now=NOW)
+        t1 = render_feed(
+            [item(text="Первое предложение без точки в конце. Второе предложение с подробностями новости для теста.")],
+            period="day",
+            now=NOW,
+        )
         h4_1 = [n for n in t1 if n.get("tag") == "h4"][0]["children"][0]
-        self.assertEqual(h4_1, "Первое предложение")
+        self.assertEqual(h4_1, "Первое предложение без точки в конце")
 
-        t2 = render_feed([item(text="Что нового в мире? Подробности в посте читайте далее.")], period="day", now=NOW)
+        t2 = render_feed(
+            [item(text="Что нового в мире технологий? Подробности в посте читайте далее в полном тексте новости.")],
+            period="day",
+            now=NOW,
+        )
         h4_2 = [n for n in t2 if n.get("tag") == "h4"][0]["children"][0]
-        self.assertEqual(h4_2, "Что нового в мире?")
+        self.assertEqual(h4_2, "Что нового в мире технологий?")
 
-        t3 = render_feed([item(text="Внимание! Это экстренное сообщение о происшествии.")], period="day", now=NOW)
+        t3 = render_feed(
+            [item(text="Внимание! Это экстренное сообщение о происшествии в городе для проверки отображения заголовка.")],
+            period="day",
+            now=NOW,
+        )
         h4_3 = [n for n in t3 if n.get("tag") == "h4"][0]["children"][0]
         self.assertEqual(h4_3, "Внимание!")
 
-        t4 = render_feed([item(text="Продолжение следует… Ждите новостей в следующем выпуске.")], period="day", now=NOW)
+        t4 = render_feed(
+            [item(text="Продолжение следует… Ждите новостей в следующем выпуске нашего регулярного дайджеста событий.")],
+            period="day",
+            now=NOW,
+        )
         h4_4 = [n for n in t4 if n.get("tag") == "h4"][0]["children"][0]
         self.assertEqual(h4_4, "Продолжение следует…")
 
     def test_block_glavnoe_thresholds(self):
-        # Меньше 3 постов — блока «Главное» нет
-        nodes_2 = render_feed([item(1, channel="c1"), item(2, channel="c2")], period="day", now=NOW)
-        self.assertFalse(any(n.get("tag") == "h3" and n.get("children") == ["Главное"] for n in nodes_2))
-        self.assertFalse(any(n.get("tag") == "ul" for n in nodes_2))
-
-        # От 3 постов — блок «Главное» (h3 + ul)
-        items_3 = [
-            item(1, channel="c1", text="Новость 1. Описание первого важного события подробно."),
-            item(2, channel="c2", text="Новость 2. Описание второго важного события подробно."),
-            item(3, channel="c3", text="Новость 3. Описание третьего важного события подробно."),
-        ]
-        nodes_3 = render_feed(items_3, period="day", now=NOW)
-        self.assertTrue(any(n.get("tag") == "h3" and n.get("children") == ["Главное"] for n in nodes_3))
-        ul_node = [n for n in nodes_3 if n.get("tag") == "ul"][0]
-        self.assertEqual(len(ul_node["children"]), 3)
-
-        # Формат пункта: <b>заголовок</b> — одно предложение сути (до 140 симв.)
-        li0 = ul_node["children"][0]
-        self.assertEqual(li0["children"][0]["tag"], "b")
-        self.assertEqual(li0["children"][0]["children"], ["Новость 1"])
-        self.assertEqual(li0["children"][1], " — Описание первого важного события подробно.")
-
-        # Для дня максимум 3 сюжета в Главном, даже если постов 7
-        items_7 = [
-            item(idx, channel=f"c{idx}", text=f"Заголовок {idx}. Описание {idx} детально расписано.")
+        # Для дня блока «Главное» нет никогда
+        items_7_day = [
+            item(idx, channel=f"c{idx}", text=f"Заголовок важной новости {idx}. Описание {idx} детально расписано в полном тексте новости для проверки.")
             for idx in range(1, 8)
         ]
-        nodes_7_day = render_feed(items_7, period="day", now=NOW)
-        ul_day = [n for n in nodes_7_day if n.get("tag") == "ul"][0]
-        self.assertEqual(len(ul_day["children"]), 3)
+        nodes_7_day = render_feed(items_7_day, period="day", now=NOW)
+        self.assertFalse(any(n.get("tag") == "h3" and n.get("children") == ["Главное"] for n in nodes_7_day))
 
-        # Для недели/месяца максимум 5 сюжетов в Главном
-        nodes_7_week = render_feed(items_7, period="week", now=NOW)
-        ul_week = [n for n in nodes_7_week if n.get("tag") == "ul"][0]
+        # Для недели: меньше 7 полных карточек — блока «Главное» нет
+        items_6_week = [
+            item(idx, channel=f"c{idx}", text=f"Заголовок важной новости {idx}. Описание {idx} детально расписано в полном тексте новости для проверки.")
+            for idx in range(1, 7)
+        ]
+        nodes_6_week = render_feed(items_6_week, period="week", now=NOW)
+        self.assertFalse(any(n.get("tag") == "h3" and n.get("children") == ["Главное"] for n in nodes_6_week))
+
+        # Для недели: от 7 полных карточек — блок «Главное» как оглавление из 5 строк «заголовок — канал» без сути
+        nodes_7_week = render_feed(items_7_day, period="week", now=NOW)
+        glavnoe_h3 = [n for n in nodes_7_week if n.get("tag") == "h3" and n.get("children") == ["Главное"]]
+        self.assertEqual(len(glavnoe_h3), 1)
+        ul_week = [nodes_7_week[i + 1] for i, n in enumerate(nodes_7_week) if n == glavnoe_h3[0]][0]
         self.assertEqual(len(ul_week["children"]), 5)
+
+        # Формат пункта: <b>заголовок</b> — канал (без сути)
+        li0 = ul_week["children"][0]
+        self.assertEqual(li0["children"][0]["tag"], "b")
+        self.assertEqual(li0["children"][0]["children"], ["Заголовок важной новости 1"])
+        self.assertEqual(li0["children"][1], " — C1")
 
     def test_today_yesterday_and_older_dates(self):
         today_post = item(1, channel="c1", time=NOW)
@@ -203,7 +216,7 @@ class FeedRenderTests(unittest.TestCase):
         self.assertNotIn("×3 к норме", rendered)
 
     def test_footer_channel_counts(self):
-        # 10 каналов: первые 8 выводятся, остальное «+2»
+        # 11 каналов: максимум 10 названий, без «+N», число постов в выпуске
         items = [
             item(1, channel="bponline", channel_title="bponline"),
             item(2, channel="truestorymedia", channel_title="truestorymedia"),
@@ -221,43 +234,45 @@ class FeedRenderTests(unittest.TestCase):
         footer_node = [n for n in nodes if n.get("tag") == "p" and "Каналы в выпуске:" in str(n.get("children", [""]))][0]
         text = footer_node["children"][0]
         self.assertTrue(text.startswith("Каналы в выпуске: bponline (2)"))
-        self.assertIn(" · +2", text)
+        self.assertNotIn("+", text)
+        names = text.replace("Каналы в выпуске: ", "").split(", ")
+        self.assertLessEqual(len(names), 10)
 
     def test_tag_sections_order_and_no_continuous_numbering(self):
         items = [
-            item(1, tag="спорт", channel="a", text="Пост А длинный текст для формирования заголовка."),
-            item(2, tag=None, channel="b", text="Пост Б длинный текст для формирования заголовка."),
-            item(3, tag="Аналитика", channel="c", text="Пост В длинный текст для формирования заголовка."),
-            item(4, tag="спорт", channel="d", text="Пост Г длинный текст для формирования заголовка."),
+            item(1, tag="спорт", channel="a", text="Пост А длинный текст для формирования заголовка новости и проверки отображения тегов."),
+            item(2, tag=None, channel="b", text="Пост Б длинный текст для формирования заголовка новости и проверки отображения тегов."),
+            item(3, tag="Аналитика", channel="c", text="Пост В длинный текст для формирования заголовка новости и проверки отображения тегов."),
+            item(4, tag="спорт", channel="d", text="Пост Г длинный текст для формирования заголовка новости и проверки отображения тегов."),
         ]
         nodes = render_feed(items, period="day", now=NOW)
         h3_texts = [node["children"][0] for node in nodes if node["tag"] == "h3"]
-        self.assertEqual(h3_texts, ["Главное", "Без тега", "#Аналитика · 1", "#спорт · 2"])
+        self.assertEqual(h3_texts, ["Без тега", "#Аналитика · 1", "#спорт · 2"])
         h4_texts = [node["children"][0] for node in nodes if node["tag"] == "h4"]
         self.assertEqual(h4_texts, [
-            "Пост Б длинный текст для формирования заголовка",
-            "Пост В длинный текст для формирования заголовка",
-            "Пост А длинный текст для формирования заголовка",
-            "Пост Г длинный текст для формирования заголовка",
+            "Пост Б длинный текст для формирования заголовка новости и проверки отображения тегов",
+            "Пост В длинный текст для формирования заголовка новости и проверки отображения тегов",
+            "Пост А длинный текст для формирования заголовка новости и проверки отображения тегов",
+            "Пост Г длинный текст для формирования заголовка новости и проверки отображения тегов",
         ])
 
     def test_no_tag_sections_when_no_tags(self):
         nodes = render_feed([
-            item(1, text="Пост 1 длинный текст для заголовка сюжета."),
-            item(2, channel="b", text="Пост 2 длинный текст для заголовка сюжета."),
+            item(1, text="Пост 1 длинный текст для формирования заголовка новости и подробной проверки сюжета выпуска."),
+            item(2, channel="b", text="Пост 2 длинный текст для формирования заголовка новости и подробной проверки сюжета выпуска."),
         ], period="day", now=NOW)
         h3_texts = [node["children"][0] for node in nodes if node["tag"] == "h3"]
         self.assertEqual(h3_texts, ["Сюжеты"])
 
     def test_untagged_heading_only_when_other_tag_exists(self):
         nodes = render_feed([
-            item(1, text="Пост 1 длинный текст для заголовка сюжета."),
-            item(2, tag="тема", channel="b", text="Пост 2 длинный текст для заголовка сюжета."),
+            item(1, text="Пост 1 длинный текст для формирования заголовка новости и подробной проверки сюжета выпуска."),
+            item(2, tag="тема", channel="b", text="Пост 2 длинный текст для формирования заголовка новости и подробной проверки сюжета выпуска."),
         ], period="day", now=NOW)
         self.assertEqual([node["children"][0] for node in nodes if node["tag"] == "h3"], ["Без тега", "#тема · 1"])
 
     def test_empty_metrics(self):
-        empty_item = item(views=None, forwards=None, reactions_total=None, replies=None, text="Пост без метрик, но с достаточным текстом для нормального парсинга.")
+        empty_item = item(views=None, forwards=None, reactions_total=None, replies=None, text="Пост без метрик, но с достаточным развернутым текстом более восьмидесяти символов для проверки сюжета.")
         nodes = render_feed([empty_item], period="day", now=NOW)
         rendered = repr(nodes)
         self.assertNotIn("👁", rendered)
@@ -267,16 +282,16 @@ class FeedRenderTests(unittest.TestCase):
         self.assertIn("Читать →", rendered)
 
     def test_empty_text_and_h4_never_equals_channel_name(self):
+        # Текст < 25 символов без ссылки отсекается полностью
         empty_post = item(channel="Alpha", text="")
         nodes = render_feed([empty_post], period="day", now=NOW)
-        h4_node = [n for n in nodes if n.get("tag") == "h4"][0]
-        self.assertNotEqual(h4_node["children"][0], "Alpha")
+        self.assertFalse(any(n.get("tag") == "h4" for n in nodes))
+
+        # Пост >= 80 символов, совпадающий с именем канала, получает заголовок «Без названия»
+        channel_name_post = item(channel="Alpha", text="Alpha. " + "Очень длинный текст подробностей новости более восьмидесяти символов для проверки карточки.")
+        nodes2 = render_feed([channel_name_post], period="day", now=NOW)
+        h4_node = [n for n in nodes2 if n.get("tag") == "h4"][0]
         self.assertEqual(h4_node["children"][0], "Без названия")
-        # При пустом тексте нет p-сути (только intro, подпись карточки и подвал выпуска)
-        p_nodes = [n for n in nodes if n.get("tag") == "p"]
-        self.assertEqual(len(p_nodes), 3)
-        # Подпись карточки содержит название канала
-        self.assertIn("Alpha · сегодня, 12:00", repr(p_nodes[1]))
 
     def test_very_long_words_and_urls(self):
         long_url = "https://example.com/" + "a" * 150
@@ -284,7 +299,7 @@ class FeedRenderTests(unittest.TestCase):
         long_item = item(text=f"{long_url}\n{long_word}")
         nodes = render_feed([long_item], period="day", now=NOW)
         h4_text = [n for n in nodes if n.get("tag") == "h4"][0]["children"][0]
-        self.assertLessEqual(len(h4_text), 90)
+        self.assertLessEqual(len(h4_text), 140)
         self.assertTrue(h4_text.endswith("…"))
         p_nodes = [n for n in nodes if n.get("tag") == "p"]
         essence_text = p_nodes[1]["children"][0]
@@ -313,7 +328,7 @@ class FeedRenderTests(unittest.TestCase):
         self.assertIn("Канал B", repr(rendered))
         self.assertIn("https://t.me/b/2", repr(rendered))
 
-    def test_also_in_is_unique_per_channel_and_omits_primary_and_caps_at_4(self):
+    def test_also_in_is_unique_per_channel_and_omits_primary_and_caps_at_2(self):
         entry = item(channel="a", also_in=[
             {"channel_username": "a", "channel_title": "Основной", "link": "https://t.me/a/1"},
             {"channel_username": "b", "channel_title": "B", "link": "https://t.me/b/2"},
@@ -321,7 +336,6 @@ class FeedRenderTests(unittest.TestCase):
             {"channel_username": "c", "channel_title": "C", "link": "https://t.me/c/1"},
             {"channel_username": "d", "channel_title": "D", "link": "https://t.me/d/1"},
             {"channel_username": "e", "channel_title": "E", "link": "https://t.me/e/1"},
-            {"channel_username": "f", "channel_title": "F", "link": "https://t.me/f/1"},
         ])
         nodes = render_feed([entry], period="week", now=NOW)
         rendered = repr(nodes)
@@ -329,10 +343,8 @@ class FeedRenderTests(unittest.TestCase):
         self.assertNotIn("Основной", rendered)
         self.assertIn("B", rendered)
         self.assertIn("C", rendered)
-        self.assertIn("D", rendered)
-        self.assertIn("E", rendered)
-        self.assertNotIn("https://t.me/f/1", rendered)
-        self.assertIn("(+1)", rendered)
+        self.assertNotIn("https://t.me/d/1", rendered)
+        self.assertIn("(+2)", rendered)
 
     def test_post_count_and_channel_count_header(self):
         nodes = render_feed([item(1), item(2, channel="b")], period="week", now=NOW, channel_count=23)
@@ -377,7 +389,7 @@ class FeedRenderTests(unittest.TestCase):
     def test_max_two_full_cards_per_channel(self):
         # 5 постов из одного канала c1
         items = [
-            item(idx, channel="c1", post_id=idx, text=f"Заголовок {idx} важной новости. Подробное описание новости {idx} для проверки.")
+            item(idx, channel="c1", post_id=idx, text=f"Заголовок {idx} важной новости. Подробное описание новости {idx} для проверки карточки сюжета.")
             for idx in range(1, 6)
         ]
         nodes = render_feed(items, period="day", now=NOW)
@@ -392,29 +404,31 @@ class FeedRenderTests(unittest.TestCase):
 
     def test_korotko_filtering_empty_and_no_link(self):
         items = [
-            # 2 полных карточки
-            item(1, channel="c1", text="Новость раз. Развернутый текст новости номер один."),
-            item(2, channel="c1", text="Новость два. Развернутый текст новости номер два."),
+            # 2 полных карточки (>= 80 симв)
+            item(1, channel="c1", text="Новость раз. Развернутый текст новости номер один для полноценной проверки карточки сюжета."),
+            item(2, channel="c1", text="Новость два. Развернутый текст новости номер два для полноценной проверки карточки сюжета."),
             # Кандидаты в Коротко:
-            # 1: валидный (>=40 симв, есть ссылка)
-            item(3, channel="c1", text="Новость три с достаточно длинным текстом более сорока символов."),
-            # 2: короткий (<40 симв)
-            item(4, channel="c1", text="Коротко."),
-            # 3: без ссылки
-            item(5, channel="c1", text="Новость пять длинный текст, но без ссылки на сообщение.", link=""),
+            # 1: валидный (между 25 и 80 симв, есть ссылка)
+            item(3, channel="c1", text="Новость три с текстом сорока символов."),
+            # 2: короткий (<25 симв, без ссылки в тексте) -> не показывается нигде
+            item(4, channel="c1", text="Коротко совсем."),
+            # 3: без ссылки поста -> не включается
+            item(5, channel="c1", text="Новость пять длинный текст для проверки, но без ссылки на сообщение в канале.", link=""),
+            # 4: <25 симв, но со ссылкой в тексте -> включается в Коротко
+            item(6, channel="c1", text="См: https://t.me/c1/6"),
         ]
         nodes = render_feed(items, period="day", now=NOW)
         korotko_ul = [nodes[i+1] for i, n in enumerate(nodes) if n.get("tag") == "h3" and n.get("children") == ["Коротко"]][0]
-        # Только 1 валидный пункт
-        self.assertEqual(len(korotko_ul["children"]), 1)
+        # Пункты 3 и 6 включены в Коротко
+        self.assertEqual(len(korotko_ul["children"]), 2)
         li = korotko_ul["children"][0]
         self.assertEqual(li["children"][0]["tag"], "a")
-        self.assertEqual(li["children"][0]["children"], ["Новость три с достаточно длинным текстом более сорока символов"])
+        self.assertEqual(li["children"][0]["children"], ["Новость три с текстом сорока символов."])
         self.assertIn("— C1 · 👁 120K", li["children"][1])
 
     def test_hr_divider_only_after_first_three_cards(self):
         items = [
-            item(idx, channel=f"ch_{idx}", text=f"Заголовок {idx}. Описание новости {idx} полное и развернутое.")
+            item(idx, channel=f"ch_{idx}", text=f"Заголовок {idx}. Описание новости {idx} полное и развернутое для проверки карточки сюжета.")
             for idx in range(1, 7)
         ]
         nodes = render_feed(items, period="day", now=NOW)
@@ -435,23 +449,29 @@ class FeedRenderTests(unittest.TestCase):
 
     def test_structure_day_week_month_limits(self):
         items = [
-            item(idx, channel=f"ch_{idx}", text=f"Заголовок {idx}. Описание {idx} детально расписано.")
+            item(idx, channel=f"ch_{idx}", text=f"Заголовок {idx}. Описание {idx} детально расписано в тексте карточки для обязательной проверки условий задачи.")
             for idx in range(1, 15)
         ]
+        def get_card_h4(nodes):
+            res = []
+            for n in nodes:
+                if n.get("tag") == "h3" and n.get("children") == ["Коротко"]:
+                    break
+                if n.get("tag") == "h4":
+                    res.append(n)
+            return res
+
         # День: max 6 полных карточек
         nodes_day = render_feed(items, period="day", now=NOW)
-        h4_day = [n for n in nodes_day if n.get("tag") == "h4"]
-        self.assertEqual(len(h4_day), 6)
+        self.assertEqual(len(get_card_h4(nodes_day)), 6)
 
         # Неделя: max 8 полных карточек
         nodes_week = render_feed(items, period="week", now=NOW)
-        h4_week = [n for n in nodes_week if n.get("tag") == "h4"]
-        self.assertEqual(len(h4_week), 8)
+        self.assertEqual(len(get_card_h4(nodes_week)), 8)
 
         # Месяц: max 10 полных карточек
         nodes_month = render_feed(items, period="month", now=NOW)
-        h4_month = [n for n in nodes_month if n.get("tag") == "h4"]
-        self.assertEqual(len(h4_month), 10)
+        self.assertEqual(len(get_card_h4(nodes_month)), 10)
 
     def test_sample_file_12_posts(self):
         sample_path = os.path.join(os.path.dirname(__file__), "..", "docs", "sprint", "lenta-v3-sample.txt")
@@ -482,17 +502,14 @@ class FeedRenderTests(unittest.TestCase):
         now = datetime(2026, 10, 16, 15, 0, tzinfo=timezone.utc)
         nodes = render_feed(feed_items, period="day", now=now)
 
-        # Проверяем структуру:
+        # Проверяем структуру для дня:
         # 1. Интро
         intro = nodes[0]["children"][0]["children"][0]
         self.assertTrue(intro.startswith("Лента за день · 16 окт — 12 постов из 7 каналов"))
         self.assertIn("мин чтения", intro)
 
-        # 2. Главное (3 сюжета для дня)
-        glavnoe_h3 = [n for n in nodes if n.get("tag") == "h3" and n.get("children") == ["Главное"]]
-        self.assertEqual(len(glavnoe_h3), 1)
-        ul_glavnoe = [nodes[i+1] for i, n in enumerate(nodes) if n == glavnoe_h3[0]][0]
-        self.assertEqual(len(ul_glavnoe["children"]), 3)
+        # 2. Для дня блока Главное нет
+        self.assertFalse(any(n.get("tag") == "h3" and n.get("children") == ["Главное"] for n in nodes))
 
         # 3. Полные карточки: для дня max 6 постов, не больше 2 на канал
         h4_nodes = [n for n in nodes if n.get("tag") == "h4"]
@@ -507,6 +524,162 @@ class FeedRenderTests(unittest.TestCase):
         # 5. Подвал со списком каналов
         footer = [n for n in nodes if n.get("tag") == "p" and "Каналы в выпуске:" in str(n.get("children", [""]))][0]
         self.assertIn("TechNews (3)", footer["children"][0])
+
+    def test_caps_title_normalization(self):
+        # КАПС-заголовок приводится к обычному регистру, аббревиатуры <= 5 букв и ИИ сохраняются
+        covid_text = (
+            "🦠КОВИД «УБИВАЕТ РАДОСТЬ» У ЛЮДЕЙ — ВИРУС БУКВАЛЬНО ВЫЖИГАЕТ ДОФАМИНОВЫЕ РЕЦЕПТОРЫ!\n"
+            "Учёные обнаружили у переболевших COVID-19 снижение плотности дофаминовых нервных окончаний."
+        )
+        nodes = render_feed([item(text=covid_text)], period="day", now=NOW)
+        h4_text = [n for n in nodes if n.get("tag") == "h4"][0]["children"][0]
+        self.assertEqual(h4_text, "🦠КОВИД «убивает радость» у людей — вирус буквально выжигает дофаминовые рецепторы!")
+
+        ai_text = "ПРОМТ, КОТОРЫЙ СОЗДАЕТ КРУТОЙ ОФФЕР В ЛЮБОЙ ИИ. Подробная инструкция для маркетологов и дизайнеров."
+        nodes2 = render_feed([item(text=ai_text)], period="day", now=NOW)
+        h4_text2 = [n for n in nodes2 if n.get("tag") == "h4"][0]["children"][0]
+        self.assertEqual(h4_text2, "Промт, который создает крутой оффер в любой ИИ")
+
+    def test_emoji_chains_collapsing(self):
+        # Цепочки эмодзи >=3 подряд схлопываются до одного
+        text = "🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴 ▶️ Учёные сделали важное открытие в области биологии и медицины. Подробности исследования далее."
+        nodes = render_feed([item(text=text)], period="day", now=NOW)
+        h4_text = [n for n in nodes if n.get("tag") == "h4"][0]["children"][0]
+        self.assertIn("Учёные сделали важное открытие", h4_text)
+        self.assertNotIn("🔴🔴", repr(nodes))
+
+    def test_service_tails_removal(self):
+        # Служебные хвосты каналов убираются из сути
+        text = (
+            "Важная новость о развитии технологий и искусственного интеллекта в мире.\n\n"
+            "Подробности читайте в полном отчете аналитиков за текущий квартал года.\n\n"
+            "@bugfeature | #chatgpt\n#новости #ai"
+        )
+        nodes = render_feed([item(text=text)], period="day", now=NOW)
+        rendered = repr(nodes)
+        self.assertNotIn("@bugfeature", rendered)
+        self.assertNotIn("#chatgpt", rendered)
+        self.assertNotIn("#новости", rendered)
+
+    def test_title_exact_140_and_141_chars(self):
+        # 140 символов: первое предложение целиком становится заголовком
+        prefix_140 = ("Слово " * 23) + "да"
+        self.assertEqual(len(prefix_140), 140)
+        text_140 = f"{prefix_140}. Второе предложение сути новости подробно описывает все детали произошедшего события."
+        nodes_140 = render_feed([item(text=text_140)], period="day", now=NOW)
+        h4_140 = [n for n in nodes_140 if n.get("tag") == "h4"][0]["children"][0]
+        self.assertEqual(len(h4_140), 140)
+        self.assertEqual(h4_140, prefix_140)
+        # Суть — второе предложение
+        essence_140 = [n for n in nodes_140 if n.get("tag") == "p"][1]["children"][0]
+        self.assertTrue(essence_140.startswith("Второе предложение сути новости"))
+
+        # 141 символ без разделителя: обрезка по слову с «…», суть = полный текст с начала
+        words_141 = ("Слово " * 23) + "нет"
+        self.assertEqual(len(words_141), 141)
+        text_141 = f"{words_141}. Второе предложение новости подробно описывает детали."
+        nodes_141 = render_feed([item(text=text_141)], period="day", now=NOW)
+        h4_141 = [n for n in nodes_141 if n.get("tag") == "h4"][0]["children"][0]
+        self.assertLessEqual(len(h4_141), 140)
+        self.assertTrue(h4_141.endswith("…"))
+        # Суть — полный исходный текст с начала
+        essence_141 = [n for n in nodes_141 if n.get("tag") == "p"][1]["children"][0]
+        self.assertTrue(essence_141.startswith("Слово"))
+
+        # 141 символ с разделителем ": " в диапазоне 50-140
+        part1 = "Важное заявление исследователей из ведущего университета"  # 56 симв
+        part2 = "x" * (141 - len(part1) - 2)
+        delim_text = f"{part1}: {part2}. Детали последующего эксперимента."
+        self.assertEqual(len(f"{part1}: {part2}"), 141)
+        nodes_delim = render_feed([item(text=delim_text)], period="day", now=NOW)
+        h4_delim = [n for n in nodes_delim if n.get("tag") == "h4"][0]["children"][0]
+        self.assertEqual(h4_delim, part1)
+
+    def test_post_exact_80_chars_boundary(self):
+        # Ровно 80 символов: квалифицируется в полную карточку
+        text_80 = ("Слово " * 13) + "д."
+        self.assertEqual(len(text_80), 80)
+        nodes_80 = render_feed([item(text=text_80)], period="day", now=NOW)
+        h4_nodes = [n for n in nodes_80 if n.get("tag") == "h4"]
+        self.assertEqual(len(h4_nodes), 1)
+
+        # 79 символов: не получает полную карточку, уходит в «Коротко» с заголовком = весь текст
+        text_79 = ("Слово " * 13) + "."
+        self.assertEqual(len(text_79), 79)
+        nodes_79 = render_feed([item(text=text_79)], period="day", now=NOW)
+        self.assertFalse(any(n.get("tag") == "h4" for n in nodes_79))
+        korotko_ul = [nodes_79[i+1] for i, n in enumerate(nodes_79) if n.get("tag") == "h3" and n.get("children") == ["Коротко"]][0]
+        self.assertEqual(len(korotko_ul["children"]), 1)
+        self.assertEqual(korotko_ul["children"][0]["children"][0]["children"], [text_79])
+
+    def test_post_under_25_chars_with_and_without_link(self):
+        # < 25 символов без ссылки в тексте — не показывается нигде
+        text_empty = "Короткая реплика"
+        self.assertLess(len(text_empty), 25)
+        nodes_empty = render_feed([item(text=text_empty)], period="day", now=NOW)
+        self.assertFalse(any(n.get("tag") == "h3" for n in nodes_empty))
+        self.assertFalse(any(n.get("tag") == "h4" for n in nodes_empty))
+
+        # < 25 символов со ссылкой в тексте — уходит в «Коротко»
+        text_with_link = "Инфо: https://t.me/c/1"
+        self.assertLess(len(text_with_link), 25)
+        nodes_link = render_feed([item(text=text_with_link)], period="day", now=NOW)
+        korotko_h3 = [n for n in nodes_link if n.get("tag") == "h3" and n.get("children") == ["Коротко"]]
+        self.assertEqual(len(korotko_h3), 1)
+
+    def test_week_korotko_grouped_by_days(self):
+        # Для недели/месяца сюжеты в «Коротко» группируются по дням с h4 внутри Коротко
+        # 8 постов для заполнения полной выдачи недели, чтобы следующие ушли в Коротко
+        base_items = [
+            item(idx, channel=f"ch_{idx}", text=f"Заголовок важной новости {idx}. Полное описание новости {idx} для проверки.")
+            for idx in range(1, 9)
+        ]
+        # Короткие посты за разные даты:
+        # сегодня
+        p_today = item(9, channel="ch_a", time=NOW, text="Короткая новость сегодня.")
+        # вчера
+        p_yesterday = item(10, channel="ch_b", time=NOW - timedelta(days=1), text="Короткая новость вчера была.")
+        # понедельник 12.10
+        p_mon = item(11, channel="ch_c", time=datetime(2026, 10, 12, 10, 0, tzinfo=timezone.utc), text="Короткая новость в понедельник.")
+
+        nodes = render_feed(base_items + [p_today, p_yesterday, p_mon], period="week", now=NOW)
+        # Внутри Коротко должны быть h4 с днями
+        korotko_idx = [i for i, n in enumerate(nodes) if n.get("tag") == "h3" and n.get("children") == ["Коротко"]][0]
+        following = nodes[korotko_idx + 1:]
+        h4_day_headings = [n["children"][0] for n in following if n.get("tag") == "h4"]
+        self.assertIn("Сегодня", h4_day_headings)
+        self.assertIn("Вчера", h4_day_headings)
+        self.assertIn("Пн, 12 окт", h4_day_headings)
+
+    def test_also_in_reads_cleanly_and_no_duplicates(self):
+        # Подпись вида «Канал · вчера, 18:11 · также: A, B (+2)» читается и один и тот же канал не повторяется
+        yesterday_time = NOW - timedelta(days=1, hours=3, minutes=11)  # вчера
+        entry = item(
+            channel="main_chan",
+            channel_title="MainChan",
+            time=yesterday_time,
+            also_in=[
+                {"channel_username": "main_chan", "channel_title": "MainChan", "link": "https://t.me/main/1"},
+                {"channel_username": "chan_a", "channel_title": "ChanA", "link": "https://t.me/a/1"},
+                {"channel_username": "chan_a", "channel_title": "ChanA-dup", "link": "https://t.me/a/2"},
+                {"channel_username": "chan_b", "channel_title": "ChanB", "link": "https://t.me/b/1"},
+                {"channel_username": "chan_c", "channel_title": "ChanC", "link": "https://t.me/c/1"},
+                {"channel_username": "chan_d", "channel_title": "ChanD", "link": "https://t.me/d/1"},
+            ],
+        )
+        nodes = render_feed([entry], period="week", now=NOW)
+        p_nodes = [n for n in nodes if n.get("tag") == "p"]
+        meta_node = p_nodes[2]
+        meta_text = "".join(
+            (c if isinstance(c, str) else "".join(c.get("children", [])))
+            for c in meta_node.get("children", [])
+        )
+        # Проверяем читаемость формата
+        self.assertIn("MainChan · вчера, 08:49 · также: ChanA, ChanB (+2)", meta_text)
+        # Канал chan_a упомянут ровно один раз
+        self.assertEqual(meta_text.count("ChanA"), 1)
+        # Основной канал не дублируется в «также:»
+        self.assertEqual(meta_text.count("MainChan"), 1)
 
     def test_publication_shared_and_digest_behavior_uses_nodes(self):
         response = SimpleNamespace(json=AsyncMock(return_value={"ok": True, "result": {"url": "https://telegra.ph/x"}}))
