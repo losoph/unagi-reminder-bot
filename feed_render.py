@@ -213,6 +213,18 @@ def _find_semantic_cut(text: str, min_len: int = 50, max_len: int = 140) -> str 
     return None
 
 
+def _strip_title_prefix(title: str, essence: str) -> str:
+    """Если «суть» начинается теми же словами, что и обрезанный заголовок, оставляем продолжение (без дубля начала)."""
+    base = " ".join(title.rstrip("…").split()).casefold()
+    flat = " ".join(essence.split())
+    if base and flat.casefold().startswith(base):
+        rest = flat[len(base):].lstrip(" ,;:—–-").strip()
+        if len(rest) < 20:
+            return ""
+        return "… " + rest if rest[:1].islower() else rest
+    return essence
+
+
 def _extract_title_and_essence(clean_text: str, max_title: int = 140, max_essence: int = 300) -> tuple[str, str]:
     if not clean_text:
         return "", ""
@@ -293,7 +305,7 @@ def _extract_title_and_essence(clean_text: str, max_title: int = 140, max_essenc
             essence = s1
         else:
             essence = _truncate_by_word(s1, max_essence)
-    return title, essence
+    return title, _strip_title_prefix(title, essence)
 
 
 def _human_badge(badge: str) -> str:

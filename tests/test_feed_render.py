@@ -582,9 +582,10 @@ class FeedRenderTests(unittest.TestCase):
         h4_141 = [n for n in nodes_141 if n.get("tag") == "h4"][0]["children"][0]
         self.assertLessEqual(len(h4_141), 140)
         self.assertTrue(h4_141.endswith("…"))
-        # Суть — полный исходный текст с начала
+        # Суть — продолжение (начало, уже вошедшее в заголовок, не повторяется)
         essence_141 = [n for n in nodes_141 if n.get("tag") == "p"][1]["children"][0]
-        self.assertTrue(essence_141.startswith("Слово"))
+        self.assertFalse(essence_141.startswith("Слово"))
+        self.assertIn("Второе предложение новости", essence_141)
 
         # 141 символ с разделителем ": " в диапазоне 50-140
         part1 = "Важное заявление исследователей из ведущего университета"  # 56 симв
@@ -713,3 +714,21 @@ class FeedRenderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TitlePrefixTests(unittest.TestCase):
+    def test_summary_does_not_repeat_the_start_of_a_cut_headline(self):
+        import feed_render
+        text = ("GitHub не смогли спокойно смириться с тем, что Anthropic публично заявили, что больше не используют git, "
+                "и выплюнули в X следующий «рандомный факт»: Anthropic вместе с Claude потратил пять месяцев на создание замены Git.")
+        title, essence = feed_render._extract_title_and_essence(text)
+        self.assertLessEqual(len(title), 141)
+        self.assertFalse(essence.casefold().startswith(title.rstrip("…").casefold()[:40]))
+        self.assertTrue(essence.startswith("…") or essence[:1].isupper())
+
+    def test_strip_title_prefix_edge_cases(self):
+        import feed_render
+        strip = feed_render._strip_title_prefix
+        self.assertEqual(strip("Коротко", "Совсем другой текст"), "Совсем другой текст")
+        self.assertEqual(strip("Заголовок", "Заголовок и всё"), "")  # остаток короче 20 символов
+        self.assertEqual(strip("Заголовок…", "Заголовок, а дальше идёт длинное продолжение мысли"), "… а дальше идёт длинное продолжение мысли")
