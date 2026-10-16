@@ -56,6 +56,11 @@ def local_now() -> datetime:
     return datetime.now(TZ)
 
 
+def ai_today_key() -> str:
+    """Ключ дня для учёта дневного лимита ИИ в общем часовом поясе приложения."""
+    return local_now().strftime("%Y-%m-%d")
+
+
 def display_db_datetime(value: str, tz: tzinfo | None = None) -> datetime:
     return parse_db_datetime(value).astimezone(tz or TZ)
 

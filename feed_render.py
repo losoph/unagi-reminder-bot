@@ -509,6 +509,52 @@ def build_feed_title(period: str, now: datetime, *, tz=timezone.utc) -> str:
     return f"Лента за {labels[period]} · {_period_range(period, now, _zone(tz))}"[:256]
 
 
+def _plural_channel(number: int) -> str:
+    """Совместимость с feed.py: «из N канала/каналов» (как в прежнем рендере)."""
+    return _plural_ru(number, "канала", "каналов", "каналов")
+
+
+def _first_sentence(text: str) -> tuple[str, str]:
+    """Совместимость с feed.py: (первое предложение, остаток)."""
+    for index, char in enumerate(text):
+        if char in ".!?…" and (index + 1 == len(text) or text[index + 1].isspace()):
+            return text[: index + 1].strip(), text[index + 1 :].strip()
+    return text, ""
+
+
+def _overview_nodes(overview: str) -> list[dict]:
+    """Блок «Главное за период» из уже очищенного ИИ-обзора."""
+    lines = [line.strip() for line in str(overview).splitlines() if line.strip()]
+    body_parts = []
+    topics = ""
+    for line in lines:
+        if line.startswith("Темы:"):
+            topics = line
+        else:
+            body_parts.append(line)
+    if not topics:
+        combined = " ".join(body_parts).strip()
+        marker = combined.find("Темы:")
+        if marker > 0:
+            body_parts = [combined[:marker].strip()]
+            topics = combined[marker:].strip()
+        elif marker == 0:
+            body_parts = []
+            topics = combined
+    body = " ".join(body_parts).strip()
+    children = []
+    if body:
+        children.append({"tag": "p", "children": [body]})
+    if topics:
+        children.append({"tag": "p", "children": [{"tag": "i", "children": [topics]}]})
+    if not children:
+        return []
+    return [
+        {"tag": "h3", "children": ["Главное за период"]},
+        {"tag": "blockquote", "children": children},
+    ]
+
+
 def render_feed(
     items: list,
     *,
@@ -519,6 +565,7 @@ def render_feed(
     incomplete_channels: list[str] | None = None,
     post_chars: int | None = None,
     tz=timezone.utc,
+    overview: str | None = None,
 ) -> list[dict]:
     """Строит Telegraph nodes для уже ранжированных FeedItem без публикации и I/O."""
     if period not in ("day", "week", "month"):
@@ -560,9 +607,11 @@ def render_feed(
                 short_candidates.append(it)
 
     body_nodes: list[dict] = []
+    if overview:  # необязательный ИИ-обзор (feed_ai.py); при его наличии оглавление «Главное» не нужно
+        body_nodes.extend(_overview_nodes(overview))
 
     # Rule 2: Блок «Главное» только когда полных карточек >= 7 (неделя/месяц), 5 строк «заголовок — канал» без сути
-    if period in ("week", "month") and len(full_items) >= 7:
+    if not overview and period in ("week", "month") and len(full_items) >= 7:
         top_items = full_items[:5]
         glavnoe_li = []
         for it in top_items:
