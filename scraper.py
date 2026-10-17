@@ -9,6 +9,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 from data.database import parse_db_datetime
+from http_session import get_session
 
 logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
@@ -135,7 +136,11 @@ def _parse_channel_html(html_text: str, clean_username: str, last_scraped_at: da
 
 async def _load_channel_html(session: aiohttp.ClientSession, url: str, clean_username: str) -> str:
     try:
-        async with session.get(url, headers=REQUEST_HEADERS) as response:
+        try:
+            get_req = session.get(url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
+        except TypeError:
+            get_req = session.get(url, headers=REQUEST_HEADERS)
+        async with get_req as response:
             logger.info("Fetching Telegram channel %s returned HTTP %s", clean_username, response.status)
             if response.status != 200:
                 raise ChannelFetchError(
@@ -175,9 +180,7 @@ async def get_latest_posts(
 
     logger.info("Scanning channel @%s for posts newer than %s", clean_username, last_scraped_at)
 
-    own_session = session is None
-    if own_session:
-        session = aiohttp.ClientSession(timeout=REQUEST_TIMEOUT)
+    session = session or get_session()
 
     all_posts: list[dict] = []
     seen_ids: set[int] = set()
@@ -185,42 +188,37 @@ async def get_latest_posts(
     pages_fetched = 0
     current_url = f"https://t.me/s/{clean_username}"
 
-    try:
-        while pages_fetched < max_pages:
-            html = await _load_channel_html(session, current_url, clean_username)
-            pages_fetched += 1
+    while pages_fetched < max_pages:
+        html = await _load_channel_html(session, current_url, clean_username)
+        pages_fetched += 1
 
-            page_posts, min_id, page_reached = _parse_channel_html_page(
-                html, clean_username, last_scraped_at
-            )
+        page_posts, min_id, page_reached = _parse_channel_html_page(
+            html, clean_username, last_scraped_at
+        )
 
-            for post in page_posts:
-                pid = post.get("id")
-                if pid is not None:
-                    if pid not in seen_ids:
-                        seen_ids.add(pid)
-                        all_posts.append(post)
-                else:
+        for post in page_posts:
+            pid = post.get("id")
+            if pid is not None:
+                if pid not in seen_ids:
+                    seen_ids.add(pid)
                     all_posts.append(post)
+            else:
+                all_posts.append(post)
 
-            if page_reached:
-                reached_cursor = True
-                break
+        if page_reached:
+            reached_cursor = True
+            break
 
-            if not min_id or min_id <= 1:
-                reached_cursor = True
-                break
+        if not min_id or min_id <= 1:
+            reached_cursor = True
+            break
 
-            if pages_fetched >= max_pages:
-                break
+        if pages_fetched >= max_pages:
+            break
 
-            current_url = f"https://t.me/s/{clean_username}?before={min_id}"
-            if page_delay > 0:
-                await asyncio.sleep(page_delay)
-
-    finally:
-        if own_session and session is not None:
-            await session.close()
+        current_url = f"https://t.me/s/{clean_username}?before={min_id}"
+        if page_delay > 0:
+            await asyncio.sleep(page_delay)
 
     all_posts.sort(key=lambda p: (p.get("time") or datetime.min.replace(tzinfo=timezone.utc), p.get("id") or 0))
     logger.info(
