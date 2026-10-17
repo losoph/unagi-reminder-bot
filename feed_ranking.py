@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import difflib
 import math
-import os
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -12,17 +11,13 @@ from datetime import datetime, timezone
 from heapq import heappop, heappush
 from urllib.parse import urlsplit, urlunsplit
 
-_WEIGHTS = {
-    "reach_abs": float(os.getenv("FEED_W_REACH", "0.30")),
-    "fwd_abs": float(os.getenv("FEED_W_FWD", "0.25")),
-    "reach_rel": float(os.getenv("FEED_W_REACH_REL", "0.15")),
-    "fwd_rel": float(os.getenv("FEED_W_FWD_REL", "0.15")),
-    "engagement": float(os.getenv("FEED_W_ENGAGEMENT", "0.10")),
-}
-_MAX_POSTS = max(0, int(os.getenv("FEED_MAX_POSTS", "50")))
-_AD_MIN_PERCENTILE = float(os.getenv("FEED_AD_MIN_PERCENTILE", "0.75"))
-_AD_MIN_POOL = max(1, int(os.getenv("FEED_AD_MIN_POOL", "4")))
-_CLUSTER_MIN_TEXT = max(0, int(os.getenv("FEED_CLUSTER_MIN_TEXT", "60")))
+from config import settings
+
+_WEIGHTS = dict(settings().feed_ranking.weights)
+_MAX_POSTS = settings().feed_ranking.max_posts
+_AD_MIN_PERCENTILE = settings().feed_ranking.ad_min_percentile
+_AD_MIN_POOL = settings().feed_ranking.ad_min_pool
+_CLUSTER_MIN_TEXT = settings().feed_ranking.cluster_min_text
 _AD_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (

@@ -1,9 +1,9 @@
 import json
 import logging
-import os
 
 import aiohttp
 
+from config import settings
 from data.database import delete_app_meta, get_app_meta, set_app_meta
 from post_text import (
     _SENTENCE_END_RE,
@@ -47,12 +47,12 @@ logger = logging.getLogger(__name__)
 
 TELEGRAPH_API = "https://api.telegra.ph"
 _TOKEN_META_KEY = "telegraph_access_token"
-_ENV_TOKEN = os.getenv("TELEGRAPH_TOKEN")
+_ENV_TOKEN = settings().telegraph.token
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20)
 # Telegraph hard-limits a page to ~64 KB of content nodes.
 _MAX_CONTENT_BYTES = 60_000
 # Maximum characters for a single post on a Telegraph page.
-TELEGRAPH_POST_CHARS = int(os.getenv("TELEGRAPH_POST_CHARS", "1500"))
+TELEGRAPH_POST_CHARS = settings().telegraph.post_chars
 # Average adult silent-reading speed, words/minute — used only for the digest's
 # rough "~N мин" estimate at the top.
 _READING_WPM = 200
@@ -73,8 +73,9 @@ async def _create_token(session: aiohttp.ClientSession) -> str:
 
 async def _get_token(session: aiohttp.ClientSession) -> str:
     global _ENV_TOKEN
-    if _ENV_TOKEN:
-        return _ENV_TOKEN
+    token = _ENV_TOKEN or settings().telegraph.token
+    if token:
+        return token
     token = get_app_meta(_TOKEN_META_KEY)
     if token:
         return token

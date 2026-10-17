@@ -1,11 +1,11 @@
 import asyncio
 import json
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
 
+from config import settings
 from scraper import ChannelFetchError, get_latest_posts
 
 logger = logging.getLogger(__name__)
@@ -27,12 +27,13 @@ class HybridChannelSource:
     """Read channel history through MTProto, with an optional Telegram Web fallback."""
 
     def __init__(self):
-        self.mode = os.getenv("CHANNEL_SOURCE", "auto").strip().lower()
-        self.api_id = os.getenv("TELEGRAM_API_ID")
-        self.api_hash = os.getenv("TELEGRAM_API_HASH")
-        self.session_string = os.getenv("TELEGRAM_USER_SESSION")
-        self.web_fallback = os.getenv("MTPROTO_WEB_FALLBACK", "true").lower() in {"1", "true", "yes"}
-        self.fetch_limit = max(20, int(os.getenv("MTPROTO_FETCH_LIMIT", "1000")))
+        cfg = settings().channel_source
+        self.mode = cfg.mode
+        self.api_id = cfg.api_id
+        self.api_hash = cfg.api_hash
+        self.session_string = cfg.session_string
+        self.web_fallback = cfg.web_fallback
+        self.fetch_limit = cfg.fetch_limit
         self._client = None
         self.account_id: int | None = None
         self._fetch_semaphore = None
@@ -43,7 +44,7 @@ class HybridChannelSource:
     @property
     def fetch_semaphore(self) -> asyncio.Semaphore:
         if self._fetch_semaphore is None:
-            concurrency = int(os.getenv("DIGEST_FETCH_CONCURRENCY", "5"))
+            concurrency = settings().channel_source.fetch_concurrency
             self._fetch_semaphore = asyncio.Semaphore(concurrency)
         return self._fetch_semaphore
 
