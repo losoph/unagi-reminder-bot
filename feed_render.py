@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import os
 import re
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-FEED_POST_CHARS = max(1, int(os.getenv("FEED_POST_CHARS", "300")))
+from config import settings
+
+FEED_POST_CHARS = settings().feed_ranking.post_chars
 
 _MONTHS_RU = ["", "янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
 _WEEKDAYS_RU = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
@@ -572,7 +573,7 @@ def render_feed(
         raise ValueError("period должен быть day, week или month")
     now = _aware_utc(now)
     tz = _zone(tz)
-    limit = FEED_POST_CHARS if post_chars is None else max(1, post_chars)
+    limit = (FEED_POST_CHARS if FEED_POST_CHARS is not None else settings().feed_ranking.post_chars) if post_chars is None else max(1, post_chars)
 
     sorted_items = sorted(items, key=lambda it: it.rank)
 

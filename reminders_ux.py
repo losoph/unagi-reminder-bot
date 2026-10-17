@@ -2,10 +2,11 @@
 
 import html
 import logging
-import os
 import re
 from datetime import datetime
 from typing import Any
+
+from config import settings
 
 from aiogram import F, Router, types
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -553,7 +554,7 @@ def build_sent_reminder_actions_keyboard(
     )
 
 
-RESCHEDULE_FOLLOWUP_WINDOW_MINUTES = int(os.getenv("RESCHEDULE_FOLLOWUP_WINDOW_MINUTES", "10"))
+RESCHEDULE_FOLLOWUP_WINDOW_MINUTES = settings().time.reschedule_followup_window_minutes
 
 
 def build_followup_reschedule_keyboard(new_db_id: int) -> InlineKeyboardMarkup:

@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import re
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -8,6 +7,7 @@ from urllib.parse import urlparse
 import aiohttp
 from bs4 import BeautifulSoup
 
+from config import settings
 from data.database import parse_db_datetime
 from http_session import get_session
 
@@ -21,8 +21,8 @@ REQUEST_HEADERS = {
     )
 }
 
-WEB_FETCH_MAX_PAGES = int(os.getenv("WEB_FETCH_MAX_PAGES", "15"))
-WEB_FETCH_PAGE_DELAY = float(os.getenv("WEB_FETCH_PAGE_DELAY", "0.5"))
+WEB_FETCH_MAX_PAGES = settings().channel_source.web_fetch_max_pages
+WEB_FETCH_PAGE_DELAY = settings().channel_source.web_fetch_page_delay
 
 
 class ScrapedPosts(list):
@@ -169,9 +169,13 @@ async def get_latest_posts(
     channel_username: str,
     last_scraped_at_str: str | None,
     session: aiohttp.ClientSession | None = None,
-    max_pages: int = WEB_FETCH_MAX_PAGES,
-    page_delay: float = WEB_FETCH_PAGE_DELAY,
+    max_pages: int | None = None,
+    page_delay: float | None = None,
 ) -> ScrapedPosts:
+    cfg = settings().channel_source
+    effective_max_pages = cfg.web_fetch_max_pages if max_pages is None else max_pages
+    effective_page_delay = cfg.web_fetch_page_delay if page_delay is None else page_delay
+
     clean_username = channel_username.replace("@", "")
     last_scraped_at = _parse_last_scraped_at(last_scraped_at_str)
 
@@ -185,7 +189,7 @@ async def get_latest_posts(
     pages_fetched = 0
     current_url = f"https://t.me/s/{clean_username}"
 
-    while pages_fetched < max_pages:
+    while pages_fetched < effective_max_pages:
         html = await _load_channel_html(session, current_url, clean_username)
         pages_fetched += 1
 
@@ -210,12 +214,12 @@ async def get_latest_posts(
             reached_cursor = True
             break
 
-        if pages_fetched >= max_pages:
+        if pages_fetched >= effective_max_pages:
             break
 
         current_url = f"https://t.me/s/{clean_username}?before={min_id}"
-        if page_delay > 0:
-            await asyncio.sleep(page_delay)
+        if effective_page_delay > 0:
+            await asyncio.sleep(effective_page_delay)
 
     all_posts.sort(key=lambda p: (p.get("time") or datetime.min.replace(tzinfo=timezone.utc), p.get("id") or 0))
     logger.info(

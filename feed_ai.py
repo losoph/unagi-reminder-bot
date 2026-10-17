@@ -10,18 +10,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 from datetime import datetime, timezone
 
 import ai_assistant
 from ai_assistant import AI_DAILY_LIMIT
+from config import settings
 from data.database import get_ai_usage_today, increment_ai_usage
 from time_utils import ai_today_key
 
 logger = logging.getLogger(__name__)
 
-FEED_AI_TIMEOUT_SECONDS = max(0.1, float(os.getenv("FEED_AI_TIMEOUT_SECONDS", "20")))
+FEED_AI_TIMEOUT_SECONDS = settings().feed_ranking.ai_timeout_seconds
 FEED_AI_MAX_ITEMS = 12
 FEED_AI_TEXT_CHARS = 220
 FEED_AI_OUTPUT_CHARS = 900
@@ -45,7 +45,7 @@ _PERIOD_LABELS = {"day": "день", "week": "неделю", "month": "меся�
 
 
 def _is_disabled() -> bool:
-    return os.getenv("FEED_AI_SUMMARY", "on").strip().lower() == "off"
+    return not settings().feed_ranking.ai_summary_enabled
 
 
 def _limit_reached(user_id: int) -> bool:
