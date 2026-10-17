@@ -20,7 +20,7 @@ trap 'rm -rf "$WORK"' EXIT
 MAX="${OC_CHECK_MAX_BYTES:-24000}"
 {
   echo "ЭТО КОРОТКАЯ СВЕРКА. Не используй инструменты, не читай файлы, не запускай команды, ничего не меняй: весь нужный контекст ниже."
-  echo "Ответь по-русски, не длиннее 200 слов: только подтверждаемые контекстом дефекты в формате «файл:строка — суть — сценарий воспроизведения»,"
+  echo "Ответь по-русски, не длиннее 200 слов: только подтверждаемые контекстом дефекты в формате «файл:строка (или функция/раздел, если номеров строк в контексте нет) — суть — сценарий воспроизведения»,"
   echo "затем одной строкой вердикт: OK или ЕСТЬ ЗАМЕЧАНИЯ. Если контекста не хватает для вывода — скажи, чего именно, не гадай."
   echo
   echo "ВОПРОС: $QUESTION"
@@ -29,4 +29,4 @@ MAX="${OC_CHECK_MAX_BYTES:-24000}"
   head -c "$MAX" "$CONTEXT"
 } > "$WORK/brief.md"
 mkdir -p "$(dirname "${OC_CHECK_LOG:-.agents/checks.ndjson}")"
-exec "$SCRIPT_DIR/oc_run.sh" "${OC_CHECK_WORKTREE:-$PWD}" "$MODEL" "$WORK/brief.md" "${OC_CHECK_LOG:-.agents/checks.ndjson}" "check-$TITLE" --review
+exec "$SCRIPT_DIR/oc_run.sh" "${OC_CHECK_WORKTREE:-$PWD}" "$MODEL" "$WORK/brief.md" "${OC_CHECK_LOG:-.agents/checks.ndjson}" "check-$TITLE" --review --inline
