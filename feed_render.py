@@ -5,31 +5,88 @@ from __future__ import annotations
 import os
 import re
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+
+from post_text import (
+    _ABBREVIATIONS,
+    _EMOJI_CLUSTER_RE,
+    _KNOWN_ABBREVIATIONS,
+    _SENTENCE_END_RE,
+    _VOWELS,
+    _clean_post_text,
+    _clean_service_lines,
+    _collapse_emoji_chains,
+    _extract_bare_url_domain,
+    _extract_title_and_essence,
+    _find_semantic_cut,
+    _find_sentence_boundary,
+    _first_sentence,
+    _is_abbreviation,
+    _is_banner_line,
+    _normalize_caps_title,
+    _split_first_sentence,
+    _split_sentences,
+    _strip_banner_line,
+    _strip_forwarding_lines,
+    _strip_title_prefix,
+    _truncate_by_word,
+    clean_post_for_render,
+)
 
 FEED_POST_CHARS = max(1, int(os.getenv("FEED_POST_CHARS", "300")))
 
 _MONTHS_RU = ["", "янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
 _WEEKDAYS_RU = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
-_SENTENCE_END_RE = re.compile(r"[.!?…]+(?=\s|$)")
-_ABBREVIATIONS = {"г", "руб", "коп", "ул", "д", "стр", "корп", "кв", "т", "см", "мм", "км", "кг", "шт"}
 
-_EMOJI_CLUSTER_RE = re.compile(
-    r"((?:[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\u2b50-\u2b55](?:[\ufe00-\ufe0f]|[\U0001f3fb-\U0001f3ff]|\u200d[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\u2b50-\u2b55])*))(?:\s*\1){2,}"
-)
-
-_KNOWN_ABBREVIATIONS = {
-    "ИИ", "США", "РФ", "ЕС", "ООН", "НАТО", "АЭС", "СМИ", "МИД", "РБК",
-    "ТАСС", "ОАЭ", "ЦРУ", "ФБР", "МЭА", "КОВИД", "COVID", "AI", "GPT",
-    "LLM", "API", "CEO", "UI", "SEO", "SMM", "СВО", "СНГ", "РАН", "ВОЗ",
-    "РЖД", "МЧС", "ВТО", "МОК", "МВФ", "ЕАЭС", "ОДКБ", "СФР", "ФНС", "ФАС",
-    "ВЦИОМ", "ГИБДД", "ТВЭЛ", "ИТЭР", "ТВ", "ЧП", "ДТП", "ИТ", "IT", "VK", "RU",
-    "FMCG", "WSJ", "CNN", "BBC", "NASA", "FT", "ПВО", "ВПК", "НПЗ", "ЦБ",
-    "БПЛА", "ВВП", "МТС", "ЦОД", "ГБ", "МБ", "ТБ", "ВСУ", "ФСБ", "МВД",
-    "КНДР",
-}
-_VOWELS = set("аеёиоуыэюяaeiouy")
+__all__ = [
+    "FEED_POST_CHARS",
+    "_ABBREVIATIONS",
+    "_EMOJI_CLUSTER_RE",
+    "_KNOWN_ABBREVIATIONS",
+    "_MONTHS_RU",
+    "_SENTENCE_END_RE",
+    "_VOWELS",
+    "_WEEKDAYS_RU",
+    "_aware_utc",
+    "_build_short_item_node",
+    "_channel_display_name",
+    "_clean_post_text",
+    "_clean_service_lines",
+    "_collapse_emoji_chains",
+    "_count_words",
+    "_extract_bare_url_domain",
+    "_extract_text_nodes",
+    "_extract_title_and_essence",
+    "_find_semantic_cut",
+    "_find_sentence_boundary",
+    "_first_sentence",
+    "_format_post_time",
+    "_full_card_nodes",
+    "_human_badge",
+    "_intro_date",
+    "_is_abbreviation",
+    "_is_banner_line",
+    "_normalize_caps_title",
+    "_overview_nodes",
+    "_period_range",
+    "_plural_channel",
+    "_plural_channel_genitive",
+    "_plural_channel_nominative",
+    "_plural_ru",
+    "_split_first_sentence",
+    "_split_sentences",
+    "_strip_banner_line",
+    "_strip_forwarding_lines",
+    "_strip_title_prefix",
+    "_truncate_by_word",
+    "_zone",
+    "build_feed_content",
+    "build_feed_title",
+    "clean_post_for_render",
+    "compact_number",
+    "render_feed",
+]
 
 
 def compact_number(value) -> str:
@@ -78,234 +135,6 @@ def _plural_channel_genitive(number: int) -> str:
     return _plural_ru(number, "канала", "каналов", "каналов")
 
 
-def _collapse_emoji_chains(text: str) -> str:
-    return _EMOJI_CLUSTER_RE.sub(r"\1", text)
-
-
-def _clean_service_lines(text: str) -> str:
-    lines = text.split("\n")
-    cleaned_lines = []
-    for line in lines:
-        s = line.strip()
-        if not s:
-            cleaned_lines.append("")
-            continue
-        without = re.sub(
-            r"(@[\w_]+|#[\w_]+|[|·•—\-/,;:\s]|(?:[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\u2b50-\u2b55]\ufe0f?))+",
-            "",
-            s,
-        )
-        if not without:
-            continue
-        cleaned_lines.append(line)
-    while cleaned_lines and not cleaned_lines[0].strip():
-        cleaned_lines.pop(0)
-    while cleaned_lines and not cleaned_lines[-1].strip():
-        cleaned_lines.pop()
-    res = "\n".join(cleaned_lines)
-    return re.sub(r"(\s*[@#][\w_]+(\s*[|·•—\-/,;]\s*[@#][\w_]+)*\s*)+$", "", res).rstrip()
-
-
-def _clean_post_text(raw_text: str) -> str:
-    if not raw_text:
-        return ""
-    text = _collapse_emoji_chains(raw_text)
-    text = _clean_service_lines(text)
-    return text.strip()
-
-
-def _is_abbreviation(word: str) -> bool:
-    clean_w = re.sub(r"[^\w]", "", word)
-    if not clean_w:
-        return False
-    if clean_w in _KNOWN_ABBREVIATIONS:
-        return True
-    if len(clean_w) <= 5:
-        if re.fullmatch(r"[IVXLCDM]+", clean_w):
-            return True
-        alpha_chars = [c.lower() for c in clean_w if c.isalpha()]
-        if len(alpha_chars) >= 2 and not any(c in _VOWELS for c in alpha_chars):
-            return True
-    return False
-
-
-def _normalize_caps_title(title: str) -> str:
-    letters = [c for c in title if c.isalpha()]
-    if len(letters) < 6:
-        return title
-    if sum(1 for c in letters if c.isupper()) / len(letters) < 0.7:
-        return title
-
-    tokens = re.split(r"(\b[^\W\d_]+\b)", title)
-    first_letter_found = False
-    new_tokens = []
-    for token in tokens:
-        if token.isalpha():
-            if _is_abbreviation(token):
-                new_tokens.append(token)
-                first_letter_found = True
-            elif not first_letter_found:
-                new_tokens.append(token.capitalize())
-                first_letter_found = True
-            else:
-                new_tokens.append(token.lower())
-        else:
-            new_tokens.append(token)
-            if re.search(r"[.!?]\s*$", token):
-                first_letter_found = False
-    return "".join(new_tokens)
-
-
-def _truncate_by_word(text: str, limit: int) -> str:
-    text = " ".join(text.split())
-    if not text:
-        return ""
-    if len(text) <= limit:
-        return text
-    cut_limit = max(0, limit - 1)
-    last_space = text[:cut_limit].rfind(" ")
-    if last_space != -1:
-        return text[:last_space].rstrip() + "…"
-    return text[:cut_limit] + "…"
-
-
-def _find_sentence_boundary(text: str) -> int | None:
-    for m in _SENTENCE_END_RE.finditer(text):
-        pos = m.start()
-        prefix = text[:pos].rstrip()
-        words = prefix.split()
-        if not words:
-            continue
-        token = words[-1]
-        if len(words) == 1 and token.isdigit():
-            continue
-        if token.lower() in _ABBREVIATIONS:
-            continue
-        return m.end()
-    return None
-
-
-def _split_sentences(text: str) -> list[str]:
-    sentences = []
-    current = " ".join(text.split())
-    while current:
-        b = _find_sentence_boundary(current)
-        if b is not None:
-            sentences.append(current[:b].strip())
-            current = current[b:].strip()
-        else:
-            sentences.append(current.strip())
-            break
-    return sentences
-
-
-def _find_semantic_cut(text: str, min_len: int = 50, max_len: int = 140) -> str | None:
-    # Приоритет разделителей смысловых частей: ":", " — ", ", "
-    for delim in (r":(?:\s|$)", r"\s+[—–]\s+", r",\s+"):
-        candidates = []
-        for m in re.finditer(delim, text):
-            prefix = text[:m.start()].strip()
-            clean_p = " ".join(prefix.split())
-            if min_len <= len(clean_p) <= max_len:
-                candidates.append(clean_p)
-        if candidates:
-            return candidates[-1]
-    return None
-
-
-def _strip_title_prefix(title: str, essence: str) -> str:
-    """Если «суть» начинается теми же словами, что и обрезанный заголовок, оставляем продолжение (без дубля начала)."""
-    base = " ".join(title.rstrip("…").split()).casefold()
-    flat = " ".join(essence.split())
-    if base and flat.casefold().startswith(base):
-        rest = flat[len(base):].lstrip(" ,;:—–-").strip()
-        if len(rest) < 20:
-            return ""
-        return "… " + rest if rest[:1].islower() else rest
-    return essence
-
-
-def _extract_title_and_essence(clean_text: str, max_title: int = 140, max_essence: int = 300) -> tuple[str, str]:
-    if not clean_text:
-        return "", ""
-
-    newline_pos = clean_text.find("\n")
-    punct_pos = _find_sentence_boundary(clean_text)
-    if newline_pos != -1 and punct_pos is not None:
-        first_end = min(newline_pos, punct_pos)
-    elif newline_pos != -1:
-        first_end = newline_pos
-    elif punct_pos is not None:
-        first_end = punct_pos
-    else:
-        first_end = len(clean_text)
-
-    candidate = clean_text[:first_end].strip()
-    first_sentence = " ".join(candidate.split())
-    if first_sentence.endswith(".") and not first_sentence.endswith("..") and not first_sentence.endswith("…"):
-        first_sentence = first_sentence[:-1].rstrip()
-
-    if len(first_sentence) <= max_title and first_sentence:
-        title = _normalize_caps_title(first_sentence)
-
-        rest = clean_text[first_end:].strip()
-        if not rest:
-            return title, ""
-        sentences = _split_sentences(rest)
-        if not sentences:
-            return title, ""
-
-        s1 = sentences[0]
-        if len(sentences) >= 2:
-            s2 = sentences[1]
-            if len(s1) + 1 + len(s2) <= max_essence:
-                essence = f"{s1} {s2}"
-            elif len(s1) <= max_essence:
-                essence = s1
-            else:
-                essence = _truncate_by_word(s1, max_essence)
-        else:
-            if len(s1) <= max_essence:
-                essence = s1
-            else:
-                essence = _truncate_by_word(s1, max_essence)
-        return title, essence
-
-    # Первое предложение > max_title: ищем смысловую часть до разделителя либо режем по слову
-    target = first_sentence or " ".join(clean_text.split())
-    cut = _find_semantic_cut(target, 50, max_title)
-    if cut:
-        title = cut
-        if title.endswith(".") and not title.endswith("..") and not title.endswith("…"):
-            title = title[:-1].rstrip()
-    else:
-        title = _truncate_by_word(target, max_title)
-    title = _normalize_caps_title(title)
-
-    # Если заголовок обрезан: суть = полный исходный текст с начала до max_essence по границе предложения
-    sentences = _split_sentences(clean_text)
-    if not sentences:
-        return title, ""
-    if len(sentences[0]) >= 6 and not _is_abbreviation(sentences[0]):
-        letters = [c for c in sentences[0] if c.isalpha()]
-        if len(letters) >= 6 and sum(1 for c in letters if c.isupper()) / len(letters) >= 0.7:
-            sentences[0] = _normalize_caps_title(sentences[0])
-
-    s1 = sentences[0]
-    if len(sentences) >= 2:
-        s2 = sentences[1]
-        if len(s1) + 1 + len(s2) <= max_essence:
-            essence = f"{s1} {s2}"
-        elif len(s1) <= max_essence:
-            essence = s1
-        else:
-            essence = _truncate_by_word(s1, max_essence)
-    else:
-        if len(s1) <= max_essence:
-            essence = s1
-        else:
-            essence = _truncate_by_word(s1, max_essence)
-    return title, _strip_title_prefix(title, essence)
 
 
 def _human_badge(badge: str) -> str:
@@ -335,13 +164,6 @@ def _human_badge(badge: str) -> str:
 
 def _format_post_time(post_time: datetime, now: datetime, tz=timezone.utc) -> str:
     p_tz = _aware_utc(post_time).astimezone(tz)
-    n_tz = _aware_utc(now).astimezone(tz)
-    p_date = p_tz.date()
-    n_date = n_tz.date()
-    if p_date == n_date:
-        return f"сегодня, {p_tz:%H:%M}"
-    if p_date == n_date - timedelta(days=1):
-        return f"вчера, {p_tz:%H:%M}"
     return f"{_WEEKDAYS_RU[p_tz.weekday()]} {p_tz:%d.%m, %H:%M}"
 
 
@@ -357,7 +179,7 @@ def _channel_display_name(item_or_post) -> str:
 def _full_card_nodes(item, post_chars: int, now: datetime, tz=timezone.utc) -> list[dict]:
     post = item.post
     raw_text = str(post.get("text") or "")
-    clean_text = _clean_post_text(raw_text)
+    clean_text = clean_post_for_render(raw_text)
     channel_name = _channel_display_name(item)
 
     if not clean_text:
@@ -443,12 +265,30 @@ def _full_card_nodes(item, post_chars: int, now: datetime, tz=timezone.utc) -> l
 
 def _build_short_item_node(it) -> dict:
     raw_text = str(it.post.get("text") or "")
-    clean_text = _clean_post_text(raw_text)
-    clean_len = len(" ".join(clean_text.split()))
-    if clean_len < 80:
-        short_title = _normalize_caps_title(" ".join(clean_text.split()))
+    clean_text = clean_post_for_render(raw_text)
+    domain = _extract_bare_url_domain(clean_text)
+    if domain:
+        short_title = f"🔗 ссылка · {domain}"
     else:
-        short_title, _ = _extract_title_and_essence(clean_text, max_title=80)
+        clean_len = len(" ".join(clean_text.split()))
+        if clean_len < 80:
+            short_title = _normalize_caps_title(" ".join(clean_text.split()))
+        else:
+            first_sent, _ = _split_first_sentence(clean_text)
+            first_sent_norm = " ".join(first_sent.split())
+            if first_sent_norm.endswith(".") and not first_sent_norm.endswith("..") and not first_sent_norm.endswith("…"):
+                first_sent_norm = first_sent_norm[:-1].rstrip()
+            if len(first_sent_norm) <= 140:
+                short_title = _normalize_caps_title(first_sent_norm)
+            else:
+                cut = _find_semantic_cut(first_sent_norm, 50, 140)
+                if cut:
+                    short_title = _normalize_caps_title(cut)
+                else:
+                    short_title = _normalize_caps_title(_truncate_by_word(first_sent_norm, 140))
+    short_title = short_title.lstrip("…. ").strip()
+    if short_title and short_title[0].islower():
+        short_title = short_title[0].upper() + short_title[1:]
     if not short_title:
         short_title = "Без названия"
     ch_name = _channel_display_name(it)
@@ -513,13 +353,6 @@ def _plural_channel(number: int) -> str:
     """Совместимость с feed.py: «из N канала/каналов» (как в прежнем рендере)."""
     return _plural_ru(number, "канала", "каналов", "каналов")
 
-
-def _first_sentence(text: str) -> tuple[str, str]:
-    """Совместимость с feed.py: (первое предложение, остаток)."""
-    for index, char in enumerate(text):
-        if char in ".!?…" and (index + 1 == len(text) or text[index + 1].isspace()):
-            return text[: index + 1].strip(), text[index + 1 :].strip()
-    return text, ""
 
 
 def _overview_nodes(overview: str) -> list[dict]:
@@ -616,7 +449,7 @@ def render_feed(
         glavnoe_li = []
         for it in top_items:
             raw_text = str(it.post.get("text") or "")
-            clean = _clean_post_text(raw_text)
+            clean = clean_post_for_render(raw_text)
             t_str, _ = _extract_title_and_essence(clean, max_title=140)
             if not t_str:
                 t_str = "Без названия"
@@ -679,16 +512,9 @@ def render_feed(
                 day_groups[p_time.date()].append(it)
 
             sorted_dates = sorted(day_groups.keys(), reverse=True)
-            now_date = _aware_utc(now).astimezone(tz).date()
 
             for d in sorted_dates:
-                if d == now_date:
-                    day_heading = "Сегодня"
-                elif d == now_date - timedelta(days=1):
-                    day_heading = "Вчера"
-                else:
-                    day_heading = f"{_WEEKDAYS_RU[d.weekday()].capitalize()}, {d.day} {_MONTHS_RU[d.month]}"
-
+                day_heading = f"{_WEEKDAYS_RU[d.weekday()].capitalize()}, {d.day} {_MONTHS_RU[d.month]}"
                 day_items = sorted(day_groups[d], key=lambda x: x.rank)
                 day_li = [_build_short_item_node(it) for it in day_items]
                 body_nodes.append({"tag": "h4", "children": [day_heading]})
@@ -713,18 +539,14 @@ def render_feed(
         ]})
 
     if channel_count is None:
-        channels = {str(item.post.get("channel_username") or item.channel_title or "").casefold() for item in items}
-        channels.update(
-            str(post.get("channel_username") or post.get("channel_title") or "").casefold()
-            for item in items
-            for post in item.also_in
-        )
+        channels = {str(item.post.get("channel_username") or item.channel_title or "").casefold() for item in (selected_items if selected_items else items)}
         channels.discard("")
         channel_count = len(channels)
 
     labels = {"day": "день", "week": "неделю", "month": "месяц"}
     date_str = _intro_date(period, now, tz)
-    posts_str = f"{len(items)} {_plural_ru(len(items), 'пост', 'поста', 'постов')}"
+    posts_count = len(selected_items)
+    posts_str = f"{posts_count} {_plural_ru(posts_count, 'пост', 'поста', 'постов')}"
     channels_str = f"{channel_count} {_plural_channel_genitive(channel_count)}"
     intro_base = f"Лента за {labels[period]} · {date_str} — {posts_str} из {channels_str} · ≈"
     intro_base_words = len(intro_base.split()) + 2

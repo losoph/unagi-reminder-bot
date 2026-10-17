@@ -123,6 +123,7 @@ _TAG_STYLES = {
     "hr": "border:0;border-top:1px solid #e5e7eb;margin:22px 0;",
     "a": "color:#2481cc;text-decoration:none;font-weight:600;",
     "b": "",
+    "br": "",
 }
 _VOID_TAGS = {"hr", "br"}
 

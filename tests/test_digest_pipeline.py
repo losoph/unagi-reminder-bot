@@ -407,7 +407,7 @@ class DigestRenderingTests(unittest.TestCase):
             for c in node.get("children", [])
         )
         self.assertNotIn(full_text, node_text)
-        self.assertIn("...", node_text)
+        self.assertTrue("..." in node_text or "…" in node_text)
         self.assertLessEqual(len(node_text), TELEGRAPH_POST_CHARS + 50)
 
     def test_telegraph_truncate_to_limit_emits_warning_and_notice(self):
@@ -426,7 +426,7 @@ class DigestRenderingTests(unittest.TestCase):
         ]
         content = build_content(sections)
         with self.assertLogs("telegraph_publisher", level=logging.WARNING) as log:
-            truncated = _truncate_to_limit(content, max_bytes=20000)
+            truncated = _truncate_to_limit(content, max_bytes=5000)
 
         self.assertTrue(any("posts omitted" in record.getMessage() for record in log.records))
         last_node = truncated[-1]

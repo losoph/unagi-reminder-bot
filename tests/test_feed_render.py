@@ -86,7 +86,7 @@ class FeedRenderTests(unittest.TestCase):
         # первый p - intro, второй - суть (p), третий - мета (p с i)
         meta_p = p_nodes[2]
         self.assertEqual(meta_p["children"][0]["tag"], "i")
-        self.assertIn("Alpha · сегодня, 12:00", meta_p["children"][0]["children"][0])
+        self.assertIn("Alpha · ср 14.10, 12:00", meta_p["children"][0]["children"][0])
 
         # Суть: обычный p, не blockquote
         self.assertFalse(any(n.get("tag") == "blockquote" for n in rendered))
@@ -97,7 +97,7 @@ class FeedRenderTests(unittest.TestCase):
         rendered = render_feed([item(badges=["🔥 ×3 к норме", "📢 Реклама"])], period="day", now=NOW)
         nodes = repr(rendered)
         self.assertIn("h4", nodes)
-        self.assertIn("Alpha · сегодня, 12:00", nodes)
+        self.assertIn("Alpha · ср 14.10, 12:00", nodes)
         self.assertIn("👁 120K · ↗ 340 · ❤ 1,2K · 💬 50", nodes)
         self.assertIn("🔥 в 3 раза больше просмотров, чем обычно", nodes)
         self.assertIn("📢 реклама", nodes)
@@ -191,9 +191,11 @@ class FeedRenderTests(unittest.TestCase):
 
         nodes = render_feed([today_post, yesterday_post, monday_post], period="week", now=NOW)
         rendered_str = repr(nodes)
-        self.assertIn("сегодня, 12:00", rendered_str)
-        self.assertIn("вчера, 12:00", rendered_str)
+        self.assertIn("ср 14.10, 12:00", rendered_str)
+        self.assertIn("вт 13.10, 12:00", rendered_str)
         self.assertIn("пн 12.10, 08:10", rendered_str)
+        self.assertNotIn("сегодня", rendered_str.lower())
+        self.assertNotIn("вчера", rendered_str.lower())
 
     def test_human_readable_badges(self):
         entry = item(
@@ -370,14 +372,14 @@ class FeedRenderTests(unittest.TestCase):
         title = build_feed_title("day", late, tz="Europe/Moscow")
         nodes = render_feed([entry], period="day", now=late, tz="Europe/Moscow")
         self.assertEqual(title, "Лента за день · 15.10")
-        self.assertIn("Alpha · сегодня, 01:30", repr(nodes))
+        self.assertIn("Alpha · чт 15.10, 01:30", repr(nodes))
 
     def test_russian_plural_forms(self):
         expected = {
             1: "Лента за день · 14 окт — 1 пост из 1 канала",
             3: "Лента за день · 14 окт — 3 поста из 3 каналов",
+            5: "Лента за день · 14 окт — 5 постов из 5 каналов",
             21: "Лента за день · 14 окт — 21 пост из 21 канала",
-            50: "Лента за день · 14 окт — 50 постов из 50 каналов",
         }
         for count, prefix in expected.items():
             with self.subTest(count=count):
@@ -648,12 +650,14 @@ class FeedRenderTests(unittest.TestCase):
         korotko_idx = [i for i, n in enumerate(nodes) if n.get("tag") == "h3" and n.get("children") == ["Коротко"]][0]
         following = nodes[korotko_idx + 1:]
         h4_day_headings = [n["children"][0] for n in following if n.get("tag") == "h4"]
-        self.assertIn("Сегодня", h4_day_headings)
-        self.assertIn("Вчера", h4_day_headings)
+        self.assertIn("Ср, 14 окт", h4_day_headings)
+        self.assertIn("Вт, 13 окт", h4_day_headings)
         self.assertIn("Пн, 12 окт", h4_day_headings)
+        self.assertNotIn("Сегодня", h4_day_headings)
+        self.assertNotIn("Вчера", h4_day_headings)
 
     def test_also_in_reads_cleanly_and_no_duplicates(self):
-        # Подпись вида «Канал · вчера, 18:11 · также: A, B (+2)» читается и один и тот же канал не повторяется
+        # Подпись вида «Канал · вт 13.10, 08:49 · также: A, B (+2)» читается и один и тот же канал не повторяется
         yesterday_time = NOW - timedelta(days=1, hours=3, minutes=11)  # вчера
         entry = item(
             channel="main_chan",
@@ -676,7 +680,7 @@ class FeedRenderTests(unittest.TestCase):
             for c in meta_node.get("children", [])
         )
         # Проверяем читаемость формата
-        self.assertIn("MainChan · вчера, 08:49 · также: ChanA, ChanB (+2)", meta_text)
+        self.assertIn("MainChan · вт 13.10, 08:49 · также: ChanA, ChanB (+2)", meta_text)
         # Канал chan_a упомянут ровно один раз
         self.assertEqual(meta_text.count("ChanA"), 1)
         # Основной канал не дублируется в «также:»
@@ -724,11 +728,12 @@ class TitlePrefixTests(unittest.TestCase):
         title, essence = feed_render._extract_title_and_essence(text)
         self.assertLessEqual(len(title), 141)
         self.assertFalse(essence.casefold().startswith(title.rstrip("…").casefold()[:40]))
-        self.assertTrue(essence.startswith("…") or essence[:1].isupper())
+        self.assertFalse(essence.startswith("…"))
+        self.assertTrue(essence[:1].isupper())
 
     def test_strip_title_prefix_edge_cases(self):
         import feed_render
         strip = feed_render._strip_title_prefix
         self.assertEqual(strip("Коротко", "Совсем другой текст"), "Совсем другой текст")
         self.assertEqual(strip("Заголовок", "Заголовок и всё"), "")  # остаток короче 20 символов
-        self.assertEqual(strip("Заголовок…", "Заголовок, а дальше идёт длинное продолжение мысли"), "… а дальше идёт длинное продолжение мысли")
+        self.assertEqual(strip("Заголовок…", "Заголовок, а дальше идёт длинное продолжение мысли"), "А дальше идёт длинное продолжение мысли")
