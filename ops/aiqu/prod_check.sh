@@ -59,11 +59,7 @@ remote() {
   echo "now=$(date '+%F %T')"
 }
 
-if [ -n "${PROD_CHECK_OUT:-}" ]; then
-  out="$PROD_CHECK_OUT"
-else
-  out="$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$SSH_HOST" "$(declare -f remote); remote '$PROD_DIR' '$CONTAINER' '$SINCE'" 2>&1)" || { echo "ALERT ssh: нет связи с $SSH_HOST"; printf '%s\n' "$out" | tail -n 3; exit 1; }
-fi
+out="$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$SSH_HOST" "$(declare -f remote); remote '$PROD_DIR' '$CONTAINER' '$SINCE'" 2>&1)" || { echo "ALERT ssh: нет связи с $SSH_HOST"; printf '%s\n' "$out" | tail -n 3; exit 1; }
 get() { printf '%s\n' "$out" | sed -n "s/^$1=//p" | head -n 1; }
 
 status=0
