@@ -67,7 +67,6 @@ from data.database import (
     increment_ai_usage,
     init_db,
     is_channel_backlog_overloaded,
-    is_valid_channel_username,
     mark_as_sent,
     mark_message_delivery_error,
     mark_reminder_as_done,
@@ -236,20 +235,29 @@ from data_transfer import (  # noqa: F401
     import_wrong_type,
     process_import_file,
 )
+import digest_setup
+from digest_setup import (  # noqa: F401
+    DigestSetupState,
+    build_setup_digest_keyboard,
+    save_subscription,
+    setup_digest,
+)
 dp.include_router(reminders_ux.router)
 dp.include_router(user_prefs.router)
 dp.include_router(feed.router)
 dp.include_router(bookmarks.router)
 dp.include_router(digest_settings.router)
 dp.include_router(data_transfer.router)
+dp.include_router(digest_setup.router)
 # SEC1 (п.5): бот работает только в личных сообщениях. Корневые фильтры
 # отсекают группы/каналы до маршрутизации во вложенные роутеры, поэтому ни один
-# пользовательский обработчик (main/reminders_ux/user_prefs/feed/bookmarks/digest_settings/data_transfer) не увидит
+# пользовательский обработчик (main/reminders_ux/user_prefs/feed/bookmarks/digest_settings/data_transfer/digest_setup) не увидит
 # сообщение или callback из группового чата.
 dp.message.filter(F.chat.type == ChatType.PRIVATE)
 dp.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
 feed.configure(bot=bot, channel_source=channel_source)
 data_transfer.configure(bot=bot)
+digest_setup.configure(bot=bot)
 from time_utils import (  # noqa: E402
     _DAY_PART_HOURS,
     TIME_TEXT_EXAMPLES,
@@ -3251,88 +3259,6 @@ async def catch_message(message: types.Message, state: FSMContext):
     )
 
 
-@dp.callback_query(F.data == "digest_setup")
-async def setup_digest(callback: CallbackQuery, state: FSMContext):
-    callback_message = get_callback_message(callback)
-    if callback_message is None:
-        await callback.answer("❌ Сообщение недоступно.")
-        return
-
-    kb = [
-        [InlineKeyboardButton(text="📅 Раз в день", callback_data="period_daily")],
-        [InlineKeyboardButton(text="🗓 Раз в неделю", callback_data="period_weekly")],
-        [InlineKeyboardButton(text="📊 Раз в месяц", callback_data="period_monthly")],
-        [InlineKeyboardButton(text="📰 В Ленту (без расписания)", callback_data="feed_add")],
-    ]
-    await callback_message.edit_text(
-        "Как часто присылать новые посты из этого канала?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
-    )
-
-
-@dp.callback_query(F.data.startswith("period_"))
-async def save_subscription(callback: CallbackQuery, state: FSMContext):
-    callback_message = get_callback_message(callback)
-    if callback_message is None:
-        await callback.answer("❌ Сообщение недоступно.")
-        return
-
-    period = parse_callback_strip_prefix(callback.data, "period_")
-    if period is None:
-        await callback.answer("❌ Некорректные данные.")
-        return
-    data = await state.get_data()
-    username = data.get("channel_username")
-    title = data.get("channel_title")
-
-    if not username:
-        await callback_message.edit_text("❌ Ошибка: данные канала утеряны.")
-        return
-
-    username = normalize_channel_username(username)
-    # SEC1 (п.10): имя канала идёт в href дайджеста — валидируем при сохранении.
-    if not is_valid_channel_username(username):
-        await callback.answer("❌ Некорректное имя канала.", show_alert=True)
-        return
-
-    now = local_now()
-    settings = resolve_digest_settings(user_id_from_callback(callback), period, now)
-    next_send = get_next_digest_time(period, now, settings)
-    last_scraped = serialize_datetime(utc_now())
-    try:
-        sub_id = add_subscription(
-            user_id_from_callback(callback),
-            username,
-            title,
-            period,
-            last_scraped,
-            serialize_datetime(next_send),
-        )
-    except ValueError as exc:
-        await callback.answer(f"🚫 {exc}", show_alert=True)
-        return
-
-    await callback.answer("✅ Подписка оформлена!")
-
-    try:
-        if callback_message.reply_to_message:
-            await bot.delete_message(user_id_from_callback(callback), callback_message.reply_to_message.message_id)
-    except TelegramAPIError:
-        pass
-
-    title_safe = html.escape(title) if title else "Канал"
-    confirmation = (
-        f"✅ <b>Дайджест оформлен:</b> {title_safe}\n"
-        f"Будет приходить {format_digest_schedule(period, settings)}.\n\n"
-        f"Можно сразу изменить периодичность или время:"
-    )
-    keyboard = build_post_subscribe_keyboard(sub_id, period)
-    try:
-        await callback_message.edit_text(confirmation, parse_mode="HTML", reply_markup=keyboard)
-    except TelegramAPIError:
-        await callback_message.answer(confirmation, parse_mode="HTML", reply_markup=keyboard)
-
-    await state.clear()
 
 
 @dp.callback_query(F.data.startswith("time_"))
