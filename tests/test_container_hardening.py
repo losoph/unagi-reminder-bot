@@ -58,6 +58,11 @@ class ComposeTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertLessEqual(float(match.group(1)), 1.0)
 
+    def test_git_sha_label(self):
+        compose = read("docker-compose.yml")
+        self.assertIn("org.unagi.git_sha", compose)
+        self.assertIn("${GIT_SHA:-unknown}", compose)
+
     def test_ci_smoke_uses_compose_capabilities(self):
         workflow = read(".github", "workflows", "deploy.yml")
         in_ci = set(re.findall(r"--cap-add (\w+)", workflow))

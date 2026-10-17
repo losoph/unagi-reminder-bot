@@ -27,6 +27,7 @@ remote() {
   # docker-compose.yml на проде правят вручную (лимит CPU) — это известная, не тревожная правка.
   echo "dirty=$(git status --porcelain --untracked-files=no | grep -v ' docker-compose.yml$' | wc -l | tr -d ' ')"
   echo "container=$(docker inspect -f '{{.State.Status}} restarting={{.State.Restarting}} started={{.State.StartedAt}}' "$2" 2>/dev/null || echo missing)"
+  echo "container_sha=$(docker inspect -f '{{ index .Config.Labels "org.unagi.git_sha" }}' "$2" 2>/dev/null || true)"
   logs="$(docker logs --since "$3" "$2" 2>&1)"
   echo "log_errors=$(printf '%s\n' "$logs" | grep -cE ' - (ERROR|CRITICAL) - |Traceback')"
   echo "last_error=$(printf '%s\n' "$logs" | grep -E ' - (ERROR|CRITICAL) - ' | tail -n 1 | cut -c1-200)"
@@ -72,6 +73,14 @@ case "$container" in
   "running restarting=false"*) say OK "контейнер: $container" ;;
   *) say ALERT "контейнер: $container" ;;
 esac
+csha="$(get container_sha)"
+if [ -z "$csha" ] || [ "$csha" = unknown ] || [ "$csha" = "<no value>" ]; then
+  say WARN "контейнер: метка версии unknown/пустая (первый деплой после внедрения)"
+elif [ "$csha" != "$rev" ]; then
+  say ALERT "контейнер на старом коде: метка $csha, HEAD $rev"
+else
+  say OK "контейнер: код $csha (HEAD $rev)"
+fi
 errors="$(get log_errors)"
 if [ "${errors:-0}" -gt 0 ]; then say ALERT "логи за $SINCE: ошибок $errors, последняя: $(get last_error)"; else say OK "логи за $SINCE: ошибок нет"; fi
 cycle="$(get last_digest_cycle)"

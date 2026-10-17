@@ -63,10 +63,34 @@ jobs:
             # --- end sync
             # Снимок БД до пересборки (миграции только добавляют, но откат данных должен быть возможен). Нет снимка — нет деплоя.
             python3 ops/aiqu/backup_db.py --db storage/bot_data.db || { echo "резервная копия не создана — деплой остановлен"; exit 1; }
+            # Откатный тег: помечаем образ работающего контейнера перед сборкой (если контейнер есть; prune не удаляет тегированные образы).
+            current_image="$(docker inspect -f '{{.Image}}' unagi-bot 2>/dev/null || true)"
+            if [ -n "$current_image" ]; then
+              docker tag "$current_image" unagi-reminder-bot-bot:rollback 2>/dev/null || true
+            fi
+            export GIT_SHA="$(git rev-parse --short HEAD)"
             docker compose up -d --build
+            # --- liveness (tests/test_dep2_deploy_verify.py исполняет этот блок во временной среде)
+            sleep "${DEPLOY_WAIT_SECS:-20}"
+            status="$(docker inspect -f '{{.State.Status}}' unagi-bot 2>/dev/null || echo missing)"
+            restarts="$(docker inspect -f '{{.RestartCount}}' unagi-bot 2>/dev/null || echo -1)"
+            container_sha="$(docker inspect -f '{{ index .Config.Labels "org.unagi.git_sha" }}' unagi-bot 2>/dev/null || echo missing)"
+            if [ "$status" != "running" ] || [ "$restarts" != "0" ] || [ "$container_sha" != "$GIT_SHA" ]; then
+              echo "деплой остановлен: контейнер не в статусе running, перезапускался или метка версии не совпадает (status=$status, restart_count=$restarts, container_sha=$container_sha, expected=$GIT_SHA)"
+              docker logs --tail 30 unagi-bot || true
+              exit 1
+            fi
+            # --- end liveness
             # Диск: каждая пересборка оставляет прежние слои образа и кеш сборки (78% → 82% за три деплоя 17.10, порог тревоги prod_check — 85%).
             # Только висячие образы и старый кеш сборки; запущенный контейнер и его образ не затрагиваются. Сбой очистки деплой не ломает.
             docker image prune -f || true
             docker builder prune -f --filter until=6h || true
+            # Защита от переполнения диска 9.8 ГБ (порог ALERT prod_check — 85%): если места мало, удаляем rollback-образ
+            disk_pct="$(df --output=pcent . 2>/dev/null | tail -n 1 | tr -dc '0-9')"
+            if [ -n "$disk_pct" ] && [ "$disk_pct" -ge 85 ]; then
+              echo "диск ${disk_pct}% >= 85%: удаление rollback-образа для защиты от переполнения"
+              docker rmi unagi-reminder-bot-bot:rollback 2>/dev/null || true
+              docker image prune -f || true
+            fi
             # Cron-файлы из репозитория (разовое письмо с итогами спринта): идемпотентная установка, сбой не ломает деплой.
             for f in ops/aiqu/cron.d/*; do [ -f "$f" ] && install -m 0644 -o root -g root "$f" "/etc/cron.d/$(basename "$f")" || true; done

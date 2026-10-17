@@ -58,6 +58,70 @@ ops/aiqu/prod_check.sh --since 10m      # после деплоя — тольк
 - Проверка: `ops/aiqu/prod_check.sh` — строки «права процесса» и «email-дайджесты»; в CI тот же набор флагов проверяет шаг «Smoke test hardened container».
 - Откат: `git revert <коммит>` и push в main — деплой вернёт прежний образ (владелец файлов в `storage/` root не мешает: root читает всё).
 
+### Контроль версии работающего контейнера и быстрый откат (DEP2)
+
+17.10 дважды возникала ситуация: деплой падал при `up`, контейнер оставался на старом образе, а `prod_check.sh` рапортовал «версия OK», так как сверял только `git rev-parse HEAD` в репозитории на сервере, а не версию кода внутри запущенного контейнера.
+
+**Метка версии контейнера:**
+- В `docker-compose.yml` контейнер помечен меткой `labels: {org.unagi.git_sha: "${GIT_SHA:-unknown}"}`.
+- В `.github/workflows/deploy.yml` перед `docker compose up` экспортируется `GIT_SHA="$(git rev-parse --short HEAD)"`.
+- `ops/aiqu/prod_check.sh` читает метку через `docker inspect -f '{{ index .Config.Labels "org.unagi.git_sha" }}'` и выдаёт:
+  * `ALERT "контейнер на старом коде: метка X, HEAD Y"` — если метка не совпадает с HEAD в git на сервере;
+  * `WARN "контейнер: метка версии unknown/пустая (первый деплой после внедрения)"` — при значении `unknown`, пустой строке или отсутствии метки;
+  * `OK "контейнер: код X (HEAD X)"` — при совпадении.
+
+**Проверка живости при деплое:**
+- В `deploy.yml` сразу после `docker compose up -d` выполняется проверка: пауза до 20 с (`sleep "${DEPLOY_WAIT_SECS:-20}"`), затем проверка через `docker inspect`:
+  - `State.Status == running`
+  - `RestartCount == 0` (корневое поле `{{.RestartCount}}`)
+  - `org.unagi.git_sha == $GIT_SHA` (метка версии совпадает с коммитом деплоя).
+- Если контейнер не запустился, упал в цикличный перезапуск или метка версии не совпала, деплой немедленно выводит последние 30 строк логов (`docker logs --tail 30 unagi-bot`) и завершается с ошибкой (`exit 1`).
+
+**Откатный тег образа и как откатиться:**
+- Перед сборкой нового образа (`up --build`) CI помечает образ текущего работающего контейнера:
+  ```bash
+  current_image="$(docker inspect -f '{{.Image}}' unagi-bot 2>/dev/null || true)"
+  if [ -n "$current_image" ]; then
+    docker tag "$current_image" unagi-reminder-bot-bot:rollback 2>/dev/null || true
+  fi
+  ```
+  Это гарантирует, что откатный тег указывает на реально работающий образ контейнера, а не на промежуточный или сбойный последний собранный `:latest`.
+- Очистка образов `docker image prune -f` удаляет **только dangling (безымянные)** слои без тегов (`<none>:<none>`). Образ с тегом `:rollback` защищён от удаления.
+- **Политика защиты диска 9.8 ГБ (порог ALERT 85%):**
+  - Если после деплоя и prune использование диска составляет 85% или выше, шаг деплоя автоматически удаляет тег `:rollback` (`docker rmi unagi-reminder-bot-bot:rollback`) и повторно запускает `docker image prune -f`, предотвращая переполнение диска.
+- **База данных и миграции при откате:**
+  - Перед каждым деплоем `backup_db.py` сохраняет преддеплойный снимок `storage/backups/bot_data-<время>-predeploy.db`.
+  - Если деплой применил миграции схемы БД, откат кода без отката БД оставит старый код на несовместимой новой схеме.
+  - Перед запуском откаченного контейнера восстановите преддеплойный снимок БД:
+    ```bash
+    docker compose stop unagi-bot
+    latest_backup="$(ls -1t storage/backups/bot_data-*-predeploy.db 2>/dev/null | head -n 1)"
+    [ -n "$latest_backup" ] && cp "$latest_backup" storage/bot_data.db
+    ```
+- **Быстрый откат на сервере (без пересборки):**
+  1. Переключить git-репозиторий на откатный коммит и экспортировать `GIT_SHA` (чтобы контейнер получил правильную метку версии):
+     ```bash
+     cd ~/projects/unagi-reminder-bot
+     git checkout <sha>
+     export GIT_SHA="$(git rev-parse --short HEAD)"
+     ```
+  2. Переключить тег `latest` на сохранённый образ `rollback` и поднять контейнер (при необходимости восстановив БД перед `up -d`):
+     ```bash
+     docker tag unagi-reminder-bot-bot:rollback unagi-reminder-bot-bot:latest
+     docker compose up -d
+     ```
+  3. Проверить откат с флагом ожидаемого коммита (по умолчанию `prod_check.sh` ожидает `origin/main`):
+     ```bash
+     ops/aiqu/prod_check.sh --expect <sha>
+     ```
+- **Откат с пересборкой из git (если тега rollback нет или диск очистил его):**
+  ```bash
+  git checkout <sha>
+  export GIT_SHA="$(git rev-parse --short HEAD)"
+  docker compose up -d --build
+  ops/aiqu/prod_check.sh --expect <sha>
+  ```
+
 ### Резервные копии БД и восстановление
 
 Перед каждым деплоем шаг CI выполняет:
