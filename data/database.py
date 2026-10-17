@@ -179,6 +179,37 @@ def _migrate_legacy_local_timestamps_to_utc(cursor: sqlite3.Cursor) -> None:
     _set_meta(cursor, "timestamps_storage", "utc_v1")
 
 
+# SEC2 (п.13): индекс пересоздаётся только при реальном расхождении определения,
+# а не на каждом старте. IF NOT EXISTS в sqlite_master не сохраняется, поэтому
+# нормализация его отбрасывает.
+_ACTIVE_SUBSCRIPTION_INDEX_NAME = "uq_subscriptions_user_channel_period_active"
+_ACTIVE_SUBSCRIPTION_INDEX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_subscriptions_user_channel_period_active
+ON subscriptions(user_id, channel_username, period)
+WHERE is_disabled = 0
+"""
+
+
+def _normalize_index_sql(sql: str | None) -> str:
+    normalized = " ".join((sql or "").split())
+    normalized = re.sub(r"\bif\s+not\s+exists\b", "", normalized, flags=re.IGNORECASE)
+    return " ".join(normalized.split()).lower()
+
+
+def _ensure_active_subscription_unique_index(cursor: sqlite3.Cursor) -> bool:
+    """Create the partial unique index or repair it if its definition drifted."""
+    row = cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (_ACTIVE_SUBSCRIPTION_INDEX_NAME,),
+    ).fetchone()
+    if row and _normalize_index_sql(row[0]) == _normalize_index_sql(_ACTIVE_SUBSCRIPTION_INDEX_SQL):
+        return False
+    if row:
+        cursor.execute(f"DROP INDEX IF EXISTS {_ACTIVE_SUBSCRIPTION_INDEX_NAME}")
+    cursor.execute(_ACTIVE_SUBSCRIPTION_INDEX_SQL)
+    return True
+
+
 def _deduplicate_active_subscriptions(cursor: sqlite3.Cursor) -> int:
     duplicate_groups = cursor.execute(
         """
@@ -784,13 +815,7 @@ def init_db():
         if reactivated_count:
             _set_meta(cursor, "reactivated_legacy_transient_failures", str(reactivated_count))
         _deduplicate_active_subscriptions(cursor)
-        cursor.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_subscriptions_user_channel_period_active
-            ON subscriptions(user_id, channel_username, period)
-            WHERE is_disabled = 0
-            """
-        )
+        _ensure_active_subscription_unique_index(cursor)
         conn.commit()
         _secure_db_files()
 
