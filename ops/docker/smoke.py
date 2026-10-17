@@ -9,6 +9,8 @@ import tempfile
 from pathlib import Path
 
 BOT_ID = 10001
+# Скрипт лежит в ops/docker, а модули приложения — в корне образа.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 failures: list[str] = []
 
 
