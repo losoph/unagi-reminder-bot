@@ -1,5 +1,7 @@
+import asyncio
 import logging
 import os
+import time
 
 import aiohttp
 
@@ -12,10 +14,90 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").r
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 AI_DAILY_LIMIT = int(os.getenv("AI_DAILY_LIMIT", "10"))
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=60)
+KEY_CHECK_INTERVAL_SECONDS = max(60, int(os.getenv("DEEPSEEK_CHECK_INTERVAL_SECONDS", "3600")))
+AUTH_ERROR_COOLDOWN_SECONDS: int = 3600
+
+_last_auth_error_time: float = 0.0
+_auth_error_logged: bool = False
+
+
+def _handle_auth_error(status: int, now: float | None = None) -> None:
+    global _last_auth_error_time, _auth_error_logged
+    current_time = time.monotonic() if now is None else now
+    msg = f"ключ DeepSeek недействителен ({status})"
+    if not _auth_error_logged:
+        logger.error(msg)
+        _auth_error_logged = True
+        _last_auth_error_time = current_time
+    elif current_time - _last_auth_error_time >= AUTH_ERROR_COOLDOWN_SECONDS:
+        logger.warning(msg)
+        _last_auth_error_time = current_time
+
+
+def _handle_auth_success() -> None:
+    global _last_auth_error_time, _auth_error_logged
+    _auth_error_logged = False
+    _last_auth_error_time = 0.0
+
+
+def reset_auth_error_state() -> None:
+    """Сброс состояния троттлинга ошибок авторизации (для тестов)."""
+    global _last_auth_error_time, _auth_error_logged
+    _auth_error_logged = False
+    _last_auth_error_time = 0.0
 
 
 def is_enabled() -> bool:
     return bool(DEEPSEEK_API_KEY)
+
+
+async def check_api_key(session: aiohttp.ClientSession | None = None) -> bool:
+    """HP1: Проверка ключа DeepSeek при старте или по расписанию.
+
+    Делает легковесный запрос GET /models без списания токенов.
+    При HTTP 401/403 пишет в лог ОДНУ строку ERROR (повторы через >= 1 час — WARNING).
+    Ключ в лог никогда не выводится, трейсбеки отсутствуют.
+    """
+    if not DEEPSEEK_API_KEY:
+        return False
+
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+    }
+    http_sess = session or get_session()
+    try:
+        req = http_sess.get(
+            f"{DEEPSEEK_BASE_URL}/models",
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        async with req as response:
+            if response.status in (401, 403):
+                _handle_auth_error(response.status)
+                return False
+            if response.status != 200:
+                logger.warning("DeepSeek API ping returned HTTP %s", response.status)
+                return False
+            _handle_auth_success()
+            return True
+    except Exception:
+        logger.warning("Не удалось выполнить проверку ключа DeepSeek")
+        return False
+
+
+ping = check_api_key
+
+
+async def run_key_check_loop(interval_seconds: int = KEY_CHECK_INTERVAL_SECONDS) -> None:
+    """Фоновый цикл периодической проверки ключа DeepSeek."""
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            await check_api_key()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.warning("Ошибка в фоновой проверке ключа DeepSeek")
 
 
 async def ask(
@@ -54,10 +136,14 @@ async def ask(
             timeout=REQUEST_TIMEOUT,
         )
         async with post_req as response:
+            if response.status in (401, 403):
+                _handle_auth_error(response.status)
+                return None
             if response.status != 200:
                 body = await response.text()
                 logger.error("DeepSeek HTTP %s: %s", response.status, body[:300])
                 return None
+            _handle_auth_success()
             data = await response.json()
         return (data["choices"][0]["message"]["content"] or "").strip() or None
     except Exception:

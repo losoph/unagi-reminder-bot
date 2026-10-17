@@ -780,7 +780,8 @@ async def render_personal_channels(
 
     channels = get_cached_personal_channels(user_id)
     if channels is None or force_refresh:
-        existing = {s["channel_username"].lower() for s in list_feed_subscriptions(user_id, include_paused=True)}
+        raw_subs = await asyncio.to_thread(list_feed_subscriptions, user_id, include_paused=True)
+        existing = {s["channel_username"].lower() for s in raw_subs}
         if _channel_source is not None and hasattr(_channel_source, "list_personal_channels"):
             channels = await _channel_source.list_personal_channels(limit=20, exclude_usernames=existing)
         else:
@@ -1715,7 +1716,7 @@ async def cb_feed_channels(callback: types.CallbackQuery, state: FSMContext):
     except (IndexError, ValueError):
         page = 0
 
-    subs = list_feed_subscriptions(user_id, include_paused=True)
+    subs = await asyncio.to_thread(list_feed_subscriptions, user_id, include_paused=True)
     total = len(subs)
     page_size = 8
     start = page * page_size
@@ -1869,7 +1870,7 @@ async def cb_feed_delete(callback: types.CallbackQuery, state: FSMContext):
     delete_feed_subscription(user_id, sub_id)
     await callback.answer("🗑 Канал убран из Ленты")
 
-    subs = list_feed_subscriptions(user_id, include_paused=True)
+    subs = await asyncio.to_thread(list_feed_subscriptions, user_id, include_paused=True)
     page_size = 8
     total = len(subs)
     if page > 0 and (page * page_size) >= total:
@@ -1900,7 +1901,8 @@ async def cb_feed_tag_menu(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Канал не найден.")
         return
 
-    existing_tags = list_feed_tags(user_id)[:8]
+    raw_tags = await asyncio.to_thread(list_feed_tags, user_id)
+    existing_tags = raw_tags[:8]
     await state.set_state(FeedTagState.waiting_for_tag)
     await state.update_data(tag_sub_id=sub_id, tag_choices=existing_tags, page=page)
 

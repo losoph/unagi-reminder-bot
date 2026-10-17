@@ -149,7 +149,7 @@ async def pop_screen(state: FSMContext) -> dict | None:
 
 async def render_kb_tags_screen(chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext):
     await state.set_state(None)
-    saved_msgs = get_saved_messages(chat_id)
+    saved_msgs = await asyncio.to_thread(get_saved_messages, chat_id)
     if not saved_msgs:
         text = "📭 Твоя база знаний пока пуста."
         if isinstance(target, CallbackQuery):
@@ -198,7 +198,7 @@ async def render_kb_tags_screen(chat_id: int, target: types.Message | types.Call
 async def render_kb_list_screen(chat_id: int, tag: str | None, page: int, target: types.Message | types.CallbackQuery, state: FSMContext):
     await state.update_data(kb_current_tag=tag, kb_current_page=page)
 
-    saved_msgs = get_saved_messages(chat_id)
+    saved_msgs = await asyncio.to_thread(get_saved_messages, chat_id)
     if tag:
         filtered = [m for m in saved_msgs if (m[1] or "Без тега") == tag]
     else:
@@ -359,7 +359,7 @@ async def render_kb_move_screen(chat_id: int, msg_id: int, target: types.Message
         f"Выберите одну из существующих категорий ниже или пришлите новый тег текстом в чат:"
     )
 
-    tags = get_user_tags(chat_id)
+    tags = await asyncio.to_thread(get_user_tags, chat_id)
     await state.update_data(kb_move_tags=tags, bookmark_msg_id=msg_id)
 
     buttons = []
@@ -399,7 +399,7 @@ async def start_save_flow(
     command_message_id: int | None = None,
     orig_msg_id: int | None = None,
 ) -> None:
-    tags = get_user_tags(user_id_from_message(message))
+    tags = await asyncio.to_thread(get_user_tags, user_id_from_message(message))
     tags_text = ""
     if tags:
         tags_formatted = "  ".join([f"`{tag}`" for tag in tags])

@@ -544,10 +544,11 @@ def reschedule_user_period(user_id: int, period: str):
 
 async def _refresh_digest_settings(callback: CallbackQuery):
     user_id = user_id_from_callback(callback)
+    subs = await asyncio.to_thread(get_user_subscriptions, user_id)
     await edit_or_answer(
         callback,
         render_digest_settings_text(user_id),
-        reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id), user_id=user_id),
+        reply_markup=build_digest_settings_keyboard(subs, user_id=user_id),
     )
 
 
@@ -685,7 +686,7 @@ async def resume_subscription(callback: CallbackQuery):
 
 @router.callback_query(F.data == "dpauseall")
 async def pause_all_subscriptions(callback: CallbackQuery):
-    changed = set_all_subscriptions_paused(user_id_from_callback(callback), True)
+    changed = await asyncio.to_thread(set_all_subscriptions_paused, user_id_from_callback(callback), True)
     await _refresh_digest_settings(callback)
     await callback.answer(f"⏸ На паузе: {changed}")
 
@@ -693,10 +694,10 @@ async def pause_all_subscriptions(callback: CallbackQuery):
 @router.callback_query(F.data == "dresumeall")
 async def resume_all_subscriptions(callback: CallbackQuery):
     user_id = user_id_from_callback(callback)
-    changed = set_all_subscriptions_paused(user_id, False)
+    changed = await asyncio.to_thread(set_all_subscriptions_paused, user_id, False)
     # Пересчитываем расписание для всех периодов после возобновления.
     for period in ("daily", "weekly", "monthly"):
-        reschedule_user_period(user_id, period)
+        await asyncio.to_thread(reschedule_user_period, user_id, period)
     await _refresh_digest_settings(callback)
     await callback.answer(f"▶️ Возобновлено: {changed}")
 
@@ -723,7 +724,7 @@ async def confirm_unsubscribe_all(callback: CallbackQuery):
 
 @router.callback_query(F.data == "dunsuball_yes")
 async def unsubscribe_all_confirmed(callback: CallbackQuery):
-    removed = unsubscribe_all(user_id_from_callback(callback))
+    removed = await asyncio.to_thread(unsubscribe_all, user_id_from_callback(callback))
     await _refresh_digest_settings(callback)
     await callback.answer(f"🗑 Удалено подписок: {removed}")
 
@@ -739,7 +740,7 @@ async def open_subscription_folder_menu(callback: CallbackQuery, state: FSMConte
     if not sub:
         await callback.answer("❌ Подписка не найдена.", show_alert=True)
         return
-    folders = get_subscription_tags(user_id)
+    folders = await asyncio.to_thread(get_subscription_tags, user_id)
     await state.update_data(folder_sub_id=sub_id, folder_list=folders)
     current = sub["tag"] or "Без папки"
     text = (
@@ -825,10 +826,11 @@ async def process_new_subscription_folder(message: types.Message, state: FSMCont
         await message.delete()
     except TelegramAPIError:
         pass
+    subs = await asyncio.to_thread(get_user_subscriptions, user_id_from_message(message))
     await message.answer(
         render_digest_settings_text(user_id_from_message(message)),
         parse_mode="HTML",
-        reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id_from_message(message))),
+        reply_markup=build_digest_settings_keyboard(subs),
     )
 
 
@@ -898,7 +900,7 @@ async def save_digest_time(callback: CallbackQuery):
         await callback.answer("❌ Некорректные данные.", show_alert=True)
         return
     upsert_digest_settings(user_id_from_callback(callback), period, send_hour=hour, send_minute=minute)
-    reschedule_user_period(user_id_from_callback(callback), period)
+    await asyncio.to_thread(reschedule_user_period, user_id_from_callback(callback), period)
     await edit_or_answer(
         callback,
         render_digest_schedule_text(user_id_from_callback(callback), period),
@@ -934,7 +936,7 @@ async def save_digest_weekday(callback: CallbackQuery):
         await callback.answer("❌ Некорректные данные.", show_alert=True)
         return
     upsert_digest_settings(user_id_from_callback(callback), period, weekday=weekday)
-    reschedule_user_period(user_id_from_callback(callback), period)
+    await asyncio.to_thread(reschedule_user_period, user_id_from_callback(callback), period)
     await edit_or_answer(
         callback,
         render_digest_schedule_text(user_id_from_callback(callback), period),
@@ -960,7 +962,7 @@ async def save_digest_monthday(callback: CallbackQuery):
         await callback.answer("❌ Некорректные данные.", show_alert=True)
         return
     upsert_digest_settings(user_id_from_callback(callback), "monthly", month_day=day)
-    reschedule_user_period(user_id_from_callback(callback), "monthly")
+    await asyncio.to_thread(reschedule_user_period, user_id_from_callback(callback), "monthly")
     await edit_or_answer(
         callback,
         render_digest_schedule_text(user_id_from_callback(callback), "monthly"),
@@ -987,7 +989,7 @@ async def save_digest_monthly_mode(callback: CallbackQuery):
         await callback.answer("❌ Некорректные данные.", show_alert=True)
         return
     upsert_digest_settings(user_id_from_callback(callback), "monthly", monthly_mode=mode)
-    reschedule_user_period(user_id_from_callback(callback), "monthly")
+    await asyncio.to_thread(reschedule_user_period, user_id_from_callback(callback), "monthly")
     await edit_or_answer(
         callback,
         render_digest_schedule_text(user_id_from_callback(callback), "monthly"),
