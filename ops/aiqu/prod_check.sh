@@ -47,6 +47,9 @@ remote() {
   echo "backup_age_h=$([ -n "$newest" ] && echo $(( ( $(date +%s) - $(stat -c %Y "$newest") ) / 3600 )) || echo none)"
   echo "mem=$(docker stats --no-stream --format '{{.MemUsage}}' "$2" 2>/dev/null)"
   echo "compose_dirty=$(git status --porcelain --untracked-files=no docker-compose.yml | wc -l | tr -d ' ')"
+  # Неразрешённые пути и маркеры конфликта (17.10: неудачный autostash оставил их в docker-compose.yml, а деплой упал на YAML).
+  echo "unmerged=$(git ls-files -u | wc -l | tr -d ' ')"
+  echo "conflict_markers=$(grep -c -E '^(<<<<<<<|>>>>>>>)' docker-compose.yml 2>/dev/null || true)"
   proc="$(docker exec "$2" sh -c 'grep -E "^(Uid|CapEff|NoNewPrivs):" /proc/1/status | tr -s "[:blank:]" " " | tr "\n" ";"' 2>&1 | cut -c1-150)"
   echo "proc=$proc"
   # Тот же пользователь, под которым работает бот: от root файл msmtprc читается всегда и проверка ничего бы не показала.
@@ -93,7 +96,10 @@ if [ -n "$stats_failed" ] && [ -n "$stats_total" ] && [ -n "$stats_subs" ] && [ 
 else
   say OK "цифры для решений: нет данных"
 fi
-[ "$(get compose_dirty)" = 0 ] && say OK "docker-compose.yml: без ручных правок" || say OK "docker-compose.yml: ручная правка на проде (cpus), деплой сохраняет её через --autostash"
+if [ "${ALERT_ON_UNMERGED:-1}" = 1 ] && { [ "$(get unmerged)" != 0 ] || [ "$(get conflict_markers)" != 0 ]; }; then
+  say ALERT "в рабочем дереве прода конфликт слияния (неразрешённых путей: $(get unmerged), маркеров в docker-compose.yml: $(get conflict_markers)): следующий деплой упадёт"
+elif [ "$(get compose_dirty)" = 0 ]; then say OK "docker-compose.yml: без ручных правок"
+else say WARN "docker-compose.yml изменён вручную: деплой сбросит правку (лимит CPU — BOT_CPUS в .env)"; fi
 proc="$(get proc)"
 if printf '%s' "$proc" | grep -q '^Uid: 0 '; then
   say WARN "права процесса: бот работает от root"

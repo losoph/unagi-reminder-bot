@@ -54,8 +54,13 @@ jobs:
           script: |
             set -e
             cd ~/projects/unagi-reminder-bot
-            # --autostash: на сервере в docker-compose.yml вручную стоит cpus: 1.0 (docs/HANDOFF.md); без него pull отказался бы сливать изменённый compose.
-            git pull --autostash origin main
+            # --- sync (tests/test_deploy_sync.py исполняет этот блок во временном репозитории)
+            # docker-compose.yml на сервере вручную не правят (лимит CPU — BOT_CPUS в .env): сбрасываем ручную правку и конфликт прошлого autostash —
+            # 17.10 `git pull --autostash` вернул код 0 при конфликте возврата stash, в compose остались маркеры и `docker compose up` упал на YAML.
+            git checkout HEAD -- docker-compose.yml
+            git pull --ff-only origin main
+            test -z "$(git ls-files -u)" || { echo "конфликт слияния в рабочем дереве сервера — деплой остановлен"; git status --short; exit 1; }
+            # --- end sync
             # Снимок БД до пересборки (миграции только добавляют, но откат данных должен быть возможен). Нет снимка — нет деплоя.
             python3 ops/aiqu/backup_db.py --db storage/bot_data.db || { echo "резервная копия не создана — деплой остановлен"; exit 1; }
             docker compose up -d --build
