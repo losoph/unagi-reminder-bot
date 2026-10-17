@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools" / "agents"
@@ -160,6 +161,96 @@ class LaunchTests(unittest.TestCase):
         self.assertIn("docs/sprint/progress.md", proc.stderr)
         self.assertIn("docs/sprint/progress/<МЕТКА>.md", proc.stderr)
 
+    def test_brief_with_per_task_directory_and_negation_does_not_warn(self):
+        # 18.10: бриф с новым протоколом не должен получать ложное предупреждение
+        brief_text = (
+            "Задача T7.\n"
+            "блок решений зафиксируй в отдельном файле docs/sprint/progress/<TASK>.md "
+            "(в том же коммите, не дописывай в progress.md).\n"
+        )
+        (self.repo / "docs" / "modern.md").write_text(brief_text, encoding="utf-8")
+        self.git("add", "docs/modern.md")
+        self.git("commit", "-q", "-m", "docs: бриф с новым протоколом")
+        proc = self.launch("agy", str(self.repo), "docs/modern.md", "(T7)")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("⚠ бриф требует дописывать", proc.stderr)
+
+
+class BriefProgressWarningTests(unittest.TestCase):
+    """Проверка брифа на требование дописывать в старый docs/sprint/progress.md.
+
+    Работает в любой среде (в том числе в CI python:3.12-slim без git).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.mod = load_progress_index()
+
+    def test_old_brief_full_path_triggers_warning(self):
+        brief = self.dir / "legacy1.md"
+        brief.write_text("допиши в docs/sprint/progress.md блок T6\n", encoding="utf-8")
+        warn = self.mod.check_brief_warning(brief)
+        self.assertIsNotNone(warn)
+        self.assertIn("docs/sprint/progress.md", warn)
+        self.assertIn("docs/sprint/progress/<МЕТКА>.md", warn)
+
+    def test_old_brief_short_path_and_block_phrase_triggers_warning(self):
+        # Случай из отчёта ревью (docs/sprint/agy-review-fixes.md): нет полного пути и корня «допис»
+        brief = self.dir / "legacy2.md"
+        brief.write_text("коротким блоком «T14b» в progress.md, затем продолжай\n", encoding="utf-8")
+        warn = self.mod.check_brief_warning(brief)
+        self.assertIsNotNone(warn)
+        self.assertIn("docs/sprint/progress.md", warn)
+
+        brief3 = self.dir / "legacy3.md"
+        brief3.write_text("Блок «AI1» в docs/sprint/progress.md\n", encoding="utf-8")
+        warn3 = self.mod.check_brief_warning(brief3)
+        self.assertIsNotNone(warn3)
+
+    def test_negative_phrases_and_per_task_directory_do_not_trigger_warning(self):
+        # Случай из отчёта ревью: ложное срабатывание на fix-шаблоне и agy-brief-prg1
+        fix_template = (TOOLS / "templates" / "fix.md").read_text(encoding="utf-8")
+        self.assertIsNone(self.mod.check_brief_warning(fix_template))
+
+        review_template = (TOOLS / "templates" / "review.md").read_text(encoding="utf-8")
+        self.assertIsNone(self.mod.check_brief_warning(review_template))
+
+        prg1_brief = (ROOT / "docs" / "sprint" / "agy-brief-prg1.md").read_text(encoding="utf-8")
+        self.assertIsNone(self.mod.check_brief_warning(prg1_brief))
+
+        synthetic_valid = self.dir / "valid.md"
+        synthetic_valid.write_text(
+            "блок решений зафиксируй в отдельном файле docs/sprint/progress/<TASK>.md (не дописывай в progress.md)\n",
+            encoding="utf-8",
+        )
+        self.assertIsNone(self.mod.check_brief_warning(synthetic_valid))
+
+    def test_cli_check_brief_stderr_and_exit_code(self):
+        legacy = self.dir / "legacy.md"
+        legacy.write_text("допиши в docs/sprint/progress.md блок T6\n", encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(TOOLS / "progress_index.py"), "--check-brief", str(legacy)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("docs/sprint/progress.md", proc.stderr)
+        self.assertIn("docs/sprint/progress/<МЕТКА>.md", proc.stderr)
+
+        valid = self.dir / "valid.md"
+        valid.write_text("блок решений в docs/sprint/progress/T1.md\n", encoding="utf-8")
+        proc_ok = subprocess.run(
+            [sys.executable, str(TOOLS / "progress_index.py"), "--check-brief", str(valid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_ok.returncode, 0)
+        self.assertEqual(proc_ok.stderr, "")
+
 
 class ProgressIndexTests(unittest.TestCase):
     """Сборка индекса журнала решений (tools/agents/progress_index.py)."""
@@ -179,7 +270,7 @@ class ProgressIndexTests(unittest.TestCase):
             encoding="utf-8",
         )
         (self.progress_dir / "PRG1.md").write_text(
-            "# PRG1 Убрать конфликты — (PRG1)\n- Решение: per-task файлы\n",
+            "## PRG1 Убрать конфликты — 64a710a\n- Решение: per-task файлы\n",
             encoding="utf-8",
         )
 
@@ -200,6 +291,43 @@ class ProgressIndexTests(unittest.TestCase):
         self.assertIn("T10", md)
         self.assertIn("T10.md", md)
 
+    def test_get_commit_date_git_mocked(self):
+        file_path = self.progress_dir / "T10.md"
+        file_path.write_text("## T10\n", encoding="utf-8")
+        with mock.patch("subprocess.run") as m_run:
+            m_run.return_value = subprocess.CompletedProcess(
+                args=["git", "log", "-1", "--format=%cs", "--", "T10.md"],
+                returncode=0,
+                stdout="2026-10-17\n",
+                stderr="",
+            )
+            date = self.mod.get_commit_date(file_path)
+            self.assertEqual(date, "2026-10-17")
+            m_run.assert_called_once()
+            args, kwargs = m_run.call_args
+            self.assertEqual(args[0], ["git", "log", "-1", "--format=%cs", "--", "T10.md"])
+            self.assertEqual(kwargs["cwd"], str(self.progress_dir))
+
+    def test_output_protection_prevents_overwriting_source_progress_file(self):
+        source = self.progress_dir / "T10.md"
+        original_content = "## T10 Управление алертами\n- Решение: inline-кнопки\n"
+        source.write_text(original_content, encoding="utf-8")
+
+        proc = subprocess.run(
+            [sys.executable, str(TOOLS / "progress_index.py"), str(self.progress_dir), "-o", str(source)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("защита от перезаписи", proc.stderr)
+        self.assertEqual(source.read_text(encoding="utf-8"), original_content)
+
+    def test_format_index_markdown_includes_archive_link(self):
+        entries = self.mod.collect_progress_entries(self.progress_dir)
+        md = self.mod.format_index_markdown(entries)
+        self.assertIn("docs/sprint/progress.md", md)
+
     def test_cli_execution_on_synthetic_dir(self):
         (self.progress_dir / "SEC1.md").write_text("## SEC1 Безопасность\n- Решение: правки\n", encoding="utf-8")
         proc = subprocess.run(
@@ -211,6 +339,81 @@ class ProgressIndexTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("SEC1", proc.stdout)
         self.assertIn("Безопасность", proc.stdout)
+
+
+class ProtocolAndDocsComplianceTests(unittest.TestCase):
+    """Сверка документации и протокола (docs/HANDOFF.md, PRG1.md, progress.md)."""
+
+    def test_prg1_file_follows_protocol_format(self):
+        prg1_path = ROOT / "docs" / "sprint" / "progress" / "PRG1.md"
+        self.assertTrue(prg1_path.exists())
+        lines = prg1_path.read_text(encoding="utf-8").splitlines()
+        first_line = lines[0].strip()
+        self.assertTrue(
+            first_line.startswith("## PRG1 "),
+            f"Заголовок должен быть уровня ## (H2): {first_line}",
+        )
+        self.assertRegex(
+            first_line,
+            r"^## PRG1 .+ — [0-9a-f]{7,40}$",
+            f"Заголовок должен содержать commit sha по протоколу: {first_line}",
+        )
+
+    def test_handoff_references_progress_per_task_directory(self):
+        handoff_path = ROOT / "docs" / "HANDOFF.md"
+        self.assertTrue(handoff_path.exists())
+        content = handoff_path.read_text(encoding="utf-8")
+        self.assertIn("docs/sprint/progress/", content)
+
+    def test_progress_md_archive_header_reflects_prg1_transition(self):
+        progress_path = ROOT / "docs" / "sprint" / "progress.md"
+        self.assertTrue(progress_path.exists())
+        content = progress_path.read_text(encoding="utf-8")
+        self.assertIn("Архив решений до перехода на PRG1 (18.10)", content)
+
+
+@unittest.skipUnless(shutil.which("git"), "в образе CI (python:3.12-slim) нет git")
+class GitCommitDateRealTests(unittest.TestCase):
+    """Проверка извлечения даты коммита через реальный git log."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.repo = self.dir / "repo"
+        self.progress_dir = self.repo / "docs" / "sprint" / "progress"
+        self.progress_dir.mkdir(parents=True)
+        self.env = os.environ | {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_AUTHOR_DATE": "2026-10-10T12:00:00+00:00",
+            "GIT_COMMITTER_DATE": "2026-10-10T12:00:00+00:00",
+        }
+        subprocess.run(["git", "init", "-q"], cwd=self.repo, env=self.env, check=True)
+        self.mod = load_progress_index()
+
+    def test_get_commit_date_extracts_git_date_not_mtime(self):
+        file_path = self.progress_dir / "T1.md"
+        file_path.write_text("## T1\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@test", "add", "docs/sprint/progress/T1.md"],
+            cwd=self.repo,
+            env=self.env,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@test", "commit", "-q", "-m", "docs: T1"],
+            cwd=self.repo,
+            env=self.env,
+            check=True,
+        )
+
+        # Выставляем mtime файла на намеренно другую дату (например, 2026-10-25)
+        future_ts = 1792900000.0  # late October 2026
+        os.utime(file_path, (future_ts, future_ts))
+
+        date = self.mod.get_commit_date(file_path)
+        self.assertEqual(date, "2026-10-10")
 
 
 if __name__ == "__main__":

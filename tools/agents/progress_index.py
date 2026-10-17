@@ -23,6 +23,43 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
 DEFAULT_PROGRESS_DIR = REPO_ROOT / "docs" / "sprint" / "progress"
 IGNORED_FILENAMES = {"README.md", "INDEX.md", "index.md"}
+BRIEF_PROGRESS_WARNING = (
+    "⚠ бриф требует дописывать в docs/sprint/progress.md: "
+    "с 17.10 решения пишутся в отдельный файл docs/sprint/progress/<МЕТКА>.md"
+)
+
+
+def check_brief_warning(brief: Path | str) -> str | None:
+    """Проверяет бриф на требование дописывать в старый docs/sprint/progress.md.
+
+    Возвращает строку предупреждения или None, если бриф корректен.
+    """
+    if isinstance(brief, Path):
+        try:
+            content = brief.read_text(encoding="utf-8")
+        except OSError:
+            return None
+    else:
+        content = str(brief)
+
+    # Если бриф уже указывает на каталог docs/sprint/progress/ (например docs/sprint/progress/<TASK>.md)
+    if "docs/sprint/progress/" in content:
+        return None
+
+    # Проверяем строки брифа на указания писать в progress.md
+    for line in content.splitlines():
+        # Убираем конструкции отрицания: «не дописывай в progress.md», «без правок ... progress.md», «а не в конец progress.md»
+        clean_line = re.sub(
+            r"(?i)(?:не|без|вместо|а\s+не)\s+[^.\n]*(?:docs/sprint/)?progress\.md",
+            "",
+            line,
+        )
+        if re.search(r"(?i)(?:блок|блоком|допис|добав|запис|в|в\s+конец).*(?:docs/sprint/)?progress\.md", clean_line):
+            return BRIEF_PROGRESS_WARNING
+        if re.search(r"docs/sprint/progress\.md", clean_line):
+            return BRIEF_PROGRESS_WARNING
+
+    return None
 
 
 def get_commit_date(file_path: Path) -> str:
@@ -103,6 +140,8 @@ def format_index_markdown(entries: list[dict[str, Any]], title: str = "Инде�
     lines: list[str] = [
         f"# {title}",
         "",
+        "> Архив решений до перехода на PRG1 (18.10): [docs/sprint/progress.md](../progress.md)",
+        "",
         "| Метка | Дата коммита | Заголовок | Файл |",
         "|---|---|---|---|",
     ]
@@ -137,7 +176,19 @@ def main(argv: list[str] | None = None) -> int:
         "-o",
         help="Путь к файлу для сохранения индекса (по умолчанию вывод в stdout)",
     )
+    parser.add_argument(
+        "--check-brief",
+        metavar="FILE",
+        help="Проверить бриф на требование дописывать в старый progress.md",
+    )
     args = parser.parse_args(argv)
+
+    if args.check_brief:
+        brief_path = Path(args.check_brief).resolve()
+        warn = check_brief_warning(brief_path)
+        if warn:
+            sys.stderr.write(f"{warn}\n")
+        return 0
 
     dir_path = Path(args.directory).resolve()
     entries = collect_progress_entries(dir_path)
@@ -145,6 +196,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.output:
         out_path = Path(args.output).resolve()
+        source_paths = {Path(e["path"]).resolve() for e in entries}
+        if out_path in source_paths or (
+            out_path.parent == dir_path and out_path.name not in IGNORED_FILENAMES and out_path.suffix == ".md"
+        ):
+            sys.stderr.write(
+                f"Ошибка: выходной файл {out_path} совпадает с исходным файлом решения (защита от перезаписи).\n"
+            )
+            return 1
         out_path.write_text(output_md, encoding="utf-8")
         print(f"Индекс сохранён в {out_path} ({len(entries)} записей)")
     else:
