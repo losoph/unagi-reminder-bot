@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -74,6 +75,7 @@ class OrchestraConfigTests(unittest.TestCase):
         self.assertTrue(policy.opencode_allowed("short-check"))
 
 
+@unittest.skipUnless(shutil.which("git"), "в образе CI (python:3.12-slim) нет git: launch проверяет историю репозитория")
 class LaunchTests(unittest.TestCase):
     """agents.sh launch: проверки перед запуском трека и готовые команды."""
 
