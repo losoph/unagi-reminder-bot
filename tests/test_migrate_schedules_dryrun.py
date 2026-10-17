@@ -90,11 +90,11 @@ class MigrateSchedulesDryrunTests(unittest.TestCase):
         # Пользователь 101: папка 'news' (daily) + 'Основное' (daily) = 2 папки, 2 расписания
         # Пользователь 102: папка 'crypto' (weekly) = 1 папка, 1 расписание
         self.assertIn("Будет создано папок:    3", output)
-        self.assertIn("Будет создано расписаний: 3", output)
-        # Решение владельца 18.10: все создаваемые расписания — Telegram, Email = 0
-        self.assertIn("Telegram-расписаний:   3", output)
-        self.assertIn("Email-расписаний:      0", output)
-        self.assertIn("курсоры: будет создано 4 записей digest_schedule_cursors (расписания × подписки папки)", output)
+        self.assertIn("Будет создано расписаний: 3 (папка = одна рассылка)", output)
+        # Модель Q4S: email-подписка пользователя 102 мигрирует в расписание с delivery='email'
+        self.assertIn("Telegram-расписаний:   2", output)
+        self.assertIn("Email-расписаний:      1", output)
+        self.assertIn("Курсоры: один на подписку (subscriptions.last_post_id, таблица курсоров упразднена)", output)
         self.assertIn("Число подписок с курсором 0/NULL: 4 (NULL: 4, 0: 0)", output)
         self.assertIn("Предупреждение: у 4 подписок в legacy-таблице курсор NULL", output)
 
@@ -388,19 +388,74 @@ class MigrateSchedulesDryrunTests(unittest.TestCase):
 
         self.assertEqual(report["legacy"]["digest_executions_count"], 1)
         self.assertEqual(report["legacy"]["digest_alerts_count"], 1)
-        self.assertEqual(report["summary"]["email_schedules"], 0)
+        self.assertEqual(report["summary"]["email_schedules"], 1)
         self.assertEqual(report["legacy"]["user_email_periods_count"], 1)
 
-    def test_two_schedules_per_folder_cursors_count_and_db_unchanged(self):
-        """Синтетическая БД с двумя расписаниями на папку: проверка числа курсоров и неизменности БД."""
-        # 1 пользователь (201), 1 папка 'work', 2 канала (chan_alpha, chan_beta)
-        # chan_alpha: 'daily', chan_beta: 'weekly' -> папка 'work' порождает 2 расписания (daily, weekly)
-        # 2 расписания * 2 подписки = 4 курсора digest_schedule_cursors
+    def test_heterogeneous_period_in_folder_detected_exit_3(self):
+        """Конфликт: неоднородный period внутри именованной папки (daily + weekly в 'work')."""
+        self._seed_clean_data()
         self._execute_write(
             """
             INSERT INTO subscriptions (user_id, channel_username, channel_title, period, tag, last_post_id, is_disabled, next_send_at)
             VALUES (201, 'chan_alpha', 'Alpha', 'daily', 'work', 100, 0, '2026-10-18 08:00:00'),
-                   (201, 'chan_beta', 'Beta', 'weekly', 'work', 200, 0, '2026-10-18 09:00:00')
+                   (201, 'chan_beta', 'Beta', 'weekly', 'work', 200, 0, '2026-10-18 08:00:00')
+            """
+        )
+        self._execute_write(
+            """
+            INSERT INTO digest_settings (user_id, period, send_hour, send_minute, weekday, month_day)
+            VALUES (201, 'daily', 8, 0, 0, 1),
+                   (201, 'weekly', 8, 0, 6, 1)
+            """
+        )
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            exit_code = main([str(self.db_path)])
+
+        output = stdout_buf.getvalue()
+        self.assertEqual(exit_code, 3)
+        self.assertIn("ВЕРДИКТ: ОБНАРУЖЕНЫ КОНФЛИКТЫ (КОД ВЫХОДА 3)", output)
+        self.assertIn("[8] Неоднородные периоды внутри папки (включая папку без тега): 1", output)
+        self.assertIn("папка='work'", output)
+        self.assertIn("периоды=['daily', 'weekly']", output)
+
+    def test_heterogeneous_period_in_default_folder_tag_null_detected_exit_3(self):
+        """Конфликт: неоднородный period внутри папки 'Основное' (tag IS NULL, daily + weekly)."""
+        self._seed_clean_data()
+        self._execute_write(
+            """
+            INSERT INTO subscriptions (user_id, channel_username, channel_title, period, tag, last_post_id, is_disabled, next_send_at)
+            VALUES (301, 'main_alpha', 'Alpha', 'daily', NULL, 100, 0, '2026-10-18 08:00:00'),
+                   (301, 'main_beta', 'Beta', 'weekly', NULL, 200, 0, '2026-10-18 08:00:00')
+            """
+        )
+        self._execute_write(
+            """
+            INSERT INTO digest_settings (user_id, period, send_hour, send_minute, weekday, month_day)
+            VALUES (301, 'daily', 8, 0, 0, 1),
+                   (301, 'weekly', 8, 0, 6, 1)
+            """
+        )
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            exit_code = main([str(self.db_path)])
+
+        output = stdout_buf.getvalue()
+        self.assertEqual(exit_code, 3)
+        self.assertIn("ВЕРДИКТ: ОБНАРУЖЕНЫ КОНФЛИКТЫ (КОД ВЫХОДА 3)", output)
+        self.assertIn("[8] Неоднородные периоды внутри папки (включая папку без тега): 1", output)
+        self.assertIn("папка='Основное'", output)
+        self.assertIn("периоды=['daily', 'weekly']", output)
+
+    def test_homogeneous_multiple_folders_clean_exit_0_and_db_unchanged(self):
+        """Чистые данные: у пользователя две однородные папки ('work_daily' и 'work_weekly'), выход 0, БД не тронута."""
+        self._execute_write(
+            """
+            INSERT INTO subscriptions (user_id, channel_username, channel_title, period, tag, last_post_id, is_disabled, next_send_at)
+            VALUES (201, 'chan_alpha', 'Alpha', 'daily', 'work_daily', 100, 0, '2026-10-18 08:00:00'),
+                   (201, 'chan_beta', 'Beta', 'weekly', 'work_weekly', 200, 0, '2026-10-18 09:00:00')
             """
         )
         self._execute_write(
@@ -421,9 +476,10 @@ class MigrateSchedulesDryrunTests(unittest.TestCase):
         output = stdout_buf.getvalue()
         self.assertEqual(exit_code, 0)
         self.assertIn("ВЕРДИКТ: ЧИСТО, КОНФЛИКТОВ НЕ ОБНАРУЖЕНО (КОД ВЫХОДА 0)", output)
-        self.assertIn("Будет создано папок:    1", output)
-        self.assertIn("Будет создано расписаний: 2", output)
-        self.assertIn("курсоры: будет создано 4 записей digest_schedule_cursors (расписания × подписки папки)", output)
+        self.assertIn("Будет создано папок:    2", output)
+        self.assertIn("Будет создано расписаний: 2 (папка = одна рассылка)", output)
+        self.assertIn("Telegram-расписаний:   2", output)
+        self.assertIn("Email-расписаний:      0", output)
         self.assertIn("Число подписок с курсором 0/NULL: 0", output)
 
         mtime_after = self.db_path.stat().st_mtime_ns
