@@ -41,7 +41,7 @@ services:
           create_host_path: false
     mem_limit: 512m
     memswap_limit: 512m
-    cpus: 1.5
+    cpus: ${BOT_CPUS:-1.5}
     # max-size/max-file: без лимита json-file-логи растут бесконечно и
     # забивают диск (см. тот же паттерн в docker-compose.yml проекта tldw
     # на этом сервере).
