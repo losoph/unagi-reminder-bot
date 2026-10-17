@@ -1,7 +1,5 @@
 import asyncio
 import html
-import io
-import json
 import logging
 import os
 import re
@@ -25,13 +23,12 @@ from aiogram.exceptions import (
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, InaccessibleMessage, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, InaccessibleMessage, Message
 from aiohttp_socks import ProxyConnector # type: ignore
 from dotenv import load_dotenv
 
 from data.database import (
     add_digest_posts,
-    add_feed_subscription,
     add_message,
     add_saved_message,
     add_subscription,
@@ -48,13 +45,11 @@ from data.database import (
     delete_message,
     delete_saved_message,
     delete_user_email,
-    export_user_data,
     get_ai_usage_today,
     get_channel_scan_cursor,
     get_digest_execution_by_id,
     get_digest_posts,
     get_email_delivery,
-    get_feed_subscription_by_username,
     get_user_email,
     delete_subscription,
     get_channel_posts_since,
@@ -89,8 +84,6 @@ from data.database import (
     serialize_datetime,
     start_email_verification,
     set_email_period,
-    set_feed_paused,
-    set_subscription_paused,
     set_user_alerts_enabled,
     set_user_alerts_paused_until,
     update_channel_scan_cursor,
@@ -99,7 +92,6 @@ from data.database import (
     update_reminder_tag,
     update_reminder_time,
     upsert_channel_posts,
-    upsert_digest_settings,
     utc_now,
 )
 from scraper import ChannelFetchError, REQUEST_TIMEOUT, get_latest_posts
@@ -224,18 +216,40 @@ from digest_settings import (  # noqa: F401
     set_subscription_folder,
     unsubscribe_all_confirmed,
 )
+import data_transfer
+from data_transfer import (  # noqa: F401
+    EXPORT_VERSION,
+    MAX_IMPORT_BOOKMARKS,
+    MAX_IMPORT_FEED,
+    MAX_IMPORT_FILE_BYTES,
+    MAX_IMPORT_REMINDERS,
+    MAX_IMPORT_SUBSCRIPTIONS,
+    ImportState,
+    _import_user_payload,
+    _prompt_import,
+    _send_export,
+    cb_export,
+    cb_import,
+    cb_import_cancel,
+    cmd_export,
+    cmd_import,
+    import_wrong_type,
+    process_import_file,
+)
 dp.include_router(reminders_ux.router)
 dp.include_router(user_prefs.router)
 dp.include_router(feed.router)
 dp.include_router(bookmarks.router)
 dp.include_router(digest_settings.router)
+dp.include_router(data_transfer.router)
 # SEC1 (п.5): бот работает только в личных сообщениях. Корневые фильтры
 # отсекают группы/каналы до маршрутизации во вложенные роутеры, поэтому ни один
-# пользовательский обработчик (main/reminders_ux/user_prefs/feed/bookmarks/digest_settings) не увидит
+# пользовательский обработчик (main/reminders_ux/user_prefs/feed/bookmarks/digest_settings/data_transfer) не увидит
 # сообщение или callback из группового чата.
 dp.message.filter(F.chat.type == ChatType.PRIVATE)
 dp.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
 feed.configure(bot=bot, channel_source=channel_source)
+data_transfer.configure(bot=bot)
 from time_utils import (  # noqa: E402
     _DAY_PART_HOURS,
     TIME_TEXT_EXAMPLES,
@@ -263,16 +277,9 @@ CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 DIGEST_TELEGRAPH_THRESHOLD = int(os.getenv("DIGEST_TELEGRAPH_THRESHOLD", "4"))
 # Максимальная длина превью поста в Telegram-сообщении дайджеста.
 TELEGRAM_PREVIEW_CHARS = int(os.getenv("TELEGRAM_PREVIEW_CHARS", "300"))
-# Лимиты на импорт, чтобы один файл не положил бота.
-MAX_IMPORT_SUBSCRIPTIONS = int(os.getenv("MAX_IMPORT_SUBSCRIPTIONS", "300"))
-MAX_IMPORT_FEED = int(os.getenv("MAX_IMPORT_FEED", "200"))
-MAX_IMPORT_BOOKMARKS = int(os.getenv("MAX_IMPORT_BOOKMARKS", "1000"))
-MAX_IMPORT_REMINDERS = int(os.getenv("MAX_IMPORT_REMINDERS", "500"))
-MAX_IMPORT_FILE_BYTES = int(os.getenv("MAX_IMPORT_FILE_BYTES", str(2 * 1024 * 1024)))
 AI_DAILY_LIMIT = ai_assistant.AI_DAILY_LIMIT
 # Средняя скорость чтения для оценки времени прочтения постов канала.
 READING_WORDS_PER_MINUTE = 180
-EXPORT_VERSION = 2
 
 # SEC1 (п.3): общий per-user кулдаун для дорогих сетевых операций.
 EXPENSIVE_COMMAND_COOLDOWN_SECONDS = int(os.getenv("EXPENSIVE_COMMAND_COOLDOWN_SECONDS", "60"))
@@ -371,10 +378,6 @@ class ScheduleState(StatesGroup):
     waiting_for_datetime = State()
     waiting_for_time = State()
     waiting_for_minutes = State()
-
-
-class ImportState(StatesGroup):
-    waiting_for_file = State()
 
 
 class EmailState(StatesGroup):
@@ -2546,250 +2549,7 @@ async def ai_summary(callback: CallbackQuery, state: FSMContext):
     )
 
 
-# ---------------------------------------------------------------------------
-# Экспорт / импорт данных (Feature 8)
-# ---------------------------------------------------------------------------
 
-
-async def _send_export(user_id: int):
-    data = export_user_data(user_id)
-    payload = {
-        "app": "unagi-reminder-bot",
-        "version": EXPORT_VERSION,
-        "exported_at": serialize_datetime(utc_now()),
-        **data,
-    }
-    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    filename = f"unagi_export_{user_id}_{local_now().strftime('%Y%m%d_%H%M')}.json"
-    feed_count = len(data.get("feed") or [])
-    caption = (
-        "📤 <b>Экспорт данных Unagi</b>\n"
-        f"• Подписки: {len(data['subscriptions'])}\n"
-        f"• Лента: {feed_count}\n"
-        f"• Закладки: {len(data['bookmarks'])}\n"
-        f"• Напоминания: {len(data['reminders'])}\n\n"
-        "Чтобы восстановить — отправь команду /import и пришли этот файл."
-    )
-    await bot.send_document(
-        user_id,
-        BufferedInputFile(raw, filename=filename),
-        caption=caption,
-        parse_mode="HTML",
-    )
-
-
-@dp.message(Command("export"))
-async def cmd_export(message: types.Message, state: FSMContext):
-    await state.clear()
-    await _send_export(user_id_from_message(message))
-
-
-@dp.callback_query(F.data == "data_export")
-async def cb_export(callback: CallbackQuery):
-    await callback.answer("📤 Готовлю файл...")
-    await _send_export(user_id_from_callback(callback))
-
-
-async def _prompt_import(user_id: int, state: FSMContext):
-    await state.set_state(ImportState.waiting_for_file)
-    await bot.send_message(
-        user_id,
-        "📥 Пришли JSON-файл, который ты ранее получил через /export.\n\n"
-        "Я добавлю подписки, закладки и будущие напоминания к текущим "
-        "(дубликаты подписок пропущу).",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="import_cancel")]]
-        ),
-    )
-
-
-@dp.message(Command("import"))
-async def cmd_import(message: types.Message, state: FSMContext):
-    await state.clear()
-    await _prompt_import(user_id_from_message(message), state)
-
-
-@dp.callback_query(F.data == "data_import")
-async def cb_import(callback: CallbackQuery, state: FSMContext):
-    await _prompt_import(user_id_from_callback(callback), state)
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "import_cancel")
-async def cb_import_cancel(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await edit_or_answer(callback, "Импорт отменён.")
-    await callback.answer()
-
-
-def _import_user_payload(user_id: int, payload) -> str:
-    if not isinstance(payload, dict):
-        return "❌ Неверный формат файла."
-
-    subscriptions = payload.get("subscriptions") or []
-    feed = payload.get("feed") or []
-    bookmarks = payload.get("bookmarks") or []
-    reminders = payload.get("reminders") or []
-    digest_settings = payload.get("digest_settings") or []
-    now = local_now()
-    added_subs = added_feed = added_bms = added_rems = 0
-    already_in_feed = 0
-
-    for setting in digest_settings[:10]:
-        period = setting.get("period")
-        if period not in ("daily", "weekly", "monthly"):
-            continue
-        try:
-            upsert_digest_settings(
-                user_id,
-                period,
-                send_hour=setting.get("send_hour"),
-                send_minute=setting.get("send_minute"),
-                weekday=setting.get("weekday"),
-                month_day=setting.get("month_day"),
-                monthly_mode=setting.get("monthly_mode"),
-            )
-        except Exception:
-            logger.exception("Import: failed to apply digest setting")
-
-    for sub in subscriptions[:MAX_IMPORT_SUBSCRIPTIONS]:
-        username = normalize_channel_username(sub.get("channel_username") or "")
-        if not username or not is_valid_channel_username(username):
-            # SEC1 (п.10): имя канала должно быть безопасным для href.
-            continue
-        period = sub.get("period") if sub.get("period") in ("daily", "weekly", "monthly") else "daily"
-        settings = resolve_digest_settings(user_id, period, now)
-        next_send = serialize_datetime(get_next_digest_time(period, now, settings))
-        try:
-            sub_id = add_subscription(
-                user_id,
-                username,
-                sub.get("channel_title") or username,
-                period,
-                serialize_datetime(utc_now()),
-                next_send,
-                tag=sub.get("tag"),
-            )
-            if sub.get("is_paused"):
-                set_subscription_paused(user_id, sub_id, True)
-            added_subs += 1
-        except Exception:
-            logger.exception("Import: failed to add subscription")
-
-    for item in feed[:MAX_IMPORT_FEED]:
-        username = normalize_channel_username(item.get("channel_username") or "")
-        if not username or not is_valid_channel_username(username):
-            continue
-        try:
-            if get_feed_subscription_by_username(user_id, username):
-                already_in_feed += 1
-                continue
-            sub_id = add_feed_subscription(
-                user_id,
-                username,
-                channel_title=item.get("channel_title") or username,
-                tag=item.get("tag"),
-            )
-            if item.get("is_paused") and sub_id:
-                set_feed_paused(user_id, sub_id, True)
-            added_feed += 1
-        except Exception:
-            logger.exception("Import: failed to add feed subscription")
-
-    for bookmark in bookmarks[:MAX_IMPORT_BOOKMARKS]:
-        text = bookmark.get("full_text")
-        if not text:
-            continue
-        # SEC1 (п.11): произвольный saved_at ломал карточку закладки при открытии.
-        saved_at_raw = bookmark.get("saved_at")
-        try:
-            saved_at = parse_db_datetime(saved_at_raw) if saved_at_raw else utc_now()
-        except (ValueError, TypeError):
-            saved_at = utc_now()
-        try:
-            add_saved_message(
-                user_id,
-                text,
-                bookmark.get("source_name") or "Импорт",
-                bookmark.get("tag") or "Импорт",
-                serialize_datetime(saved_at),
-            )
-            added_bms += 1
-        except Exception:
-            logger.exception("Import: failed to add bookmark")
-
-    for reminder in reminders[:MAX_IMPORT_REMINDERS]:
-        send_at = reminder.get("send_at")
-        if not send_at:
-            continue
-        try:
-            if parse_db_datetime(send_at) <= utc_now():
-                continue  # пропускаем напоминания из прошлого
-            text_preview = reminder.get("text_preview") or ""
-            full_text = reminder.get("full_text") or text_preview
-            note = reminder.get("note")
-            source_url = reminder.get("source_url")
-            add_message(
-                user_id,
-                None,
-                send_at,
-                text_preview=text_preview,
-                source_name=reminder.get("source_name") or "Импорт",
-                full_text=full_text,
-                note=note,
-                source_url=source_url,
-            )
-            added_rems += 1
-        except Exception:
-            logger.exception("Import: failed to add reminder")
-
-    feed_line = f"• Лента: +{added_feed}"
-    if already_in_feed:
-        feed_line += f" (уже были в Ленте: {already_in_feed})"
-
-    return (
-        "✅ <b>Импорт завершён</b>\n"
-        f"• Подписки: +{added_subs}\n"
-        f"{feed_line}\n"
-        f"• Закладки: +{added_bms}\n"
-        f"• Напоминания: +{added_rems}\n\n"
-        "Открой /list_digest, /saved или /list, чтобы проверить."
-    )
-
-
-@dp.message(ImportState.waiting_for_file, F.document)
-async def process_import_file(message: types.Message, state: FSMContext):
-    document = message.document
-    filename = (document.file_name or "").lower()
-    is_jsonish = filename.endswith(".json") or document.mime_type in (
-        "application/json",
-        "text/json",
-        "text/plain",
-    )
-    if not is_jsonish:
-        await message.answer("❌ Это не похоже на JSON-файл. Пришли .json из /export или нажми «Отмена».")
-        return
-    if document.file_size and document.file_size > MAX_IMPORT_FILE_BYTES:
-        await message.answer("❌ Файл слишком большой.")
-        return
-
-    await state.set_state(None)
-    buffer = io.BytesIO()
-    try:
-        await bot.download(document, destination=buffer)
-        payload = json.loads(buffer.getvalue().decode("utf-8"))
-    except Exception:
-        logger.exception("Import: failed to read file")
-        await message.answer("❌ Не удалось прочитать файл как JSON. Проверь, что это экспорт из /export.")
-        return
-
-    report = _import_user_payload(user_id_from_message(message), payload)
-    await message.answer(report, parse_mode="HTML")
-
-
-@dp.message(ImportState.waiting_for_file)
-async def import_wrong_type(message: types.Message):
-    await message.answer("📎 Пришли именно файл .json (как документ), либо нажми «Отмена».")
 
 
 @dp.callback_query(F.data.startswith("bksched_init_"))
