@@ -136,7 +136,8 @@ jobs:
               if docker inspect unagi-reminder-bot-bot:rollback >/dev/null 2>&1; then
                 echo "откат: запуск контейнера из unagi-reminder-bot-bot:rollback"
                 docker tag unagi-reminder-bot-bot:rollback unagi-reminder-bot-bot:latest
-                docker compose up -d
+                # Метка версии — не HEAD: в контейнере старый образ, prod_check должен показать ALERT «контейнер на старом коде».
+                GIT_SHA=rollback docker compose up -d
                 echo "откат выполнен"
               fi
               # --- end rollback
