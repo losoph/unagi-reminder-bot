@@ -77,6 +77,7 @@ python main.py
 - `FORWARD_STANDOUT_RATIO` - множитель форвардов к медиане канала для обязательного включения поста сверх лимита (по умолчанию 1.25)
 - `FORWARD_STANDOUT_MAX_EXTRA` - максимум дополнительных постов с высоким числом форвардов на канал за выпуск (по умолчанию 3)
 - `WEB_FETCH_MAX_PAGES` - максимальное число страниц при постраничной загрузке веб-fallback через `?before=` (по умолчанию 15)
+- `BOT_CPUS` - лимит ядер CPU для Docker-контейнера в compose (по умолчанию `1.0` под 1 vCPU хост)
 - `WEB_FETCH_PAGE_DELAY` - задержка в секундах между постраничными запросами веб-fallback (по умолчанию 0.5)
 
 Каналы читаются нативно через MTProto (Telethon) поверх OpenVPN-туннеля; веб-парсинг `t.me/s` —
@@ -119,8 +120,19 @@ cp .env.example .env
 docker compose up --build -d
 ```
 
-В контейнере база по умолчанию хранится в `/app/storage/bot_data.db`, это значение уже задано в `.env.example`.
+Контейнер ужесточён (hardened):
+- Запуск от непривилегированного пользователя `bot` (`uid 10001`, `gid 10001`), права root сбрасываются точкой входа через `setpriv`;
+- Сброшены все capabilities (`cap_drop: ALL`), включён `no-new-privileges: true`;
+- Корневая файловая система только для чтения (`read_only: true`), временные каталоги `/tmp` и `/run/unagi` — в `tmpfs`;
+- Лимит CPU по умолчанию ограничен 1.0 (`BOT_CPUS=1.0`), так как прод имеет 1 vCPU;
+- База хранится в `/app/storage/bot_data.db` (права 0600, владелец 10001:10001);
+- Перед каждым деплоем в CI создаётся консистентный снимок БД (`ops/aiqu/backup_db.py`) со сжатием старых копий в gzip (`.db.gz`, BK1).
 
 ## Для разработчиков и агентов
 
-Состояние релиза, проверки, деплой и откат, работа с агентами — [docs/HANDOFF.md](docs/HANDOFF.md). Спринт «Лента» — [docs/sprint/2026-10-13-lenta-sprint.md](docs/sprint/2026-10-13-lenta-sprint.md).
+- **Состояние релиза, проверки, деплой и откат**: [docs/HANDOFF.md](docs/HANDOFF.md).
+- **Архитектура системы и распил монолита**: [docs/architecture.md](docs/architecture.md) (роутеры `bookmarks.py`, `digest_settings.py`, инструмент верификации порядка хендлеров `tools/handler_order.py`).
+- **Мультиагентный оркестр**: спецификация `tools/agents/orchestra.json`, единый скрипт запуска и проверок `tools/agents/agents.sh` (`orchestra`, `launch`, `gate`).
+- **Журнал решений спринта**: пофайловая фиксация в [docs/sprint/progress/](docs/sprint/progress/).
+- **Контроль прода**: скрипт проверки [ops/aiqu/prod_check.sh](ops/aiqu/prod_check.sh) и руководство [ops/aiqu/README.md](ops/aiqu/README.md).
+- **Спринты и бэклог**: [docs/sprint/](docs/sprint/) и [docs/roadmap.md](docs/roadmap.md).
