@@ -165,7 +165,7 @@ class BackupDbTests(unittest.TestCase):
         # Снимок создан и проверен; любой сбой уборки (ротация, сжатие, подсчёт) не должен давать код 1 и останавливать деплой.
         err = io.StringIO()
         with (
-            patch("ops.aiqu.backup_db.rotate", side_effect=PermissionError("нет доступа к каталогу")),
+            patch.object(backup_db, "rotate", side_effect=PermissionError("нет доступа к каталогу")),  # модуль загружен по пути, не как ops.aiqu.backup_db
             contextlib.redirect_stderr(err),
             contextlib.redirect_stdout(io.StringIO()) as out,
         ):
