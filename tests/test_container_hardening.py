@@ -52,6 +52,12 @@ class ComposeTests(unittest.TestCase):
         self.assertTrue(any(item.startswith("/run/unagi:") for item in compose_list("tmpfs")))
         self.assertTrue(any(item.startswith("/tmp:") for item in compose_list("tmpfs")))
 
+    def test_cpu_limit_default_fits_a_single_vcpu_host(self):
+        # 17.10: деплой упал на проде — Docker отвергает cpus выше числа ядер (хост 1 vCPU: «range of CPUs is from 0.01 to 1.00»).
+        match = re.search(r"cpus: \$\{BOT_CPUS:-([0-9.]+)\}", read("docker-compose.yml"))
+        self.assertIsNotNone(match)
+        self.assertLessEqual(float(match.group(1)), 1.0)
+
     def test_ci_smoke_uses_compose_capabilities(self):
         workflow = read(".github", "workflows", "deploy.yml")
         in_ci = set(re.findall(r"--cap-add (\w+)", workflow))

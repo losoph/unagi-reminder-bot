@@ -47,7 +47,7 @@ ops/aiqu/prod_check.sh --since 10m      # после деплоя — тольк
 
 ### Лимит CPU контейнера
 
-`docker-compose.yml` берёт лимит из `BOT_CPUS` (по умолчанию 1.5). На сервере нужно добавить в `.env` рядом с compose строку `BOT_CPUS=1.0` — после этого ручная правка `docker-compose.yml` не нужна, а деплой сам сбрасывает ручные правки compose (`git checkout HEAD -- docker-compose.yml`, затем `git pull --ff-only`; `--autostash` убран 17.10: при конфликте возврата stash он возвращал код 0, в compose оставались маркеры, и `docker compose up` падал на YAML). `ops/aiqu/prod_check.sh` даёт ALERT, если в рабочем дереве сервера есть конфликт слияния.
+`docker-compose.yml` берёт лимит из `BOT_CPUS` (по умолчанию 1.0 (хост 1 vCPU: Docker отвергает больше)). На сервере нужно добавить в `.env` рядом с compose строку `BOT_CPUS=1.0` — после этого ручная правка `docker-compose.yml` не нужна, а деплой сам сбрасывает ручные правки compose (`git checkout HEAD -- docker-compose.yml`, затем `git pull --ff-only`; `--autostash` убран 17.10: при конфликте возврата stash он возвращал код 0, в compose оставались маркеры, и `docker compose up` падал на YAML). `ops/aiqu/prod_check.sh` даёт ALERT, если в рабочем дереве сервера есть конфликт слияния.
 
 ### Контейнер unagi-bot: права процесса
 
