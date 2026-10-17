@@ -91,6 +91,8 @@ jobs:
               echo "диск ${disk_pct}% >= 85%: удаление rollback-образа для защиты от переполнения"
               docker rmi unagi-reminder-bot-bot:rollback 2>/dev/null || true
               docker image prune -f || true
+              # 18.10: кеш сборки 2 ГБ, из них 1,6 ГБ свободны, но моложе 6 ч — фильтр until их не берёт. Неиспользуемый кеш чистим целиком только при тревоге по диску.
+              docker builder prune -f || true
             fi
             # Cron-файлы из репозитория (разовое письмо с итогами спринта): идемпотентная установка, сбой не ломает деплой.
             for f in ops/aiqu/cron.d/*; do [ -f "$f" ] && install -m 0644 -o root -g root "$f" "/etc/cron.d/$(basename "$f")" || true; done
