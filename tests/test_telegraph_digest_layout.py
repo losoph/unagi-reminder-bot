@@ -25,7 +25,11 @@ import unittest
 import email_digest
 from telegraph_publisher import (
     _MAX_CONTENT_BYTES,
+    _extract_bare_url_domain,
+    _is_banner_line,
     _is_post_node,
+    _strip_banner_line,
+    _strip_forwarding_lines,
     _truncate_to_limit,
     build_content,
 )
@@ -563,3 +567,275 @@ class TelegraphDigestLayoutTests(unittest.TestCase):
         self.assertFalse(_is_post_node(actions))
         self.assertFalse(_is_post_node({"tag": "hr"}))
         self.assertFalse(_is_post_node({"tag": "h4", "children": ["Канал"]}))
+
+    def test_defect1_forwarding_lines_dropped_when_text_follows(self):
+        # 1. Sample issue: TechNews post 104
+        sections = make_synthetic_sections()
+        nodes = build_content(sections)
+        technews_cards = []
+        is_technews = False
+        for n in nodes:
+            if n.get("tag") == "h4":
+                is_technews = n.get("children") == ["TechNews"]
+            elif is_technews:
+                if n.get("tag") == "hr":
+                    break
+                if n.get("tag") == "p" and any(
+                    isinstance(c, dict) and c.get("tag") == "b" and c.get("children") != ["Коротко"]
+                    for c in n.get("children", [])
+                ):
+                    technews_cards.append(n)
+
+        card_104 = next(
+            (
+                c
+                for c in technews_cards
+                if any(
+                    "104" in str(ch.get("attrs", {}).get("href", ""))
+                    for ch in c.get("children", [])
+                    if isinstance(ch, dict)
+                )
+            ),
+            None,
+        )
+        self.assertIsNotNone(card_104)
+        card_104_text = repr(card_104)
+        self.assertIn("Разработчики открыли веса легковесной модели распознавания речи на 50 языках", card_104_text)
+        self.assertNotIn("Переслано из CodeDigest", card_104_text)
+        self.assertIn("Модель весит менее ста мегабайт и уверенно работает на мобильных устройствах.", card_104_text)
+
+        # Culture Wave post 801
+        culture_cards = []
+        is_culture = False
+        for n in nodes:
+            if n.get("tag") == "h4":
+                is_culture = n.get("children") == ["Culture Wave"]
+            elif is_culture:
+                if n.get("tag") == "hr":
+                    break
+                if n.get("tag") == "p" and any(
+                    isinstance(c, dict) and c.get("tag") == "b" for c in n.get("children", [])
+                ):
+                    culture_cards.append(n)
+        card_801 = next(
+            (
+                c
+                for c in culture_cards
+                if any(
+                    "801" in str(ch.get("attrs", {}).get("href", ""))
+                    for ch in c.get("children", [])
+                    if isinstance(ch, dict)
+                )
+            ),
+            None,
+        )
+        self.assertIsNotNone(card_801)
+        self.assertIn("Театр открыл юбилейный сезон премьерой спектакля по классической пьесе", repr(card_801))
+        self.assertNotIn("Переслано из Театральный Вестник", repr(card_801))
+
+        # Check all required prefixes (case-insensitive) with text following
+        test_prefixes = [
+            ("Переслано из TechChannel\nОсновной текст важного сообщения.", "Основной текст важного сообщения."),
+            ("forwarded from @channel\nОсновной текст важного сообщения.", "Основной текст важного сообщения."),
+            ("Источник: https://example.com\nОсновной текст важного сообщения.", "Основной текст важного сообщения."),
+            ("via @cool_news\nОсновной текст важного сообщения.", "Основной текст важного сообщения."),
+            ("Repost from AnotherChannel\nОсновной текст важного сообщения.", "Основной текст важного сообщения."),
+            ("источник:https://example.com\nОсновной текст важного сообщения.", "Основной текст важного сообщения."),
+        ]
+        for raw, expected in test_prefixes:
+            stripped = _strip_forwarding_lines(raw)
+            self.assertEqual(stripped, expected)
+
+        # Negative tests:
+        # Forwarding without text remains as is
+        self.assertEqual(_strip_forwarding_lines("Переслано из CodeDigest"), "Переслано из CodeDigest")
+        self.assertEqual(_strip_forwarding_lines("Forwarded from TechNews\n"), "Forwarded from TechNews\n")
+        # Forwarding line inside text (not leading) is not dropped
+        mid_text = "Инженеры закончили проект. Переслано из CodeDigest.\nПродолжение."
+        self.assertEqual(_strip_forwarding_lines(mid_text), mid_text)
+        # Word boundary: word starting with prefix letters is not dropped
+        word_boundary = "Переслано известие о победе команды.\nПодробности в репортаже."
+        self.assertEqual(_strip_forwarding_lines(word_boundary), word_boundary)
+        via_word = "Viaduct construction was delayed by weather.\nWork resumes tomorrow."
+        self.assertEqual(_strip_forwarding_lines(via_word), via_word)
+
+    def test_defect2_banner_headlines_dropped_when_text_follows(self):
+        self.assertTrue(_is_banner_line("🔥 Срочно в номер! 🔥"))
+        self.assertTrue(_is_banner_line("🌱 Экологическая инициатива недели 🌱"))
+        self.assertTrue(_is_banner_line("Внимание!"))
+        self.assertFalse(_is_banner_line("Физики охладили молекулы газа"))
+
+        sections = make_synthetic_sections()
+        nodes = build_content(sections)
+
+        # Science Digest post 201
+        sci_nodes = []
+        is_sci = False
+        for n in nodes:
+            if n.get("tag") == "h4":
+                is_sci = n.get("children") == ["Science Digest"]
+            elif is_sci:
+                if n.get("tag") == "hr":
+                    break
+                sci_nodes.append(n)
+        card_201 = next(
+            (
+                c
+                for c in sci_nodes
+                if any(
+                    "201" in str(ch.get("attrs", {}).get("href", ""))
+                    for ch in c.get("children", [])
+                    if isinstance(ch, dict)
+                )
+            ),
+            None,
+        )
+        self.assertIsNotNone(card_201)
+        card_201_repr = repr(card_201)
+        self.assertNotIn("Срочно в номер", card_201_repr)
+        self.assertNotIn("🔥", card_201_repr)
+        self.assertIn("Биологи расшифровали геном глубоководных кораллов, устойчивых к потеплению океана", card_201_repr)
+        self.assertIn(
+            "Найденные белковые маркеры объясняют феномен адаптации к термальному стрессу без потери пигментации.",
+            card_201_repr,
+        )
+
+        # Eco Daily post 502
+        eco_nodes = []
+        is_eco = False
+        for n in nodes:
+            if n.get("tag") == "h4":
+                is_eco = n.get("children") == ["Eco Daily"]
+            elif is_eco:
+                if n.get("tag") == "hr":
+                    break
+                eco_nodes.append(n)
+        card_502 = next(
+            (
+                c
+                for c in eco_nodes
+                if any(
+                    "502" in str(ch.get("attrs", {}).get("href", ""))
+                    for ch in c.get("children", [])
+                    if isinstance(ch, dict)
+                )
+            ),
+            None,
+        )
+        self.assertIsNotNone(card_502)
+        card_502_repr = repr(card_502)
+        self.assertNotIn("Экологическая инициатива недели", card_502_repr)
+        self.assertIn(
+            "В Сибири запущена гибридная солнечная электростанция мощностью 120 МВт с накопителями",
+            card_502_repr,
+        )
+        self.assertIn(
+            "Комплекс обеспечит круглосуточное зеленое энергоснабжение трех удаленных поселков.",
+            card_502_repr,
+        )
+
+        # Negative tests:
+        # Short normal headline without emoji or '!' remains headline
+        normal_short = "Физики охладили молекулы газа\nПодробности эксперимента приведены в статье."
+        self.assertEqual(_strip_banner_line(normal_short), normal_short)
+        normal_two_words = "Короткий заголовок\nПодробный текст новости продолжается здесь."
+        self.assertEqual(_strip_banner_line(normal_two_words), normal_two_words)
+
+        # Single line "🔥 Срочно!" without continuation remains
+        self.assertEqual(_strip_banner_line("🔥 Срочно!"), "🔥 Срочно!")
+        self.assertEqual(_strip_banner_line("🔥 Срочно!\n"), "🔥 Срочно!\n")
+        self.assertEqual(
+            _strip_banner_line("🌱 Экологическая инициатива недели 🌱"),
+            "🌱 Экологическая инициатива недели 🌱",
+        )
+
+        # Long first line (> 4 words) with emojis is not dropped
+        long_line = "🔥 Важные оперативные новости сегодняшнего дня недели 🔥\nТекст новости здесь."
+        self.assertEqual(_strip_banner_line(long_line), long_line)
+
+    def test_defect3_bare_urls_in_shorts_formatted_with_domain(self):
+        sections = make_synthetic_sections()
+        nodes = build_content(sections)
+
+        # TechNews post 103 in shorts:
+        technews_ul = None
+        is_technews = False
+        for n in nodes:
+            if n.get("tag") == "h4":
+                is_technews = n.get("children") == ["TechNews"]
+            elif is_technews:
+                if n.get("tag") == "hr":
+                    break
+                if n.get("tag") == "ul":
+                    technews_ul = n
+        self.assertIsNotNone(technews_ul)
+        li_103 = next(
+            (
+                li
+                for li in technews_ul["children"]
+                if any(
+                    "103" in str(ch.get("attrs", {}).get("href", ""))
+                    for ch in li.get("children", [])
+                    if isinstance(ch, dict)
+                )
+            ),
+            None,
+        )
+        self.assertIsNotNone(li_103)
+        a_103 = li_103["children"][0]
+        self.assertEqual(a_103["children"], ["🔗 ссылка · technews.example.com"])
+        self.assertEqual(a_103["attrs"]["href"], "https://t.me/technews/103")
+
+        # Eco Daily post 504 in shorts:
+        eco_ul = None
+        is_eco = False
+        for n in nodes:
+            if n.get("tag") == "h4":
+                is_eco = n.get("children") == ["Eco Daily"]
+            elif is_eco:
+                if n.get("tag") == "hr":
+                    break
+                if n.get("tag") == "ul":
+                    eco_ul = n
+        self.assertIsNotNone(eco_ul)
+        li_504 = next(
+            (
+                li
+                for li in eco_ul["children"]
+                if any(
+                    "504" in str(ch.get("attrs", {}).get("href", ""))
+                    for ch in li.get("children", [])
+                    if isinstance(ch, dict)
+                )
+            ),
+            None,
+        )
+        self.assertIsNotNone(li_504)
+        a_504 = li_504["children"][0]
+        self.assertEqual(a_504["children"], ["🔗 ссылка · ecodaily.example.org"])
+        self.assertEqual(a_504["attrs"]["href"], "https://t.me/ecodaily/504")
+
+        # Domain extraction removes www.
+        self.assertEqual(_extract_bare_url_domain("https://www.example.com/some/path"), "example.com")
+        self.assertEqual(_extract_bare_url_domain("http://www.sub.example.com:8080/page"), "sub.example.com")
+
+        # Negative test: URL inside text together with words is left as is
+        test_section = [
+            {
+                "title": "URLChannel",
+                "posts": [
+                    {"id": 1, "text": "Post 1 text with enough detail for card " * 3, "link": "https://t.me/c/1"},
+                    {"id": 2, "text": "Post 2 text with enough detail for card " * 3, "link": "https://t.me/c/2"},
+                    {"id": 3, "text": "Post 3 text with enough detail for card " * 3, "link": "https://t.me/c/3"},
+                    {
+                        "id": 4,
+                        "text": "Подробности доступны по ссылке https://technews.example.com/ai-benchmark-results-2026",
+                        "link": "https://t.me/c/4",
+                    },
+                ],
+            }
+        ]
+        url_nodes = build_content(test_section)
+        url_repr = repr(url_nodes)
+        self.assertNotIn("🔗 ссылка", url_repr)
+        self.assertIn("Подробности доступны по ссылке https://technews.example.com/ai-benchmark-results-2026", url_repr)

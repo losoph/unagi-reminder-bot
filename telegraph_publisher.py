@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -108,6 +109,82 @@ def _build_summary(sections: list[dict]) -> list:
     ]
 
 
+_FORWARDING_PREFIXES_RE = re.compile(
+    r"^(?:переслано\s+из\b|forwarded\s+from\b|источник\s*:|via\b|repost\s+from\b).*$",
+    re.IGNORECASE,
+)
+_EMOJI_CHAR_PATTERN = r"[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\u2b50-\u2b55]"
+_EMOJI_START_RE = re.compile(rf"^[.,;:!?\s]*{_EMOJI_CHAR_PATTERN}")
+_EMOJI_END_RE = re.compile(rf"{_EMOJI_CHAR_PATTERN}[\ufe00-\ufe0f]?[.,;:!?\s]*$")
+
+
+def _strip_forwarding_lines(text: str) -> str:
+    """Drop leading service lines of forwarding if substantive text follows."""
+    lines = text.split("\n")
+    drop_count = 0
+    for idx, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            continue
+        if _FORWARDING_PREFIXES_RE.match(s):
+            drop_count = idx + 1
+        else:
+            break
+    if drop_count > 0:
+        remaining = "\n".join(lines[drop_count:]).strip()
+        if remaining:
+            return remaining
+    return text
+
+
+def _is_banner_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    words = [w for w in s.split() if any(c.isalnum() for c in w)]
+    if len(words) == 0 or len(words) > 4:
+        return False
+    ends_with_excl = s.endswith("!") or bool(re.search(r"!\s*$", s))
+    has_emoji_edges = bool(_EMOJI_START_RE.search(s)) and bool(_EMOJI_END_RE.search(s))
+    return has_emoji_edges or ends_with_excl
+
+
+def _strip_banner_line(text: str) -> str:
+    """Drop first line if it is a banner (<= 4 words, emoji edges or '!') and meaningful text follows."""
+    if "\n" not in text:
+        return text
+    first_line, rest = text.split("\n", 1)
+    if not _is_banner_line(first_line):
+        return text
+    rest_cleaned = _clean_post_text(rest)
+    if not rest_cleaned or not any(c.isalpha() for c in rest_cleaned):
+        return text
+    return rest_cleaned
+
+
+def _clean_post_for_digest(text: str) -> str:
+    clean = _clean_post_text(text)
+    clean = _strip_forwarding_lines(clean)
+    clean = _clean_post_text(clean)
+    clean = _strip_banner_line(clean)
+    clean = _clean_post_text(clean)
+    return clean
+
+
+def _extract_bare_url_domain(text: str) -> str | None:
+    s = text.strip()
+    if not re.fullmatch(r"https?://\S+", s, re.IGNORECASE):
+        return None
+    try:
+        parsed = urlsplit(s)
+        host = (parsed.hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host if host else None
+    except Exception:
+        return None
+
+
 def _build_card_node(title: str, essence: str, link: str | None = None) -> dict:
     children: list = [{"tag": "b", "children": [title]}]
     if link:
@@ -125,7 +202,7 @@ def _build_post_node(post: dict, max_chars: int | None = None) -> dict:
     text = (post.get("text") or "").strip()
     if max_chars and len(text) > max_chars:
         text = text[: max_chars - 1] + "…"
-    clean = _clean_post_text(text)
+    clean = _clean_post_for_digest(text)
     title, essence = _extract_title_and_essence(clean, max_title=140, max_essence=300)
     if not title:
         title = "Без названия"
@@ -146,7 +223,7 @@ def _select_channel_posts(posts: list[dict]) -> tuple[list[dict], list[dict]]:
         text = (post.get("text") or "").strip()
         if TELEGRAPH_POST_CHARS and len(text) > TELEGRAPH_POST_CHARS:
             text = text[: TELEGRAPH_POST_CHARS - 1] + "…"
-        clean = _clean_post_text(text)
+        clean = _clean_post_for_digest(text)
         title, essence = _extract_title_and_essence(clean, max_title=140, max_essence=300)
         if not title:
             title = "Без названия"
@@ -213,12 +290,16 @@ def build_content(sections: list[dict], *, with_actions: bool = False) -> list:
             short_li = []
             for item in shorts:
                 clean = item["clean"]
-                clean_len = len(" ".join(clean.split()))
-                if clean_len < 80:
-                    short_title = _normalize_caps_title(" ".join(clean.split()))
+                domain = _extract_bare_url_domain(clean) or _extract_bare_url_domain(item["title"])
+                if domain:
+                    short_title = f"🔗 ссылка · {domain}"
                 else:
-                    short_title = item["title"]
-                short_title = _truncate_by_word(short_title or "Без названия", 100)
+                    clean_len = len(" ".join(clean.split()))
+                    if clean_len < 80:
+                        short_title = _normalize_caps_title(" ".join(clean.split()))
+                    else:
+                        short_title = item["title"]
+                    short_title = _truncate_by_word(short_title or "Без названия", 100)
                 link = item["post"].get("link")
                 if link:
                     li_children = [{"tag": "a", "attrs": {"href": str(link)}, "children": [short_title]}]
