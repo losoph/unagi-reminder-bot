@@ -1,0 +1,4 @@
+# Разовое письмо: переезд на российский сервер — чек-лист (2026-10-31, 11:00 МСК). Флаг отправки — /var/lib/tldw/unagi. Ставится деплоем.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 11 31 10 * root /root/projects/unagi-reminder-bot/ops/aiqu/unagi-status-alert.sh --once 2026-10-31 --file docs/ALERT-MOVE-2026-10-31.md --subject "[aiqu] unagi: переезд на российский сервер — чек-лист" >> /var/log/unagi-status-alert.log 2>&1
