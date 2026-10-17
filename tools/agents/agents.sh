@@ -141,6 +141,11 @@ launch_agent() {
     || { echo "⛔ бриф $brief не закоммичен в $worktree: супервизор agy чистит неотслеживаемые файлы — закоммитьте бриф до запуска" >&2; return 3; }
   git -C "$worktree" diff --quiet HEAD -- "$brief" 2>/dev/null \
     || { echo "⛔ бриф $brief изменён после коммита — закоммитьте правки брифа" >&2; return 3; }
+  local brief_path="$brief"
+  [[ "$brief_path" = /* ]] || brief_path="$worktree/$brief"
+  if [ -f "$brief_path" ]; then
+    "$PY" "$SCRIPT_DIR/progress_index.py" --check-brief "$brief_path"
+  fi
   local title="${marker#(}"; title="${title%)}"
   local depth hit; depth="$("$PY" "$SCRIPT_DIR/orchestra.py" get limits.marker_history_depth 2>/dev/null || echo 40)"
   hit="$(git -C "$worktree" log --oneline -"$depth" | grep -F -- "($title)" | head -n 1)"
