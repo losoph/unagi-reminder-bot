@@ -92,6 +92,9 @@ class MigrateSchedulesDryrunTests(unittest.TestCase):
         self.assertIn("Будет создано расписаний: 3", output)
         self.assertIn("Telegram-расписаний:   2", output)
         self.assertIn("Email-расписаний:      1", output)
+        self.assertIn("курсоры: будет создано 4 записей digest_schedule_cursors (расписания × подписки папки)", output)
+        self.assertIn("Число подписок с курсором 0/NULL: 4 (NULL: 4, 0: 0)", output)
+        self.assertIn("Предупреждение: у 4 подписок в legacy-таблице курсор NULL", output)
 
     def test_conflict_channel_in_multiple_tags_detected(self):
         """Конфликт: один и тот же канал у пользователя в разных тегах."""
@@ -239,6 +242,46 @@ class MigrateSchedulesDryrunTests(unittest.TestCase):
 
         self.assertEqual(report["legacy"]["digest_executions_count"], 1)
         self.assertEqual(report["legacy"]["digest_alerts_count"], 1)
+
+    def test_two_schedules_per_folder_cursors_count_and_db_unchanged(self):
+        """Синтетическая БД с двумя расписаниями на папку: проверка числа курсоров и неизменности БД."""
+        # 1 пользователь (201), 1 папка 'work', 2 канала (chan_alpha, chan_beta)
+        # chan_alpha: 'daily', chan_beta: 'weekly' -> папка 'work' порождает 2 расписания (daily, weekly)
+        # 2 расписания * 2 подписки = 4 курсора digest_schedule_cursors
+        self._execute_write(
+            """
+            INSERT INTO subscriptions (user_id, channel_username, channel_title, period, tag, last_post_id, is_disabled)
+            VALUES (201, 'chan_alpha', 'Alpha', 'daily', 'work', 100, 0),
+                   (201, 'chan_beta', 'Beta', 'weekly', 'work', 200, 0)
+            """
+        )
+        self._execute_write(
+            """
+            INSERT INTO digest_settings (user_id, period, send_hour, send_minute)
+            VALUES (201, 'daily', 8, 0),
+                   (201, 'weekly', 9, 0)
+            """
+        )
+
+        mtime_before = self.db_path.stat().st_mtime_ns
+        hash_before = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            exit_code = main([str(self.db_path)])
+
+        output = stdout_buf.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("ВЕРДИКТ: ЧИСТО, КОНФЛИКТОВ НЕ ОБНАРУЖЕНО (КОД ВЫХОДА 0)", output)
+        self.assertIn("Будет создано папок:    1", output)
+        self.assertIn("Будет создано расписаний: 2", output)
+        self.assertIn("курсоры: будет создано 4 записей digest_schedule_cursors (расписания × подписки папки)", output)
+        self.assertIn("Число подписок с курсором 0/NULL: 0", output)
+
+        mtime_after = self.db_path.stat().st_mtime_ns
+        hash_after = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+        self.assertEqual(hash_before, hash_after, "Хеш базы данных изменился!")
+        self.assertEqual(mtime_before, mtime_after, "mtime базы данных изменился!")
 
 
 if __name__ == "__main__":

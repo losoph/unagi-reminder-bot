@@ -51,6 +51,10 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
             "schedules_to_create": 0,
             "telegram_schedules": 0,
             "email_schedules": 0,
+            "cursors_to_create": 0,
+            "zero_or_null_cursors": 0,
+            "null_cursors": 0,
+            "zero_cursors": 0,
         },
         "folders_detail": [],
         "conflicts": {
@@ -59,6 +63,9 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
             "schedule_without_time": [],
             "unconfirmed_email": [],
             "channel_in_multiple_periods": [],
+        },
+        "warnings": {
+            "null_cursors": [],
         },
         "legacy": {
             "digest_executions_count": 0,
@@ -152,6 +159,7 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
     total_schedules = 0
     telegram_scheds = 0
     email_scheds = 0
+    total_cursors = 0
 
     for u_row in users_with_subs:
         uid = u_row["user_id"]
@@ -179,10 +187,12 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
                     "is_default": is_default,
                     "periods": set(),
                     "channel_count": 0,
+                    "channels": set(),
                 }
             period = s["period"] or "daily"
             folders_for_user[folder_name]["periods"].add(period)
             folders_for_user[folder_name]["channel_count"] += 1
+            folders_for_user[folder_name]["channels"].add(s["channel_username"])
 
             # Проверка: есть ли для периода настройки в digest_settings
             if (uid, period) not in digest_settings_map:
@@ -205,6 +215,7 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
         for f_name, f_info in folders_for_user.items():
             total_folders += 1
             f_periods = f_info["periods"] or {"daily"}
+            num_f_scheds = len(f_periods)
             for p in f_periods:
                 total_schedules += 1
                 if confirmed_email and (p in email_periods):
@@ -212,13 +223,18 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
                 else:
                     telegram_scheds += 1
 
+            subs_in_folder = len(f_info["channels"])
+            f_cursors = num_f_scheds * subs_in_folder
+            total_cursors += f_cursors
+
             report["folders_detail"].append(
                 {
                     "user_id": uid,
                     "folder_name": f_name,
                     "is_default": f_info["is_default"],
-                    "channels_count": f_info["channel_count"],
+                    "channels_count": subs_in_folder,
                     "schedules": sorted(f_periods),
+                    "cursors_count": f_cursors,
                 }
             )
 
@@ -226,6 +242,43 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
     report["summary"]["schedules_to_create"] = total_schedules
     report["summary"]["telegram_schedules"] = telegram_scheds
     report["summary"]["email_schedules"] = email_scheds
+    report["summary"]["cursors_to_create"] = total_cursors
+
+    # Анализ курсоров в legacy-таблице subscriptions
+    cursor_stats = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN last_post_id IS NULL THEN 1 ELSE 0 END) as null_count,
+            SUM(CASE WHEN last_post_id = 0 THEN 1 ELSE 0 END) as zero_count
+        FROM subscriptions
+        WHERE is_disabled = 0
+        """
+    ).fetchone()
+
+    null_cnt = int(cursor_stats["null_count"] or 0)
+    zero_cnt = int(cursor_stats["zero_count"] or 0)
+    report["summary"]["zero_or_null_cursors"] = null_cnt + zero_cnt
+    report["summary"]["null_cursors"] = null_cnt
+    report["summary"]["zero_cursors"] = zero_cnt
+
+    if null_cnt > 0:
+        null_rows = conn.execute(
+            """
+            SELECT id, user_id, channel_username
+            FROM subscriptions
+            WHERE is_disabled = 0 AND last_post_id IS NULL
+            ORDER BY user_id, id
+            """
+        ).fetchall()
+        for nr in null_rows:
+            report["warnings"]["null_cursors"].append(
+                {
+                    "sub_id": nr["id"],
+                    "user_id": nr["user_id"],
+                    "channel_username": nr["channel_username"],
+                    "resolution": "Курсор digest_schedule_cursors будет инициализирован как NULL (backfill при первом запуске)",
+                }
+            )
 
     # 5. Конфликт 1(е): Канал в нескольких тегах
     multiple_tags_rows = conn.execute(
@@ -347,6 +400,13 @@ def format_report(report: dict[str, Any]) -> str:
     lines.append(f"   • Будет создано расписаний: {summary['schedules_to_create']}")
     lines.append(f"     - Telegram-расписаний:   {summary['telegram_schedules']}")
     lines.append(f"     - Email-расписаний:      {summary['email_schedules']}")
+    lines.append(
+        f"   • курсоры: будет создано {summary['cursors_to_create']} записей digest_schedule_cursors (расписания × подписки папки)"
+    )
+    lines.append(
+        f"   • Число подписок с курсором 0/NULL: {summary['zero_or_null_cursors']} "
+        f"(NULL: {summary['null_cursors']}, 0: {summary['zero_cursors']})"
+    )
 
     lines.append("\n2. ОБНАРУЖЕННЫЕ КОНФЛИКТЫ ДАННЫХ:")
     conflicts = report["conflicts"]
@@ -390,6 +450,15 @@ def format_report(report: dict[str, Any]) -> str:
             f"       - user={item['user_id']} channel=@{item['channel_username']} "
             f"periods={item['periods']} -> {item['resolution']}"
         )
+
+    warnings = report.get("warnings", {})
+    null_subs = warnings.get("null_cursors", [])
+    if null_subs:
+        lines.append(f"   [!] Предупреждение: у {len(null_subs)} подписок в legacy-таблице курсор NULL:")
+        for item in null_subs:
+            lines.append(
+                f"       - sub_id={item['sub_id']} user={item['user_id']} channel=@{item['channel_username']} -> {item['resolution']}"
+            )
 
     legacy = report["legacy"]
     lines.append("\n3. ЧТО ОСТАНЕТСЯ КАК LEGACY:")

@@ -52,13 +52,16 @@
 
 ## 2. Целевая схема данных (Target Schema DDL)
 
-Модель: **папка (`folders`) → 1..N расписаний (`digest_schedules`) → выпуск (`digest_editions` + `digest_edition_items`)**. Канал привязан к подписке, подписка строго в одной папке (`subscriptions.folder_id`). Курсор доставки (`last_post_id`) остаётся на подписке.
+Модель: **папка (`folders`) → 1..N расписаний (`digest_schedules`) → выпуск (`digest_editions` + `digest_edition_items`)**. Канал привязан к подписке, подписка строго в одной папке (`subscriptions.folder_id`).
+**Курсор доставки**: перенесён на независимую пару (расписание, подписка) в новую таблицу `digest_schedule_cursors`. Поле `subscriptions.last_post_id` сохраняется исключительно для обратной совместимости legacy-планировщика на время поэтапного перехода T20→T23.
 
 ```mermaid
 erDiagram
     users ||--o{ folders : owns
     folders ||--o{ subscriptions : contains
     folders ||--o{ digest_schedules : configures
+    digest_schedules ||--o{ digest_schedule_cursors : tracks
+    subscriptions ||--o{ digest_schedule_cursors : references
     digest_schedules ||--o{ digest_editions : generates
     digest_editions ||--o{ digest_edition_items : snapshots
     subscriptions ||--o{ digest_edition_items : feeds
@@ -146,9 +149,19 @@ CREATE TABLE IF NOT EXISTS digest_edition_items (
 );
 CREATE INDEX IF NOT EXISTS idx_edition_items_edition ON digest_edition_items(edition_id);
 CREATE INDEX IF NOT EXISTS idx_edition_items_sub ON digest_edition_items(subscription_id);
+
+-- 5. Курсоры доставки на пару (расписание, подписка)
+CREATE TABLE IF NOT EXISTS digest_schedule_cursors (
+    schedule_id INTEGER NOT NULL REFERENCES digest_schedules(id) ON DELETE CASCADE,
+    subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+    last_post_id INTEGER,
+    updated_at DATETIME NOT NULL,
+    PRIMARY KEY(schedule_id, subscription_id)
+);
+CREATE INDEX IF NOT EXISTS idx_schedule_cursors_sub ON digest_schedule_cursors(subscription_id);
 ```
 
-### 2.2. Модификация существующих таблиц
+### 2.2. Модификация существующих таблиц и правила курсоров
 1. **`subscriptions`**:
    - Добавляется поле `folder_id INTEGER REFERENCES folders(id) ON DELETE RESTRICT`.
    - Инвариант: канал строго в одной папке на пользователя:
@@ -157,11 +170,24 @@ CREATE INDEX IF NOT EXISTS idx_edition_items_sub ON digest_edition_items(subscri
      ```
    - Колонка `tag` остаётся для обратной совместимости на время переходного периода (read-only fallback).
    - Колонка `period` объявляется устаревшей (deprecated legacy). Расписание теперь привязано к папке через `digest_schedules`.
-   - Курсор `last_post_id` остаётся на `subscriptions` и двигается только после подтверждённой доставки выпуска (`digest_editions.status IN ('delivered', 'partial')`).
+   - Поле `subscriptions.last_post_id` **остаётся только для legacy-планировщика** на время перехода. Для нового планировщика источником правды является `digest_schedule_cursors.last_post_id`.
+   - **Backfill курсоров**: при миграции T20 и при добавлении нового расписания/подписки в папку в `digest_schedule_cursors` создаётся запись со значением `last_post_id = subscriptions.last_post_id` (или `NULL`, если подписка новая).
 2. **`digest_executions` / `digest_alerts`**:
    - В T22 добавляется `schedule_id INTEGER REFERENCES digest_schedules(id)`.
    - Ключевание переводится на `(schedule_id, scheduled_at)`.
    - Существующие записи остаются как legacy (с `schedule_id IS NULL`, старые `user_id, period, scheduled_at` не трогаются).
+
+### 2.3. Правило движения курсора доставки
+Курсор пары `(schedule_id, subscription_id)` двигается **ТОЛЬКО** для каналов, чьи посты реально вошли в доставленный снапшот, и **строго в той же SQL-транзакции**, что и фиксация статуса `delivered` (или `partial`) с выставлением `delivered_at`.
+
+| Статус выпуска (`digest_editions.status`) | Действие с курсорами `digest_schedule_cursors` | Транзакционность и детали |
+|---|---|---|
+| `delivered` | **Двигаются** до `MAX(post_id)` из снапшота для каждой подписки, чьи посты вошли в выпуск. | Выполняется атомарно в одной транзакции: `UPDATE digest_editions SET status='delivered', delivered_at=...` + `UPDATE digest_schedule_cursors SET last_post_id=... WHERE schedule_id=? AND subscription_id=?`. Если у подписки в выпуске не было постов, её курсор не меняется. |
+| `partial` | **Двигаются ЧАСТИЧНО** — ТОЛЬКО для подписок/каналов, чьи посты успешно включены в доставленную часть выпуска. Для упавших каналов (`channels_failed`) курсор пары **НЕ сдвигается**. | Атомарная транзакция с фиксацией `partial`. Посты упавшего канала остаются в БД и гарантированно войдут в следующий выпуск или ретрай. Потери контента нет. |
+| `empty` | **НЕ двигаются**. Новых постов не обнаружено ни в одном канале папки. | Курсоры остаются прежними. Обновляется только `digest_schedules.next_send_at` на следующий будущий слот. |
+| `failed` | **НЕ двигаются** ни для одного канала/подписки папки. | Курсоры остаются без изменений. Запись выпуска остаётся со статусом `failed` для ретрая или алерта. |
+| `retrying` | **НЕ двигаются**. Идёт повторная попытка отправки. | Состав постов для отправки берётся СТРОГО из `digest_edition_items` (существующий снапшот), а НЕ пересобирается по курсорам заново. |
+| `pending` / `building` / `ready` / `delivering` | **НЕ двигаются**. Промежуточные шаги конвейера. | Курсоры остаются в исходном состоянии до окончательного подтверждения доставки транспортом. |
 
 ---
 
@@ -172,7 +198,7 @@ CREATE INDEX IF NOT EXISTS idx_edition_items_sub ON digest_edition_items(subscri
 | `subscriptions.tag` (строка или `NULL`) | `folders.name` + `subscriptions.folder_id` | Если `tag` не пустой → создаётся `folders(user_id, name=tag)`. Если `tag IS NULL` или пуст → `folders(user_id, name='Основное', is_default=1)`. Подписка связывается через `folder_id`. |
 | `subscriptions.period` (`'daily'`/`'weekly'`/`'monthly'`) | `digest_schedules.period` | Переносится в расписание папки. В `subscriptions` колонка остаётся как legacy; частота получения постов определяется расписаниями папки, в которой состоит канал. |
 | `subscriptions.next_send_at` | `digest_schedules.next_send_at` | Планировщик опрашивает `digest_schedules`, а не отдельные подписки. В `subscriptions` поле сохраняется до полного отказа от старого планировщика. |
-| `subscriptions.last_post_id` | `subscriptions.last_post_id` | **Без изменений**. Курсор доставки остаётся на подписке. При нескольких расписаниях на одну папку (например, 08:00 и 20:00) утренний выпуск забирает ночные посты и двигает курсор; вечерний выпуск забирает дневные посты от нового курсора. Дублей постов нет. |
+| `subscriptions.last_post_id` | `digest_schedule_cursors(schedule_id, subscription_id, last_post_id)` | **Курсор на пару (расписание, подписка)**. У каждого расписания независимый курсор. `subscriptions.last_post_id` сохраняется только для legacy-планировщика на период миграции. Исключены гонки и обнуления: daily 08:00 не опустошает weekly 09:00 той же папки, а одновременные расписания (Telegram и Email) не затирают посты друг друга. |
 | `digest_settings.send_hour`, `send_minute`, `weekday`, `month_day`, `monthly_mode` | `digest_schedules.send_hour`, `send_minute`, `weekdays`, `month_day`, `monthly_mode` | Пользовательские настройки времени переносятся в расписания папки по умолчанию (и папок, каналы которых имели соответствующий период). |
 | `user_emails.email_periods` (`'daily,weekly'`) | `digest_schedules.delivery = 'email'`, `digest_schedules.email_address` | Если период был отмечен для отправки на почту И адрес `user_emails.email` подтверждён → соответствующее расписание получает `delivery = 'email'`, `email_address = user_emails.email`. Все остальные расписания получают `delivery = 'telegram'`. |
 | `user_emails.email` | `digest_schedules.email_address` | Денормализуется в расписание для изоляции от последующих изменений настроек почты во время доставки. |
@@ -185,7 +211,7 @@ CREATE INDEX IF NOT EXISTS idx_edition_items_sub ON digest_edition_items(subscri
 
 ### 4.1. Порядок выполнения миграции
 1. **Резервная копия**: Вызов штатного проверенного скрипта `python3 ops/aiqu/backup_db.py --tag pre-q4d` (создаёт снимок `bot_data-<stamp>-pre-q4d.db` с проверкой `PRAGMA quick_check`).
-2. **Создание DDL**: Создание таблиц `folders`, `digest_schedules`, `digest_editions`, `digest_edition_items`, индекса `idx_digest_schedules_due`. Добавление колонки `subscriptions.folder_id` (через безопасный `ALTER TABLE ADD COLUMN`).
+2. **Создание DDL**: Создание таблиц `folders`, `digest_schedules`, `digest_editions`, `digest_edition_items`, `digest_schedule_cursors`, индекса `idx_digest_schedules_due`. Добавление колонки `subscriptions.folder_id` (через безопасный `ALTER TABLE ADD COLUMN`).
 3. **Формирование папок по умолчанию**:
    - Для каждого пользователя с активными подписками создаётся запись `folders(user_id, name='Основное', is_default=1)`.
    - Для каждого уникального непустого `tag` активных подписок создаётся `folders(user_id, name=tag, is_default=0)`.
@@ -199,7 +225,18 @@ CREATE INDEX IF NOT EXISTS idx_edition_items_sub ON digest_edition_items(subscri
    - Параметры времени (час, минута, дни недели/месяца) берутся из `digest_settings` пользователя для этого периода; если настройки в базе отсутствовали — из системных дефолтов (`07:00` daily, `09:00` weekly Вс, `10:00` monthly 1-е число).
    - Если период входил в `user_emails.email_periods` и `user_emails.email` подтверждён → `delivery = 'email'`, иначе `'telegram'`.
    - Вычисление первого значения `next_send_at` в UTC.
-6. **Фиксация в метаданных**:
+6. **Backfill курсоров `digest_schedule_cursors`**:
+   - Для каждого созданного расписания и каждой активной подписки его папки создаётся запись:
+     ```sql
+     INSERT INTO digest_schedule_cursors (schedule_id, subscription_id, last_post_id, updated_at)
+     SELECT s.id, sub.id, sub.last_post_id, CURRENT_TIMESTAMP
+     FROM digest_schedules s
+     JOIN subscriptions sub ON sub.folder_id = s.folder_id
+     WHERE sub.is_disabled = 0
+     ON CONFLICT(schedule_id, subscription_id) DO NOTHING;
+     ```
+   - Если `sub.last_post_id` равен `NULL`, курсор пары инициализируется как `NULL` (первый запуск вычитает посты с момента подписки).
+7. **Фиксация в метаданных**:
    - Запись в `app_meta` ключа `schema_queue4 = 'migrated_v1'`.
 
 ### 4.2. Идемпотентность и повторный запуск
@@ -218,24 +255,36 @@ CREATE INDEX IF NOT EXISTS idx_edition_items_sub ON digest_edition_items(subscri
 - Поскольку T19 создаёт валидный SQLite-файл с правами 0600 и проверкой целостности, откат гарантирует мгновенный возврат к стабильному состоянию.
 
 ### 4.4. Совместимость старого и нового кода при поэтапном выкате (T20 → T23)
-Выкат спроектирован так, чтобы происходить **без остановки сервиса и без big-bang релиза**:
-- **Шаг T20 (Схема и миграция)**:
-  - Добавляются новые таблицы и колонка `subscriptions.folder_id`.
-  - Старый планировщик (`main.py:check_digests`) продолжает работать по `subscriptions.next_send_at` и `subscriptions.period`. Бот полностью работоспособен.
-  - Появляется read-only инструмент проверки консистентности `ops/migrate_schedules_dryrun.py`.
-- **Шаг T21 (Новый планировщик и снапшоты)**:
-  - Планировщик переключается на выборку due-расписаний из `digest_schedules`.
-  - Сборка формирует `digest_editions` и `digest_edition_items`.
-  - При отправке посты берутся из снапшота выпуска. Повторы идемпотентны по `edition_id`.
-  - `subscriptions.last_post_id` обновляется по факту доставки.
-  - Обратная совместимость: для фонового мониторинга обновляется и `subscriptions.next_send_at`.
-- **Шаг T22 (Алерты и executions на schedule_id)**:
-  - `digest_executions` и `digest_alerts` получают `schedule_id`.
-  - Кнопка «Повторить» перезапускает выпуск через `digest_editions.status = 'retrying'`.
-  - Старые записи остаются доступны для просмотра как legacy.
-- **Шаг T23 (UI папок и расписаний)**:
-  - До UI расписаний обработчики настроек дайджеста выносятся из `main.py` в отдельный роутер.
-  - Включается интерфейс управления папками, добавления нескольких расписаний на папку, перемещения каналов.
+Выкат спроектирован так, чтобы происходить **без остановки сервиса, без big-bang релиза и строго без двойной отправки**:
+- **Механизм изоляции планировщиков (Feature Flag переключения)**:
+  - Вводится флаг версии планировщика на уровне пользователя: `user_prefs.digest_scheduler_version TEXT DEFAULT 'v1'` (или `user_features.digest_v2 = 0|1`).
+  - Пока флаг `'v1'` (дефолт): старый планировщик (`main.py:check_digests`) обслуживает подписки пользователя по `subscriptions.next_send_at`. Новый планировщик игнорирует расписания таких пользователей.
+  - При переключении пользователя на `'v2'`:
+    - Старый планировщик атомарно исключает пользователя из выборки (`WHERE user_id NOT IN (SELECT user_id FROM user_prefs WHERE digest_scheduler_version = 'v2')` либо установкой `subscriptions.next_send_at = NULL`).
+    - Новый планировщик начинает опрашивать `digest_schedules` для данного пользователя.
+    - Окно параллельной работы двух планировщиков для одного пользователя отсутствует — двойная отправка исключена физически.
+- **Порядок шагов выката**:
+  - **Шаг T20 (Схема и миграция данных)**:
+    - Создаются новые таблицы (`folders`, `digest_schedules`, `digest_editions`, `digest_edition_items`, `digest_schedule_cursors`).
+    - Добавляется колонка `subscriptions.folder_id`.
+    - Выполняется миграция данных: наполняются папки, расписания, выполняется backfill курсоров `digest_schedule_cursors`.
+    - Все пользователи остаются на флаге `v1`. Работает только старый планировщик. Новые таблицы не опрашиваются в горячем цикле.
+    - Доступен strictly read-only инструмент `ops/migrate_schedules_dryrun.py` для верификации консистентности.
+  - **Шаг T21 (Новый планировщик, снапшоты, независимые курсоры)**:
+    - Реализуется новый модуль `digest_scheduler.py` с выборкой due-расписаний по `digest_schedules.next_send_at <= now` для пользователей с флагом `v2`.
+    - Сборка выпуска фиксирует снапшот в `digest_editions` и `digest_edition_items` до отправки.
+    - Движение курсора: только после подтверждения доставки и только для вошедших каналов в `digest_schedule_cursors`.
+    - Ретраи читают посты строго из снапшота `digest_edition_items`.
+    - Канареечное переключение: флаг переключается сначала для тестовых пользователей/админов, затем для всей базы.
+  - **Шаг T22 (Алерты и executions на schedule_id)**:
+    - `digest_executions` и `digest_alerts` получают колонку `schedule_id REFERENCES digest_schedules(id)`.
+    - Ключевание новых записей переводится на `(schedule_id, scheduled_at)`.
+    - Исторические записи остаются как legacy (`schedule_id IS NULL`), не мешая дедупликации новых алертов и повторов.
+    - Кнопка «Повторить» в алерте перезапускает конкретное расписание через его `schedule_id`.
+  - **Шаг T23 (UI папок и расписаний)**:
+    - Обработчики настроек дайджеста выносятся из `main.py` в отдельный роутер `handlers/digest_settings.py`.
+    - Включается интерфейс управления папками и расписаниями (несколько расписаний на папку, выбор времени и транспорта).
+    - Полный вывод из эксплуатации старого планировщика `v1` и удаление legacy-колонок в плановой оптимизации.
 
 ---
 
@@ -246,28 +295,46 @@ CREATE INDEX IF NOT EXISTS idx_edition_items_sub ON digest_edition_items(subscri
 ```sql
 SELECT s.id, s.folder_id, s.user_id, s.period, s.delivery, s.email_address, s.next_send_at
 FROM digest_schedules s
-WHERE s.is_enabled = 1 AND s.next_send_at <= ?
+JOIN user_prefs p ON p.user_id = s.user_id
+WHERE s.is_enabled = 1 AND s.next_send_at <= ? AND p.digest_scheduler_version = 'v2'
 ORDER BY s.next_send_at ASC
 LIMIT ?;
 ```
 - Запрос покрывается составным индексом: `idx_digest_schedules_due ON digest_schedules(is_enabled, next_send_at)`.
-- Для каждого due-расписания подписки выбираются одним быстрым запросом по папке:
+- Для каждого due-расписания подписки и их индивидуальные курсоры выбираются одним запросом по папке:
   ```sql
-  SELECT sub.id, sub.channel_username, sub.channel_title, sub.last_post_id
+  SELECT sub.id AS subscription_id, sub.channel_username, sub.channel_title,
+         c.last_post_id
   FROM subscriptions sub
+  JOIN digest_schedule_cursors c
+    ON c.subscription_id = sub.id AND c.schedule_id = ?
   WHERE sub.folder_id = ? AND sub.is_disabled = 0 AND sub.is_paused = 0;
   ```
-- После обработки снапшота планировщик вычисляет следующий `next_send_at` расписания и засыпает до ближайшего `MIN(next_send_at)` среди активных расписаний (с ограничением сверху, например 15–30 минут для подхвата ручных изменений).
+  *(Если для новой подписки запись в `digest_schedule_cursors` ещё не создана, используется `LEFT JOIN` с `COALESCE(c.last_post_id, sub.last_post_id, 0)` и автоматическим backfill).*
+- Выборка постов канала в выпуск выполняется строго от курсора пары `(schedule_id, subscription_id)`:
+  ```sql
+  SELECT p.post_id, p.post_text, p.post_link, p.post_time,
+         p.views, p.reactions_total, p.forwards, p.replies
+  FROM channel_posts p
+  WHERE p.channel_username = ?
+    AND p.post_id > COALESCE(?, 0)  -- подставляется c.last_post_id пары (schedule_id, subscription_id)
+  ORDER BY p.post_id ASC
+  LIMIT ?;
+  ```
+- После успешной доставки и фиксации снапшота планировщик вычисляет следующий `next_send_at` расписания и засыпает до ближайшего `MIN(next_send_at)` среди активных расписаний (с ограничением сверху, например 15–30 минут для подхвата ручных изменений).
 
-### 5.2. Catch-up одним объединённым выпуском при простое
+### 5.2. Catch-up одним объединённым выпуском на расписание при простое
 Если бот был остановлен (деплой, сбой сети, простой сервера) на длительное время (например, 36 часов):
 - По расписанию наступило несколько плановых сроков (например, вчера в 09:00 и сегодня в 09:00).
-- **Правило**: Формируется строго **ОДИН объединённый выпуск (catch-up)**.
-- В выпуск входят все посты канала, вышедшие с момента `subscriptions.last_post_id`.
-- Срок `scheduled_at` этого выпуска фиксируется как время последнего наступившего слота.
+- **Правило**: Формируется строго **ОДИН объединённый выпуск (catch-up) НА РАСПИСАНИЕ** (а не на папку).
+- В выпуск входят все посты канала, вышедшие с момента `digest_schedule_cursors.last_post_id` для данного расписания.
+- **Изоляция расписаний**: Благодаря раздельным курсорам в `digest_schedule_cursors` расписания одной папки не влияют друг на друга:
+  - Утреннее расписание (daily 08:00) при catch-up собирает посты от своего курсора и сдвигает только свой курсор.
+  - Еженедельное расписание (weekly Вс 09:00) или вечернее (daily 20:00) той же папки при наступлении своего слота собирает посты от СВОЕГО курсора. Утренний выпуск не опустошает еженедельный!
+- Срок `scheduled_at` этого выпуска фиксируется как время последнего наступившего слота расписания.
 - Поле `next_send_at` расписания не шагает по 1 дню, а сразу переносится на **следующий будущий слот** от текущего момента:
   $$\text{next\_send\_at} = \text{calculate\_next\_slot}(\text{now})$$
-- Пользователь не получает лавину из пропущенных дайджестов — приходит одна актуальная сводка за всё время простоя.
+- Пользователь не получает лавину из пропущенных дайджестов — приходит одна актуальная сводка на каждое активное расписание за всё время простоя.
 
 ### 5.3. Граничные случаи
 1. **Часовой пояс пользователя (`user_prefs.timezone`, T15)**:
@@ -284,7 +351,29 @@ LIMIT ?;
      - *Поведение*: Создаются два независимых выпуска `digest_editions` (по одному на расписание/папку). Если оба идут в Telegram — отправляются последовательно двумя сообщениями (или двумя Telegraph-ссылками) с понятными заголовками папок.
      - Оптимизация сети: каналы обеих папок предзагружаются в память общим пулом через `prefetch_due_channels`, исключая повторные запросы по каналам.
    - Сценарий Б: Одно расписание на папку в 09:00 (Telegram) и другое в 09:00 (Email).
-     - Доставка разделяется по транспортам; курсор двигается по факту успешной доставки каждого выпуска.
+     - Благодаря раздельным строкам `digest_schedule_cursors` для каждого `schedule_id` курсоры изолированы:
+     - Успешная отправка в Telegram сдвигает ТОЛЬКО курсоры Telegram-расписания.
+     - Email-расписание гарантированно получает полный набор постов, даже если Telegram отправился раньше.
+     - При одновременной сборке посты не дублируются и не теряются: каждый транспорт доставляет свой зафиксированный снапшот.
+
+### 5.4. Ретрай, идемпотентность и восстановление при сбоях (Crash Recovery)
+1. **Ретрай строго по снапшоту**:
+   - Повторная попытка отправки выпуска (`status = 'retrying'`) читает состав постов **СТРОГО из `digest_edition_items`**, а **НЕ** запрашивает посты по курсорам заново.
+   - Это гарантирует, что пользователь получит ровно тот выпуск, который был сформирован, даже если в каналы уже поступили новые посты.
+2. **Идемпотентность слота**:
+   - Повторное создание выпуска на один и тот же слот невозможно благодаря ограничению целостности:
+     ```sql
+     UNIQUE(schedule_id, scheduled_at)
+     ```
+   - Любая попытка параллельного планировщика создать дублирующий выпуск отсекается на уровне СУБД (`sqlite3.IntegrityError`).
+3. **Поведение при сбое посреди доставки и рестарте бота**:
+   - **Сбой во время отправки (`delivering`)**:
+     - Обновление статуса на `delivered` и сдвиг курсоров в `digest_schedule_cursors` происходят в единой атомарной транзакции SQLite (`BEGIN IMMEDIATE ... COMMIT`).
+     - Если бот упал (SIGKILL, падение хоста, OOM) до коммита транзакции, курсоры в базе данных **НЕ изменились**.
+     - При перезапуске бота фоновый процесс инициализации находит выпуски в промежуточных статусах (`building`, `delivering`).
+     - Для выпусков в `delivering`: статус переводится в `retrying`, и планировщик выполняет повторную отправку зафиксированного снапшота из `digest_edition_items`. Двойного сбора постов не происходит.
+   - **Сбой во время сборки снапшота (`building`)**:
+     - Если бот упал до завершения фиксации снапшота (статус `building`), незавершённый выпуск удаляется или его items очищаются, после чего сборка выполняется заново от актуальных курсоров `digest_schedule_cursors`.
 
 ---
 
@@ -361,32 +450,35 @@ flowchart TD
     T23["T23: Модуляризация хэндлеров и UI папок/расписаний"]
 ```
 
-### T20. Схема данных folders / digest_schedules / digest_editions и миграция с dry-run
+### T20. Схема данных folders / digest_schedules / digest_editions / digest_schedule_cursors и миграция с dry-run
 - **Объём**:
-  - DDL в `data/database.py:init_db` (создание таблиц, внешние ключи, индексы).
-  - Скрипт миграции базы данных `ops/migrate_schedules.py` с флагом транзакции и проверкой контрольных сумм.
-  - Read-only диагностический скрипт `ops/migrate_schedules_dryrun.py` (подключение через `mode=ro`).
+  - DDL в `data/database.py:init_db` (создание таблиц `folders`, `digest_schedules`, `digest_editions`, `digest_edition_items`, `digest_schedule_cursors`, внешние ключи, индексы).
+  - Поле флага миграции `user_prefs.digest_scheduler_version TEXT DEFAULT 'v1'`.
+  - Скрипт миграции базы данных `ops/migrate_schedules.py` с флагом транзакции, backfill курсоров `digest_schedule_cursors = subscriptions.last_post_id` и проверкой контрольных сумм.
+  - Read-only диагностический скрипт `ops/migrate_schedules_dryrun.py` (подключение через `mode=ro`, расчёт числа курсоров, предупреждения о NULL-курсорах).
 - **Критерий готовности**:
   - `init_db()` создаёт новые таблицы без регрессий существующих тестов.
   - Dry-run скрипт на чистой базе возвращает код 0, на конфликтной базе — код 3 с детальным списком конфликтов.
   - Повторный запуск миграции идемпотентен.
+  - Старый планировщик продолжает работать штатно для всех пользователей (`v1`).
 - **Тесты**: `tests/test_migrate_schedules_dryrun.py`, `tests/test_database_migration_q4.py`.
 
-### T21. Планировщик по due-расписаниям, snapshot выпуска, повтор и catch-up
+### T21. Планировщик по due-расписаниям, snapshot выпуска, повтор, catch-up и безопасное переключение
 - **Объём**:
-  - Модуль `digest_scheduler.py`: выборка due-расписаний, расчёт интервала сна до следующего события.
+  - Модуль `digest_scheduler.py`: выборка due-расписаний по `digest_schedules.next_send_at <= now` для пользователей с флагом `v2`.
+  - Изоляция планировщиков: пользователи с `v1` обслуживаются старым планировщиком, пользователи с `v2` — исключительно новым, исключая двойную отправку.
   - Сборка выпуска с фиксацией снапшота в `digest_editions` и `digest_edition_items` до вызова Telegram/SMTP API.
-  - Идемпотентный повтор: при ошибке отправки повторный запуск отправляет посты строго из существующего снапшота.
-  - Механизм catch-up: при задержке > суток генерируется один выпуск, а `next_send_at` перескакивает на ближайший будущий слот.
-  - Продвижение курсора `subscriptions.last_post_id` только после фиксации статуса `delivered`/`partial`.
+  - Идемпотентный повтор: при ошибке отправки повторный запуск отправляет посты строго из существующего снапшота `digest_edition_items` без повторного сбора по курсору.
+  - Механизм catch-up: строго один выпуск на расписание; расписания одной папки не влияют друг на друга благодаря раздельным курсорам.
+  - Продвижение курсоров `digest_schedule_cursors` строго в одной транзакции с отметкой `delivered`/`partial` и только для каналов, чьи посты реально вошли в доставленный снапшот.
 - **Критерий готовности**:
-  - Имитация сетевого сбоя при отправке не приводит к повторному сбору постов и дублированию.
-  - Отсутствие starvation при большом числе расписаний.
+  - Имитация сбоя при отправке не приводит к повторному сбору постов и дублированию.
+  - Отсутствие двойной отправки при переключении пользователя с `v1` на `v2`.
 - **Тесты**: `tests/test_digest_schedules_scheduler.py`, `tests/test_digest_edition_snapshot.py`, `tests/test_digest_catchup.py`.
 
 ### T22. Перевод digest_executions и digest_alerts на schedule_id
 - **Объём**:
-  - Привязка записей `digest_executions` и `digest_alerts` к `schedule_id + scheduled_at`.
+  - Привязка новых записей `digest_executions` и `digest_alerts` к `schedule_id + scheduled_at`.
   - Маркировка исторической информации как legacy (`schedule_id IS NULL`).
   - Адаптация логики технических алертов (`digest_alerts.py`): кулдауны, антиспам, кнопки «Повторить сейчас» и «Пауза 24ч» работают через `schedule_id`.
 - **Критерий готовности**:
@@ -399,6 +491,7 @@ flowchart TD
   - Выделение обработчиков дайджеста, FSM-состояний и inline-клавиатур из монолита `main.py` в роутер `handlers/digest_settings.py` (или `digest_ux.py`).
   - Реализация интерфейса папок: «📁 Мои папки», создание папки, перемещение канала в другую папку.
   - Реализация интерфейса расписаний: добавление расписания к папке (выбор времени, дней недели, канала доставки Telegram/Email).
+  - Перевод всех пользователей на `v2` и отключение старого планировщика `v1`.
 - **Критерий готовности**:
   - `main.py` сокращается минимум на 800+ строк.
   - Пользователь может в чате добавить второе расписание на папку и получать дайджест дважды в день.
@@ -441,7 +534,24 @@ flowchart TD
    - **Вариант Б**: Создавать расписание с `delivery = 'email'`, но ставить `is_enabled = 0` (отключено до подтверждения).
    - *Решение для проекта*: Выбран **Вариант А**, так как пользователь не должен терять доставку дайджеста в Telegram из-за незавершённого подтверждения почты.
 
-7. **Несколько расписаний одной папки на один и тот же день (например, утро 08:00 и вечер 20:00)**:
-   - **Вариант А (Рекомендуется)**: Каждое расписание доставляет посты, появившиеся с момента предыдущей доставки (`last_post_id`), независимо от периода. Утренний выпуск отдаёт ночные посты, вечерний — дневные.
-   - **Вариант Б**: Принудительно объединять расписания одного дня в один выпуск (как делал старый `digest_edition.py`).
-   - *Решение для проекта*: Выбран **Вариант А** — это главная цель Очереди 4 (несколько выпусков в день для одной подборки каналов).
+7. **Распределение потока постов между расписаниями одной папки (ОТКРЫТЫЙ ВОПРОС К ВЛАДЕЛЬЦУ)**:
+   - **Вопрос**: «Расписания одной папки делят поток постов (каждый пост попадает ровно в один выпуск: утренний — ночные, вечерний — дневные) или независимы (каждое расписание получает все посты с момента СВОЕЙ прошлой доставки; при утро+вечер часть постов повторится)?»
+   - **Вариант А (Независимые курсоры — РЕКОМЕНДАЦИЯ ПРОЕКТА как базовая модель)**:
+     - Каждое расписание имеет собственный курсор `digest_schedule_cursors(schedule_id, subscription_id, last_post_id)`.
+     - Выпуск собирает все посты с момента СВОЕЙ прошлой доставки.
+     - *Что в схеме*: Таблица `digest_schedule_cursors(schedule_id, subscription_id, last_post_id, updated_at, PRIMARY KEY(schedule_id, subscription_id))`.
+     - *Что в планировщике*: Выборка постов `WHERE post_id > c.last_post_id` для текущего `schedule_id`. При успешной доставке сдвигается только курсор этого расписания.
+     - *Плюсы*:
+       - Не ломает комбинацию `daily` + `weekly`: еженедельный воскресный выпуск папки получит ВСЕ посты за неделю, а не окажется пустым из-за утреннего ежедневного выпуска.
+       - Параллельные расписания разных транспортов (Telegram в 09:00 и Email в 09:00) работают без гонок и взаимного обнуления.
+       - Независимый catch-up и прозрачные ретраи per-schedule.
+     - *Минусы*: При наличии утреннего (08:00) и вечернего (20:00) расписаний посты могут пересекаться, если окно выборки шире межвыпускного интервала.
+   - **Вариант Б (Деление единого потока постов — режим «потокового пайплайна»)**:
+     - Курсор фиксируется на уровне папки: один курсор на пару `(folder_id, subscription_id)`.
+     - Каждый пост попадает ровно в один выпуск: утренний выпуск забирает ночные посты и двигает курсор папки, вечерний — дневные посты от сдвинутого курсора.
+     - *Что в схеме*: Таблица курсоров `digest_folder_cursors(folder_id, subscription_id, last_post_id)` либо поле на связи папки с подпиской.
+     - *Что в планировщике*: Все расписания папки читают и двигают единый курсор папки.
+     - *Плюсы*: Гарантированное отсутствие дублирования постов между утренним и вечерним дайджестами одной папки.
+     - *Минусы*: Несовместимо с еженедельными/ежемесячными сводками в той же папке (`weekly` соберет 0 постов). Несовместимо с одновременной доставкой в Telegram и Email (первый отправившийся опустошит второй).
+   - **Рекомендация проекта**: Принять **Вариант А** (независимые курсоры `digest_schedule_cursors`) как базовую системную модель. Вариант Б («делить поток») при необходимости может быть поддержан в будущем как расширение через флаг расписания `is_stream_slice = 1` или связанные расписания, не нарушая фундамент изоляции.
+   - *Статус решения*: Выбор остаётся за владельцем продукта (вариант НЕ зафиксирован директивно).
