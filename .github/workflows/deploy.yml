@@ -3,9 +3,15 @@ name: Deploy to VDS
 on:
   push:
     branches: [ "main" ]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
   # Проверки (без деплоя) на PR: ужесточение контейнера нельзя проверить иначе, чем собрав образ.
   pull_request:
     branches: [ "main" ]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
 
 permissions:
   contents: read

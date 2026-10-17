@@ -37,12 +37,12 @@
 **НЕ в релизе:** T24c — опциональная автодоставка Ленты по расписанию. Незавершённая работа agy (609 строк, **без тестов**)
 сохранена в ветке `t24c-wip` (база `4ea8627`, перед продолжением — rebase на `main`). Спека — задача T24c в спринте.
 
-## 3. Как проверить перед пушем (все шаги проходили 15.10, повторно 16.10)
+## 3. Как проверить перед пушем (все шаги проходили 17.10)
 
 ```bash
 cd "$HOME/Library/CloudStorage/GoogleDrive-vctork@gmail.com/Мой диск/DEV/unagi"
 ~/.venvs/unagi/bin/ruff check .                                   # как в CI (ruff==0.16.8)
-~/.venvs/unagi/bin/python -m unittest discover -s tests           # 354 тестов, skipped=2 — штатно
+~/.venvs/unagi/bin/python -m unittest discover -s tests           # 680 тестов (skipped=4 локально: 1 без age, 1 без docker daemon, 2 перф-теста)
 PYTHON=~/.venvs/unagi/bin/python tools/agents/time_shift_tests.sh # +1d +7d +30d +365d -30d: нет зависимости от даты
 ```
 
@@ -52,16 +52,25 @@ PYTHON=~/.venvs/unagi/bin/python tools/agents/time_shift_tests.sh # +1d +7d +30d
 Tier 3, формула не собралась) — `time_shift_tests.sh` здесь не работает; при появлении Linux/другой машины прогнать там, а новые
 тесты писать с датами относительно `now`.
 
-CI (`.github/workflows/deploy.yml`) на push в `main`: ruff → `docker build` → `unittest` в контейнере → SSH-деплой
-(`git pull origin main` → снимок БД `ops/aiqu/backup_db.py` в `storage/backups/*-predeploy.db`, 14 последних; нет снимка — деплой
-останавливается → `docker compose up -d --build`). Секреты GitHub (`HOST`, `SSH_KEY`, `SSH_PORT`, `USERNAME`)
-обновлены 10.10 и указывают на `aiqu-new` (деплои 10–12.10 прошли). Docker локально не нужен: чистый экспорт `main`
-+ свежий venv из `requirements.txt` + `ruff 0.16.8` дали те же результаты (проверено).
+CI (`.github/workflows/deploy.yml`) на push и PR в `main`:
+1. `ruff==0.16.8 check .`
+2. Сборка production-образа `docker build -t unagi-reminder-bot:test .`
+3. Регрессионные тесты в контейнере: 680 тестов (в CI-контейнере прогон идёт от root и без git/docker daemon, поэтому скипаются тесты харденинга, git-зависимые проверки оркестра/деплоя и 2 перф-теста).
+4. Смоук-тест ужесточённого контейнера (`ops/docker/smoke.py`): uid 10001, `read_only`, `cap_drop ALL`, `no-new-privileges`, tmpfs.
+5. SSH-деплой на push:
+   - `git checkout HEAD -- docker-compose.yml` (сброс ручных правок compose на сервере);
+   - `git pull --ff-only origin main` (строго fast-forward; убран `--autostash`, сбоивший 17.10);
+   - проверка неразрешённых конфликтов `test -z "$(git ls-files -u)"`;
+   - консистентный снимок БД `python3 ops/aiqu/backup_db.py` (правило «нет снимка — нет деплоя», ротация 14 копий, сжатие старых в `.db.gz`, BK1);
+   - `docker compose up -d --build`;
+   - очистка висячих образов и старого кеша сборки `docker image prune -f` и `docker builder prune -f --filter until=6h` (защита диска от переполнения: после достижения 86% порог удержания кеша сборки сокращён до 6h, при диске >= 85% удаляется `:rollback`).
 
-Проверено на сервере/копиях 15.10:
-- миграция на **реальной копии прод-БД**: 17 → 20 таблиц, ни одна строка существующих таблиц не изменилась, повтор идемпотентен, `integrity_check = ok`;
-- релиз не меняет `Dockerfile` и `requirements.txt`; лимит CPU задаётся в `.env` (`BOT_CPUS`, на проде 1.0), поэтому ручная правка `docker-compose.yml` на сервере не нужна и не сохраняется: деплой делает `git checkout HEAD -- docker-compose.yml` и `git pull --ff-only` (с 17.10 вместо `--autostash`, который при конфликте возврата stash возвращал код 0 и оставлял маркеры в compose); конфликт слияния на сервере останавливает деплой, а `prod_check` даёт ALERT;
-- новые переменные окружения (`FEED_*`, `MAX_FEED_CHANNELS`, `MAX_IMPORT_FEED`) имеют значения по умолчанию — менять `.env` на проде не нужно.
+Проверено на сервере/копиях 17.10:
+- Контейнер работает без root: uid 10001 (`bot`), `entrypoint.sh` сбрасывает права через `setpriv`, ФС read-only;
+- Лимит CPU по умолчанию 1.0 (`BOT_CPUS` в `.env` и compose), так как на хосте 1 vCPU и Docker отвергает >1.0;
+- БД оптимизирована (DB1): WAL и chmod в `init_db()`, кеш 16 МиБ, порционная очистка по 500 строк, пакетная вставка постов;
+- Сжатие снимков БД (BK1) снижает объём бэкапов втрое (2 несжатых + 12 сжатых);
+- Контроль прода `ops/aiqu/prod_check.sh` выводит 15 параметров, включая статистику бэкапов и цифры для решений `prod_stats.sql`.
 
 ## 4. Деплой и откат
 
@@ -92,9 +101,15 @@ CI (`.github/workflows/deploy.yml`) на push в `main`: ruff → `docker build`
   годятся для коротких ревью; для кода и больших тестов — `gpt-6.1-sol` (16k). `agy -c` продолжает **последний** разговор — после любого
   постороннего запуска agy указывать разговор явно или начинать новый. Супервизор `agy_supervise.sh` на повторных попытках откатывает
   дерево (обрывки в `.agy/partial-*`) — если нужно сохранить работу, `AGY_KEEP_TREE=1`.
-- **Единая точка входа для агентов (с 16.10):** `tools/agents/agents.sh help` — `status`, `pick`, `run`, `check`, `watch`, `route`, `report`. Исполнитель по умолчанию — **dsh**
-  (DeepSeek Harness, `npx dsh web`, ключ хранит сам dsh); opencode — только короткие сверки и только с решением Jev (бюджет 5 млн токенов на сессию, `budget.json`, `budget.json`).
-  Приоритет экономии токенов: opencode > deepseek > Jev > Claude > agy. Подробности, калибровка расхода и эффорт Off/Low/High/Max — `tools/agents/README.md`.
+- **Оркестр агентов и единая точка входа (`tools/agents/`):**
+  - Декларативная спецификация `tools/agents/orchestra.json`: роли (`claude`, `argon-web`, `agy`, `dsh`, `opencode`, `jev`), лестница исполнения (ladder от бесплатных к дорогим), жесткие лимиты (вкладок терминала $\le 6$, параллельных треков $\le 4$, таймаут opencode 900 с), правила безопасности и факты среды прода (1 vCPU, 961 МБ ОЗУ, диск 9,8 ГБ, uid 10001, без root).
+  - Управление через `tools/agents/agents.sh`:
+    - `agents.sh orchestra [validate|show]` — проверка и просмотр конфигурации;
+    - `agents.sh launch <agent> <worktree> <brief> <marker>` — валидация перед запуском (проверка worktree, закоммиченности брифа без маркера готовности в коммите, отсутствие метки в истории git) и генерация терминальной команды;
+    - `agents.sh gate <PR>` — предслиянный аудит PR независимым агентом с учетом фактов среды прода;
+    - `agents.sh check`, `run`, `watch`, `status`, `route`, `report`.
+  - Приоритет экономии токенов: бесплатные (agy, argon-web) > дешёвые (jev, dsh) > дорогие (opencode) > Claude.
+  - Журнал решений ведётся в модели «один файл на задачу» в каталоге `docs/sprint/progress/<МЕТКА>.md`.
 - **Простые решения через Jev:** `tools/agents/decide.sh "вопрос" вариант=описание … --default <безопасный>` — закрытый список, порог
   уверенности 0.7, эскалация к человеку (код 10); журнал `.agents/decisions.ndjson`. Только советует: push, откат прода, удаление данных
   решает наблюдатель/владелец. Ключ OpenRouter берётся из окружения или из `~/.config/agent-tools/env` (0600, строки `OPENROUTER_API_KEY=…`);
@@ -113,14 +128,15 @@ CI (`.github/workflows/deploy.yml`) на push в `main`: ruff → `docker build`
 - Вне спринта (см. спеку, раздел 4): Лента на почту (ghsub), ИИ-сводка, обучение ранжирования по 👍/👎, импорт из папок Telegram.
 - Старые ветки/копии для уборки после релиза: `git worktree list`, `git branch --merged main`.
 
-## 7. Следующие шаги (состояние на 16.10.2026, ночь) — для новой сессии
+## 7. Следующие шаги (состояние на 17.10.2026, вечер) — для новой сессии
 
-На проде `main` = автодоставка Ленты (T24c), очистка и атомарный откат (T26), снимок БД перед деплоем. Окружение агентов — `tools/agents/README.md`, вход — `agents.sh status`.
+На проде `main`: контейнер без root (uid 10001, `read_only`, `cap_drop ALL`), DB1 (PRAGMA и батчи), BK1 (сжатие снимков БД в gzip, ротация по 2 суффиксам), деплой без autostash с `git pull --ff-only` и очисткой docker, лимит CPU 1.0 по умолчанию, MS1 (`bookmarks.py` в Router). Вход агентов — `agents.sh status` / `orchestra`. Тесты: **680 тестов** (skipped=4 локально: 1 без age, 1 без docker daemon, 2 перф-теста; в CI без git/docker и от root дополнительно скипаются тесты харденинга и git-зависимые проверки).
 
-1. **Ключ Jev не положен** (`~/.config/agent-tools/env`, строка `OPENROUTER_API_KEY=…`): пока Jev ничего не выбирает, dsh/agy работают по статической политике, opencode отказывается запускаться. После ключа — один замер: `agents.sh route dsh review "..." --dry-run`, затем `agents.sh report`.
-2. **Решение владельца:** `executor_policy.opencode_allowed(kind)` (единственный `TODO(human)`) — для каких видов задач допускается opencode. Сейчас для всех запрещён.
-3. **Tokenn-уровень мышления** выставляется вручную в панели (сейчас Min; в панели Min/Low/Medium/High/xHigh). Нужно: эффорт opencode у Jev = те же 5 уровней и шлюз «выбранный уровень ≠ уровню в панели → не запускать, попросить владельца» (`tools/agents/tokenn_state.json`); просьбы владельцу — через разовое письмо с aiqu (образец — `/usr/local/bin/ghsub-roadmap-alert.sh`, флаг в `/var/lib/tldw`), в тексте письма — статус репо, спринт, окружение агентов, расход, чтобы его можно было вставить в новую сессию. **Не сделано.**
-4. Бэклог (docs/roadmap.md): Лента на почту (ghsub), ИИ-сводка Ленты, очередь 4 (расписания дайджестов на папку), резервная доставка MAX, разбиение `main.py`.
-5. Проверки: `ruff check .`, `unittest discover -s tests` (440 тестов), CI на slim-образе строже локального (нет `pkill`, `agy`).
-
-**Актуальный статус на 16.10 утро — [docs/ALERT-HANDOFF.md](ALERT-HANDOFF.md)** (он же тело письма-алерта aiqu; раздел 7 выше устарел частично: Jev-ключ положен, opencode разрешён для проверок, безопасность и быстродействие Ленты сделаны).
+1. **Ворота G1 (решения владельца по Очереди 4, [docs/sprint/owner-decisions-2026-10-17.md](docs/sprint/owner-decisions-2026-10-17.md), ветка `docs/owner-decisions-2026-10-17`)**:
+   - Выбор модели курсоров: Вариант В (одно расписание со слотами времени и общим курсором) vs Вариант А (независимые выпуски);
+   - Авто-разрешение конфликтов: 5 правил, по тегам — опираясь на замер `channels_multi_tag_or_period` из `prod_check.sh`;
+   - Email-периоды: оставить на legacy-пути до ghsub (без двойной миграции) vs миграция в `digest_schedules`.
+2. **Ключ DeepSeek на проде недействителен** (HTTP 401): заменить владельцу, иначе ИИ-функции не работают.
+3. **Ворота G2 (MS2, настройки дайджеста в Router)**: завершить ревью и слияние `feat/ms2-digest-router` (PR 28; инструмент интроспекции `tools/handler_order.py` в ветке PR подтвердил 0 конфликтов диспетчеризации хендлеров).
+4. **Резервная доставка в MAX (Очередь 5)**: оценить приоритет по цифре `reminders_failed_30d` из `prod_check.sh` (после переезда в РФ зарубежный IP уходит, риск блокировки номера высокий).
+5. **Подготовка к переезду на сервер в РФ (окно 21–22.10)**: OVPN-туннель до Telegram DC, чек-лист `ops/aiqu/README.md`, перенос MTProto-сессии (строго один клиент в момент времени), снятие `network_mode: host` после проверки bridge.
