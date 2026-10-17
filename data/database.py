@@ -20,6 +20,7 @@ MAX_ERROR_TEXT_LENGTH = int(os.getenv("MAX_ERROR_TEXT_LENGTH", "800"))
 CHANNEL_BACKLOG_MAX = int(os.getenv("CHANNEL_BACKLOG_MAX", "500"))
 CHANNEL_DELIVERY_BATCH_SIZE = int(os.getenv("CHANNEL_DELIVERY_BATCH_SIZE", "50"))
 MAX_FEED_CHANNELS = int(os.getenv("MAX_FEED_CHANNELS", "100"))
+CLEANUP_BATCH_SIZE = 500
 # SEC1 (п.2/п.9): квоты на пользователя, чтобы один аккаунт не выел память.
 MAX_DIGEST_SUBSCRIPTIONS = int(os.getenv("MAX_DIGEST_SUBSCRIPTIONS", "300"))
 MAX_USER_REMINDERS = int(os.getenv("MAX_USER_REMINDERS", "1000"))
@@ -39,6 +40,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "bot_data.db"))
 
 
+_SECURED_DB_PATHS: set[str] = set()
+
+
 @contextmanager
 def get_connection():
     if DB_PATH != ":memory:":
@@ -46,12 +50,13 @@ def get_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
+        # Б1/Б2: journal_mode=WAL персистентен в файле и выставляется в init_db();
+        # на соединении остаются только пер-соединенческие настройки.
         conn.execute("PRAGMA busy_timeout = 5000")
-        conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA temp_store = MEMORY")
-        conn.execute("PRAGMA cache_size = -64000")
-        _secure_db_files()
+        conn.execute("PRAGMA cache_size = -16000")
+        _secure_db_files_once()
         yield conn
     finally:
         conn.close()
@@ -68,6 +73,14 @@ def _secure_db_files() -> None:
                 os.chmod(path, 0o600)
         except OSError:
             pass
+    _SECURED_DB_PATHS.add(DB_PATH)
+
+
+def _secure_db_files_once() -> None:
+    """Не более одного chmod-прохода на путь БД за процесс."""
+    if DB_PATH == ":memory:" or DB_PATH in _SECURED_DB_PATHS:
+        return
+    _secure_db_files()
 
 
 
@@ -267,6 +280,8 @@ def _reactivate_legacy_transient_failures(cursor: sqlite3.Cursor) -> int:
 
 def init_db():
     with get_connection() as conn:
+        # Б1: WAL — свойство файла БД, а не отдельного соединения.
+        conn.execute("PRAGMA journal_mode = WAL")
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -777,6 +792,7 @@ def init_db():
             """
         )
         conn.commit()
+        _secure_db_files()
 
 
 def add_message(
@@ -2016,29 +2032,32 @@ def add_digest_posts(user_id, channel_username, channel_title, posts):
         return 0
     normalized_username = normalize_channel_username(channel_username)
     created_at = serialize_datetime(utc_now())
-    inserted = 0
-    with get_connection() as conn:
-        for post in posts:
-            post_time = post.get("time")
-            post_time_str = serialize_datetime(post_time) if post_time is not None else created_at
-            cursor = conn.execute(
-                '''
-                INSERT OR IGNORE INTO digest_posts (
-                    user_id, channel_username, channel_title, post_text, post_link, post_time, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''',
-                (
-                    user_id,
-                    normalized_username,
-                    channel_title,
-                    post.get("text", ""),
-                    post.get("link", ""),
-                    post_time_str,
-                    created_at,
-                ),
+    rows = []
+    for post in posts:
+        post_time = post.get("time")
+        post_time_str = serialize_datetime(post_time) if post_time is not None else created_at
+        rows.append(
+            (
+                user_id,
+                normalized_username,
+                channel_title,
+                post.get("text", ""),
+                post.get("link", ""),
+                post_time_str,
+                created_at,
             )
-            inserted += cursor.rowcount
+        )
+    with get_connection() as conn:
+        cursor = conn.executemany(
+            '''
+            INSERT OR IGNORE INTO digest_posts (
+                user_id, channel_username, channel_title, post_text, post_link, post_time, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''',
+            rows,
+        )
+        inserted = cursor.rowcount
         conn.commit()
     return inserted
 
@@ -2860,84 +2879,95 @@ def get_delivered_executions_pending_recovery_alert(now_str: str | None = None) 
         return [dict(r) for r in rows]
 
 
+def _delete_old_rows_in_batches(conn, table: str, where_clause: str, params: tuple) -> int:
+    """Удалять строки короткими порциями, освобождая write-lock после каждой."""
+    deleted = 0
+    while True:
+        cursor = conn.execute(
+            f"""
+            DELETE FROM {table}
+            WHERE rowid IN (
+                SELECT rowid FROM {table}
+                WHERE {where_clause}
+                LIMIT ?
+            )
+            """,
+            (*params, CLEANUP_BATCH_SIZE),
+        )
+        deleted += cursor.rowcount
+        conn.commit()
+        if cursor.rowcount < CLEANUP_BATCH_SIZE:
+            break
+    return deleted
+
+
 def cleanup_old_records(now_str: str) -> dict[str, int]:
     with get_connection() as conn:
-        scheduled_sent_deleted = conn.execute(
-            """
-            DELETE FROM scheduled_messages
-            WHERE is_sent = 1
-              AND created_at < datetime(?, ?)
-            """,
-            (now_str, f"-{MESSAGE_RETENTION_DAYS} days"),
-        ).rowcount
-        scheduled_failed_deleted = conn.execute(
-            """
-            DELETE FROM scheduled_messages
-            WHERE delivery_status = 'failed_permanent'
-              AND created_at < datetime(?, ?)
-            """,
-            (now_str, f"-{MESSAGE_RETENTION_DAYS} days"),
-        ).rowcount
-        subscriptions_failed_deleted = conn.execute(
-            """
-            DELETE FROM subscriptions
-            WHERE is_disabled = 1
-              AND digest_status = 'failed_permanent'
-              AND COALESCE(last_attempt_at, created_at) < datetime(?, ?)
-            """,
-            (now_str, f"-{SUBSCRIPTION_FAILURE_RETENTION_DAYS} days"),
-        ).rowcount
-        digest_posts_deleted = conn.execute(
-            """
-            DELETE FROM digest_posts
-            WHERE COALESCE(post_time, created_at) < datetime(?, ?)
-            """,
-            (now_str, f"-{DIGEST_POST_RETENTION_DAYS} days"),
-        ).rowcount
-        channel_posts_deleted = conn.execute(
-            """
-            DELETE FROM channel_posts
-            WHERE post_time < datetime(?, ?)
-            """,
-            (now_str, f"-{DIGEST_POST_RETENTION_DAYS} days"),
-        ).rowcount
-        digest_executions_deleted = conn.execute(
-            """
-            DELETE FROM digest_executions
-            WHERE created_at < datetime(?, ?)
-            """,
-            (now_str, f"-{DIGEST_POST_RETENTION_DAYS} days"),
-        ).rowcount
-        digest_alerts_deleted = conn.execute(
-            """
-            DELETE FROM digest_alerts
-            WHERE created_at < datetime(?, ?)
-            """,
-            (now_str, f"-{DIGEST_POST_RETENTION_DAYS} days"),
-        ).rowcount
-        ai_usage_deleted = conn.execute(
-            """
-            DELETE FROM ai_usage
-            WHERE usage_day < date(?, '-2 days')
-            """,
+        message_retention = f"-{MESSAGE_RETENTION_DAYS} days"
+        subscription_retention = f"-{SUBSCRIPTION_FAILURE_RETENTION_DAYS} days"
+        digest_retention = f"-{DIGEST_POST_RETENTION_DAYS} days"
+        scheduled_sent_deleted = _delete_old_rows_in_batches(
+            conn,
+            "scheduled_messages",
+            "is_sent = 1 AND created_at < datetime(?, ?)",
+            (now_str, message_retention),
+        )
+        scheduled_failed_deleted = _delete_old_rows_in_batches(
+            conn,
+            "scheduled_messages",
+            "delivery_status = 'failed_permanent' AND created_at < datetime(?, ?)",
+            (now_str, message_retention),
+        )
+        subscriptions_failed_deleted = _delete_old_rows_in_batches(
+            conn,
+            "subscriptions",
+            "is_disabled = 1 AND digest_status = 'failed_permanent' "
+            "AND COALESCE(last_attempt_at, created_at) < datetime(?, ?)",
+            (now_str, subscription_retention),
+        )
+        digest_posts_deleted = _delete_old_rows_in_batches(
+            conn,
+            "digest_posts",
+            "COALESCE(post_time, created_at) < datetime(?, ?)",
+            (now_str, digest_retention),
+        )
+        channel_posts_deleted = _delete_old_rows_in_batches(
+            conn,
+            "channel_posts",
+            "post_time < datetime(?, ?)",
+            (now_str, digest_retention),
+        )
+        digest_executions_deleted = _delete_old_rows_in_batches(
+            conn,
+            "digest_executions",
+            "created_at < datetime(?, ?)",
+            (now_str, digest_retention),
+        )
+        digest_alerts_deleted = _delete_old_rows_in_batches(
+            conn,
+            "digest_alerts",
+            "created_at < datetime(?, ?)",
+            (now_str, digest_retention),
+        )
+        ai_usage_deleted = _delete_old_rows_in_batches(
+            conn,
+            "ai_usage",
+            "usage_day < date(?, '-2 days')",
             (now_str,),
-        ).rowcount
-        feed_editions_deleted = conn.execute(
-            """
-            DELETE FROM feed_editions
-            WHERE created_at < datetime(?, '-2 days')
-            """,
+        )
+        feed_editions_deleted = _delete_old_rows_in_batches(
+            conn,
+            "feed_editions",
+            "created_at < datetime(?, '-2 days')",
             (now_str,),
-        ).rowcount
-        reschedule_undo_deleted = conn.execute(
-            """
-            DELETE FROM reschedule_undo_history
-            WHERE created_timestamp IS NOT NULL
-              AND created_timestamp < unixepoch(datetime(?, '-1 day'))
-            """,
+        )
+        reschedule_undo_deleted = _delete_old_rows_in_batches(
+            conn,
+            "reschedule_undo_history",
+            "created_timestamp IS NOT NULL "
+            "AND created_timestamp < unixepoch(datetime(?, '-1 day'))",
             (now_str,),
-        ).rowcount
-        conn.commit()
+        )
 
     return {
         "scheduled_sent_deleted": scheduled_sent_deleted,
