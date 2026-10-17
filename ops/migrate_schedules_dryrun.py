@@ -59,7 +59,6 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
             "schedules_to_create": 0,
             "telegram_schedules": 0,
             "email_schedules": 0,
-            "cursors_to_create": 0,
             "zero_or_null_cursors": 0,
             "null_cursors": 0,
             "zero_cursors": 0,
@@ -68,6 +67,7 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
         "conflicts": {
             "channel_in_multiple_tags": [],
             "channel_in_multiple_periods": [],
+            "heterogeneous_period_in_folder": [],
             "time_discrepancy_in_folder": [],
             "empty_folders": [],
             "schedule_without_time": [],
@@ -107,8 +107,7 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
     report["summary"]["unique_channels"] = int(row_subs["unique_channels"] or 0)
 
     # 2. Анализ email-доставки пользователей
-    # Решение владельца (18.10): Email остаётся на legacy-пути (period), в digest_schedules
-    # не мигрирует. Dry-run не создаёт email-расписания (email_schedules = 0).
+    # Модель Q4S: email-подписки мигрируют в папки с delivery='email'
     user_emails_map: dict[int, dict[str, Any]] = {}
     if _table_exists(conn, "user_emails"):
         for row in conn.execute(
@@ -133,7 +132,7 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
                         "user_id": uid,
                         "pending_email": pending or None,
                         "email_periods": sorted(periods),
-                        "resolution": "Email остаётся на legacy-пути; в digest_schedules не мигрирует (не подтверждён)",
+                        "resolution": "Неподтверждённый email при указанных email_periods — конфликт (код 3)",
                     }
                 )
 
@@ -218,13 +217,10 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
 
     total_folders = 0
     total_schedules = 0
-    total_cursors = 0
 
     # Структуры для выявления конфликтов каналов и папок
     # (user_id, channel_username) -> список записей
     user_channel_subs: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
-    # (user_id, folder_name, period) -> список (channel_username, next_send_at)
-    folder_period_times: dict[tuple[int, str, str], list[dict[str, Any]]] = defaultdict(list)
 
     for u_row in users_with_subs:
         uid = u_row["user_id"]
@@ -246,7 +242,7 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
             folder_name = tag_clean if tag_clean else "Основное"
             is_default = (folder_name == "Основное")
 
-            period = s["period"] or "daily"
+            raw_period = s["period"]
             channel_username = s["channel_username"]
             sub_id = s["id"]
             next_send_at = s["next_send_at"]
@@ -255,28 +251,21 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
                 {
                     "sub_id": sub_id,
                     "folder_name": folder_name,
-                    "period": period,
+                    "period": raw_period,
                     "next_send_at": next_send_at,
                     "last_post_id": s["last_post_id"],
                 }
             )
 
-            folder_period_times[(uid, folder_name, period)].append(
-                {
-                    "channel_username": channel_username,
-                    "next_send_at": next_send_at,
-                }
-            )
-
             # Валидация period подписки
-            if period not in VALID_PERIODS:
+            if raw_period is None or raw_period not in VALID_PERIODS:
                 report["conflicts"]["invalid_schedule_params"].append(
                     {
                         "user_id": uid,
                         "sub_id": sub_id,
                         "channel_username": channel_username,
-                        "period": period,
-                        "reason": f"Подписка имеет недопустимый period='{period}' (ожидается daily, weekly, monthly)",
+                        "period": raw_period,
+                        "reason": f"Подписка имеет недопустимый period={repr(raw_period)} (ожидается daily, weekly, monthly)",
                     }
                 )
 
@@ -287,33 +276,78 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
                     "periods": set(),
                     "channel_count": 0,
                     "channels": set(),
+                    "next_send_at_set": set(),
                 }
-            folders_for_user[folder_name]["periods"].add(period)
+            folders_for_user[folder_name]["periods"].add(raw_period)
             folders_for_user[folder_name]["channel_count"] += 1
             folders_for_user[folder_name]["channels"].add(channel_username)
+            if next_send_at is not None:
+                folders_for_user[folder_name]["next_send_at_set"].add(next_send_at)
 
-            # Проверка наличия явных настроек в digest_settings
-            if (uid, period) not in digest_settings_map:
+            # Проверка наличия явных настроек в digest_settings (если period валидный)
+            if raw_period in VALID_PERIODS and (uid, raw_period) not in digest_settings_map:
                 report["conflicts"]["schedule_without_time"].append(
                     {
                         "user_id": uid,
-                        "period": period,
+                        "period": raw_period,
                         "send_hour": None,
                         "send_minute": None,
-                        "reason": f"Нет явной записи в digest_settings для активной подписки '{period}'",
+                        "reason": f"Нет явной записи в digest_settings для активной подписки '{raw_period}'",
                         "resolution": "Будет применён дефолт из кода (07:00, текущий день недели/месяца, monthly_mode='date')",
                     }
                 )
 
         for f_name, f_info in folders_for_user.items():
-            total_folders += 1
-            f_periods = f_info["periods"] or {"daily"}
-            num_f_scheds = len(f_periods)
-            total_schedules += num_f_scheds
-
+            periods_set = f_info["periods"]
             subs_in_folder = len(f_info["channels"])
-            f_cursors = num_f_scheds * subs_in_folder
-            total_cursors += f_cursors
+
+            # 1. Проверка однородности period в папке (включая папку "Основное", где tag IS NULL)
+            # Разные периоды внутри одной папки или NULL — жесткий конфликт (код 3)
+            has_hetero = (len(periods_set) > 1) or (None in periods_set)
+            if has_hetero:
+                report["conflicts"]["heterogeneous_period_in_folder"].append(
+                    {
+                        "user_id": uid,
+                        "folder_name": f_name,
+                        "periods": sorted([str(p) for p in periods_set]),
+                        "channels_count": subs_in_folder,
+                        "resolution": "Папка содержит неоднородный period (включая NULL) — требуется один period на папку (код 3)",
+                    }
+                )
+                valid_candidates = [p for p in periods_set if p in VALID_PERIODS]
+                folder_period = sorted(valid_candidates)[0] if valid_candidates else "daily"
+            else:
+                folder_period = list(periods_set)[0] if periods_set else "daily"
+
+            # 2. Проверка расхождения времени внутри папки
+            if len(f_info["next_send_at_set"]) > 1:
+                report["conflicts"]["time_discrepancy_in_folder"].append(
+                    {
+                        "user_id": uid,
+                        "folder_name": f_name,
+                        "period": folder_period,
+                        "channels_count": subs_in_folder,
+                        "distinct_times": sorted(str(t) for t in f_info["next_send_at_set"]),
+                        "resolution": "Подписки одной папки имеют разные next_send_at — расхождение времени (код 3)",
+                    }
+                )
+
+            # 3. Определение доставки (Telegram или Email)
+            # В модели Q4S email-подписки мигрируют в папки с delivery='email'
+            user_email_info = user_emails_map.get(uid)
+            if (
+                user_email_info
+                and user_email_info["email"]
+                and folder_period in user_email_info["periods"]
+            ):
+                delivery = "email"
+                report["summary"]["email_schedules"] += 1
+            else:
+                delivery = "telegram"
+                report["summary"]["telegram_schedules"] += 1
+
+            total_folders += 1
+            total_schedules += 1  # Папка = одна рассылка
 
             report["folders_detail"].append(
                 {
@@ -321,17 +355,13 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
                     "folder_name": f_name,
                     "is_default": f_info["is_default"],
                     "channels_count": subs_in_folder,
-                    "schedules": sorted(f_periods),
-                    "cursors_count": f_cursors,
+                    "period": folder_period,
+                    "delivery": delivery,
                 }
             )
 
     report["summary"]["folders_to_create"] = total_folders
     report["summary"]["schedules_to_create"] = total_schedules
-    # Решение владельца 18.10: все расписания в digest_schedules — Telegram
-    report["summary"]["telegram_schedules"] = total_schedules
-    report["summary"]["email_schedules"] = 0
-    report["summary"]["cursors_to_create"] = total_cursors
 
     # 5. Анализ курсоров в legacy-таблице subscriptions
     cursor_stats = conn.execute(
@@ -365,7 +395,7 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
                     "sub_id": nr["id"],
                     "user_id": nr["user_id"],
                     "channel_username": nr["channel_username"],
-                    "resolution": "Курсор digest_schedule_cursors будет инициализирован как NULL (вычитка с момента подписки)",
+                    "resolution": "Курсор subscriptions.last_post_id равен NULL (вычитка с момента подписки)",
                 }
             )
 
@@ -383,7 +413,6 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
             )
 
         # Конфликт: дубли периодов одного канала (один канал в нескольких периодах)
-        # Бриф 18.10: дубли периодов одного канала — конфликт (код 3)
         if len(subs) > 1:
             periods = [s["period"] for s in subs]
             report["conflicts"]["channel_in_multiple_periods"].append(
@@ -395,23 +424,7 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
                 }
             )
 
-    # 7. Конфликт: расхождения времени у подписок одной папки
-    # Бриф 18.10: dry-run показывает расхождения времени у подписок одной папки (код 3), но не разрешает
-    for (uid, folder_name, period), items in folder_period_times.items():
-        non_null_times = {item["next_send_at"] for item in items if item["next_send_at"] is not None}
-        if len(non_null_times) > 1:
-            report["conflicts"]["time_discrepancy_in_folder"].append(
-                {
-                    "user_id": uid,
-                    "folder_name": folder_name,
-                    "period": period,
-                    "channels_count": len(items),
-                    "distinct_times": sorted(str(t) for t in non_null_times),
-                    "resolution": "Подписки одной папки имеют разные next_send_at — расхождение времени (код 3)",
-                }
-            )
-
-    # 8. Конфликт: пустые папки (теги только у отключённых подписок)
+    # 7. Конфликт: пустые папки (теги только у отключённых подписок)
     disabled_tags_query = """
         SELECT DISTINCT user_id, tag
         FROM subscriptions
@@ -439,7 +452,7 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
             }
         )
 
-    # 9. Legacy статистика
+    # 8. Legacy статистика
     if _table_exists(conn, "digest_executions"):
         row_exec = conn.execute("SELECT COUNT(*) FROM digest_executions").fetchone()
         report["legacy"]["digest_executions_count"] = int(row_exec[0] or 0)
@@ -451,11 +464,12 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
     report["legacy"]["legacy_subscriptions_period_count"] = report["summary"]["active_subscriptions"]
 
     # Определение общего статуса конфликтов
-    # Бриф 18.10: дубли периодов, расхождения времени, невалидные параметры,
-    # один канал в нескольких папках — всё это конфликты (код 3).
+    # Модель Q4S: неоднородный period внутри папки (в т.ч. tag IS NULL), дубли периодов,
+    # расхождения времени, невалидные параметры, канал в нескольких папках — всё это конфликты (код 3).
     has_conflicts = bool(
         report["conflicts"]["channel_in_multiple_tags"]
         or report["conflicts"]["channel_in_multiple_periods"]
+        or report["conflicts"]["heterogeneous_period_in_folder"]
         or report["conflicts"]["time_discrepancy_in_folder"]
         or report["conflicts"]["empty_folders"]
         or report["conflicts"]["schedule_without_time"]
@@ -480,12 +494,10 @@ def format_report(report: dict[str, Any]) -> str:
     lines.append(f"   • Активных подписок:      {summary['active_subscriptions']}")
     lines.append(f"   • Уникальных каналов:     {summary['unique_channels']}")
     lines.append(f"   • Будет создано папок:    {summary['folders_to_create']}")
-    lines.append(f"   • Будет создано расписаний: {summary['schedules_to_create']}")
+    lines.append(f"   • Будет создано расписаний: {summary['schedules_to_create']} (папка = одна рассылка)")
     lines.append(f"     - Telegram-расписаний:   {summary['telegram_schedules']}")
-    lines.append(f"     - Email-расписаний:      {summary['email_schedules']} (Email остаётся на legacy-пути)")
-    lines.append(
-        f"   • курсоры: будет создано {summary['cursors_to_create']} записей digest_schedule_cursors (расписания × подписки папки)"
-    )
+    lines.append(f"     - Email-расписаний:      {summary['email_schedules']}")
+    lines.append("   • Курсоры: один на подписку (subscriptions.last_post_id, таблица курсоров упразднена)")
     lines.append(
         f"   • Число подписок с курсором 0/NULL: {summary['zero_or_null_cursors']} "
         f"(NULL: {summary['null_cursors']}, 0: {summary['zero_cursors']})"
@@ -547,6 +559,14 @@ def format_report(report: dict[str, Any]) -> str:
     for item in c7:
         lines.append(
             f"       - user={item['user_id']} {item.get('param', item.get('period', ''))}: {item['reason']}"
+        )
+
+    c8 = conflicts.get("heterogeneous_period_in_folder", [])
+    lines.append(f"   [8] Неоднородные периоды внутри папки (включая папку без тега): {len(c8)}")
+    for item in c8:
+        lines.append(
+            f"       - user={item['user_id']} папка='{item['folder_name']}' "
+            f"периоды={item['periods']} каналы={item['channels_count']} -> {item['resolution']}"
         )
 
     warnings = report.get("warnings", {})
