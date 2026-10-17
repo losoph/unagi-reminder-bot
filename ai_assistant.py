@@ -47,19 +47,12 @@ async def ask(
 
     http_sess = session or get_session()
     try:
-        try:
-            post_req = http_sess.post(
-                f"{DEEPSEEK_BASE_URL}/chat/completions",
-                json=payload,
-                headers=headers,
-                timeout=REQUEST_TIMEOUT,
-            )
-        except TypeError:
-            post_req = http_sess.post(
-                f"{DEEPSEEK_BASE_URL}/chat/completions",
-                json=payload,
-                headers=headers,
-            )
+        post_req = http_sess.post(
+            f"{DEEPSEEK_BASE_URL}/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
         async with post_req as response:
             if response.status != 200:
                 body = await response.text()

@@ -136,10 +136,7 @@ def _parse_channel_html(html_text: str, clean_username: str, last_scraped_at: da
 
 async def _load_channel_html(session: aiohttp.ClientSession, url: str, clean_username: str) -> str:
     try:
-        try:
-            get_req = session.get(url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
-        except TypeError:
-            get_req = session.get(url, headers=REQUEST_HEADERS)
+        get_req = session.get(url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
         async with get_req as response:
             logger.info("Fetching Telegram channel %s returned HTTP %s", clean_username, response.status)
             if response.status != 200:
