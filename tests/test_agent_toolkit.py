@@ -155,5 +155,51 @@ class AgentToolkitTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, f"{file}: {proc.stderr}")
 
 
+class AgyProfileTests(unittest.TestCase):
+    """AGY_HOME: отдельный профиль второго аккаунта agy2 (вход и разговоры не смешиваются с основным)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        (self.dir / "bin").mkdir()
+        self.args_file = self.dir / "zsh-args.txt"
+        fake = self.dir / "bin" / "zsh"
+        fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$FAKE_ZSH_ARGS"\n', encoding="utf-8")
+        fake.chmod(0o755)
+        (self.dir / "brief.md").write_text("задача", encoding="utf-8")
+        self.env = {
+            **os.environ,
+            "PATH": f"{self.dir / 'bin'}:{os.environ['PATH']}",
+            "FAKE_ZSH_ARGS": str(self.args_file),
+            "AGY_LOG_DIR": str(self.dir / "log"),
+            "AGY_MODEL": "model-x",
+        }
+        self.env.pop("AGY_HOME", None)
+
+    def run_watch(self, **extra):
+        env = {**self.env, **extra}
+        return subprocess.run([str(TOOLS / "agy_watch.sh"), "run", str(self.dir / "brief.md")], env=env, text=True, capture_output=True, check=False)
+
+    def test_without_profile_home_is_not_overridden(self):
+        self.run_watch()
+        self.assertTrue(self.args_file.exists())
+        self.assertNotIn("HOME=", self.args_file.read_text(encoding="utf-8"))
+
+    def test_profile_sets_home_for_agy_only(self):
+        home = self.dir / "agy2"
+        home.mkdir()
+        self.run_watch(AGY_HOME=str(home))
+        command = self.args_file.read_text(encoding="utf-8")
+        self.assertIn('HOME="$AGY_HOME" agy', command)
+        self.assertIn("--model", command)
+
+    def test_missing_profile_dir_stops_before_starting_agy(self):
+        proc = self.run_watch(AGY_HOME=str(self.dir / "absent"))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("профиль", proc.stdout)
+        self.assertFalse(self.args_file.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

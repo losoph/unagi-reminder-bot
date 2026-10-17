@@ -21,8 +21,14 @@ case "${1:-steps}" in
       export https_proxy="$AGY_PROXY" http_proxy="$AGY_PROXY"
     fi
     flag=""; [ "$1" = "cont" ] && flag="-c"
+    # AGY_HOME — отдельный домашний каталог второго аккаунта (agy2): вход, разговоры и «-c» у него свои. ~/.zshrc всё равно грузится из настоящего HOME.
+    pre=""
+    if [ -n "${AGY_HOME:-}" ]; then
+      [ -d "$AGY_HOME" ] || { echo "профиль $AGY_HOME не создан: войдите в agy под вторым аккаунтом (tools/agents/README.md, «Второй аккаунт agy»)"; exit 1; }
+      export AGY_HOME; pre='HOME="$AGY_HOME" '
+    fi
     # Интерактивный zsh загружает алиас agy и личные параметры из ~/.zshrc; env передаёт прокси во вкладку исполнителя.
-    zsh -ic "agy $flag --model \"\$AGY_MODEL\" -p \"\$(cat \"\$AGY_TASK_FILE\")\" --output-format stream-json" \
+    zsh -ic "${pre}agy $flag --model \"\$AGY_MODEL\" -p \"\$(cat \"\$AGY_TASK_FILE\")\" --output-format stream-json" \
       2>&1 | tee -a "$LOG" >/dev/null
     echo "прогон записан в $LOG"
     "$0" result
