@@ -45,6 +45,10 @@ ops/aiqu/prod_check.sh --since 10m      # после деплоя — тольк
 
 Только чтение, один ssh-сеанс (`PROD_SSH`, по умолчанию `aiqu`). Строки `OK` / `WARN` / `ALERT`, код выхода 1 при `ALERT`. Правка `docker-compose.yml` на сервере (лимит CPU) известна и не считается «грязным» деревом.
 
+### Лимит CPU контейнера
+
+`docker-compose.yml` берёт лимит из `BOT_CPUS` (по умолчанию 1.5). На сервере нужно добавить в `.env` рядом с compose строку `BOT_CPUS=1.0` — после этого ручная правка `docker-compose.yml` не нужна, а `git checkout -- docker-compose.yml` на сервере делает владелец. `--autostash` остаётся в деплое до тех пор, пока `ops/aiqu/prod_check.sh` показывает «ручная правка» для `docker-compose.yml`.
+
 ### Контейнер unagi-bot: права процесса
 
 Ревью безопасности п.7. Образ запускается через `ops/docker/entrypoint.sh`: от root он на доли секунды передаёт `storage/` пользователю bot (uid 10001) и кладёт копию `/root/.msmtprc` в tmpfs `/run/unagi` (на хосте файл закрыт 0600 для root), затем навсегда сбрасывает права (`setpriv`). Процесс бота: не root, без capabilities, `no-new-privileges`, корневая ФС read-only, записываемы только `storage/`, `/tmp` и `/run/unagi` (tmpfs). Привилегии `cap_add` в `docker-compose.yml` нужны лишь точке входа и исчезают вместе с root.

@@ -34,7 +34,15 @@ remote() {
   echo "feed_builds=$(printf '%s\n' "$logs" | grep -c 'feed_build')"
   echo "db_check=$(sqlite3 -readonly storage/bot_data.db 'pragma quick_check;' 2>&1 | head -n 1)"
   echo "db_tables=$(sqlite3 -readonly storage/bot_data.db "select count(*) from sqlite_master where type='table';" 2>&1)"
+  # OPS1: цифры для решений владельца. Пустой результат или ошибка не ломают prod_check.
+  stats="$(sqlite3 -readonly storage/bot_data.db < ops/aiqu/prod_stats.sql 2>/dev/null || true)"
+  [ -n "$stats" ] && printf '%s\n' "$stats"
   echo "disk_pct=$(df --output=pcent . | tail -n 1 | tr -dc '0-9')"
+  # Снимки БД (BK1): сколько несжатых и сжатых, сколько места они занимают, и размер самой БД — видно, работает ли сжатие.
+  echo "backups_raw=$(ls -1 storage/backups/*.db 2>/dev/null | wc -l | tr -d ' ')"
+  echo "backups_gz=$(ls -1 storage/backups/*.db.gz 2>/dev/null | wc -l | tr -d ' ')"
+  echo "backups_mb=$(du -sm storage/backups 2>/dev/null | cut -f1)"
+  echo "db_mb=$(du -sm storage/bot_data.db 2>/dev/null | cut -f1)"
   newest="$(ls -1t storage/backups/*.db 2>/dev/null | head -n 1)"
   echo "backup_age_h=$([ -n "$newest" ] && echo $(( ( $(date +%s) - $(stat -c %Y "$newest") ) / 3600 )) || echo none)"
   echo "mem=$(docker stats --no-stream --format '{{.MemUsage}}' "$2" 2>/dev/null)"
@@ -74,6 +82,17 @@ if [ "$age" = none ]; then say WARN "резервные копии: нет"
 elif [ "$age" -gt "${WARN_BACKUP_HOURS:-48}" ]; then say WARN "резервная копия: ${age} ч назад"
 else say OK "резервная копия: ${age} ч назад"; fi
 say OK "память контейнера: $(get mem)"
+say OK "снимки БД: несжатых $(get backups_raw), сжатых $(get backups_gz), всего $(get backups_mb) МБ (БД $(get db_mb) МБ)"
+stats_failed="$(get reminders_failed_30d)"
+stats_total="$(get reminders_total_30d)"
+stats_subs="$(get subs_active)"
+stats_users="$(get users_with_subs)"
+stats_conflicts="$(get channels_multi_tag_or_period)"
+if [ -n "$stats_failed" ] && [ -n "$stats_total" ] && [ -n "$stats_subs" ] && [ -n "$stats_users" ] && [ -n "$stats_conflicts" ]; then
+  say OK "цифры для решений: failed/total за 30 дн $stats_failed/$stats_total, активных подписок/пользователей $stats_subs/$stats_users, каналов с конфликтом $stats_conflicts"
+else
+  say OK "цифры для решений: нет данных"
+fi
 [ "$(get compose_dirty)" = 0 ] && say OK "docker-compose.yml: без ручных правок" || say OK "docker-compose.yml: ручная правка на проде (cpus), деплой сохраняет её через --autostash"
 proc="$(get proc)"
 if printf '%s' "$proc" | grep -q '^Uid: 0 '; then
