@@ -148,9 +148,14 @@ def main(argv: list[str] | None = None, now: float | None = None) -> int:
     except RuntimeError as exc:
         print(f"ОШИБКА резервной копии: {exc}", file=sys.stderr)
         return 1
-    removed = rotate(db, directory, args.tag, args.keep)
-    compressed, raw_kept = compress_old_snapshots(db, directory, args.tag, args.keep_raw)
-    total_bytes = sum(p.stat().st_size for p in directory.iterdir() if p.is_file())
+    # Снимок создан и проверен — дальше только уборка: любой сбой здесь не должен останавливать деплой (код выхода остаётся 0).
+    removed = compressed = raw_kept = total_bytes = -1
+    try:
+        removed = rotate(db, directory, args.tag, args.keep)
+        compressed, raw_kept = compress_old_snapshots(db, directory, args.tag, args.keep_raw)
+        total_bytes = sum(p.stat().st_size for p in directory.iterdir() if p.is_file())
+    except Exception as exc:  # noqa: BLE001
+        print(f"ПРЕДУПРЕЖДЕНИЕ: уборка снимков не завершена: {exc}", file=sys.stderr)
     print(
         f"backup ok path={path} size={size} tables={tables} "
         f"rotated_out={removed} compressed={compressed} raw_kept={raw_kept} dir_total={total_bytes}"

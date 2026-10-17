@@ -161,6 +161,20 @@ class BackupDbTests(unittest.TestCase):
         self.assertTrue(oldest_raw.exists())
         self.assertEqual(list(self.dir.glob("*.partial")), [])
 
+    def test_unexpected_cleanup_error_after_a_good_snapshot_does_not_fail_the_deploy(self):
+        # Снимок создан и проверен; любой сбой уборки (ротация, сжатие, подсчёт) не должен давать код 1 и останавливать деплой.
+        err = io.StringIO()
+        with (
+            patch("ops.aiqu.backup_db.rotate", side_effect=PermissionError("нет доступа к каталогу")),
+            contextlib.redirect_stderr(err),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            code = backup_db.main(["--db", str(self.db), "--dir", str(self.dir)], now=1768000000.0)
+        self.assertEqual(code, 0)
+        self.assertIn("уборка снимков не завершена", err.getvalue())
+        self.assertIn("backup ok", out.getvalue())
+        self.assertEqual(len(list(self.dir.glob("*.db"))), 1)
+
     def test_manual_files_are_untouched(self):
         self.dir.mkdir()
         manual1 = self.dir / "bot_data-manual.db"
