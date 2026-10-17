@@ -855,12 +855,16 @@ async def fetch_subscription_posts(
                     scan_marker,
                     web_session=session,
                 )
-                upsert_channel_posts(username, fetched_posts, source_name)
+                await asyncio.to_thread(upsert_channel_posts, username, fetched_posts, source_name)
                 advance_channel_scan_cursor(username, fetched_posts)
 
             # SEC1 (п.14): берём batch+1, чтобы отличить «ровно батч» от «есть backlog».
-            available_posts = get_channel_posts_since(
-                username, last_scraped, last_post_id, limit=CHANNEL_DELIVERY_BATCH_SIZE + 1
+            available_posts = await asyncio.to_thread(
+                get_channel_posts_since,
+                username,
+                last_scraped,
+                last_post_id,
+                limit=CHANNEL_DELIVERY_BATCH_SIZE + 1,
             )
             if fetched_posts and not available_posts:
                 # Compatibility for a malformed legacy link without a numeric post id.
@@ -997,7 +1001,7 @@ async def prefetch_due_channels(
                     scan_marker,
                     web_session=session,
                 )
-                upsert_channel_posts(username, posts, source_name)
+                await asyncio.to_thread(upsert_channel_posts, username, posts, source_name)
                 advance_channel_scan_cursor(username, posts)
                 return username, {"posts": posts, "source": source_name, "error": None}
             except ChannelFetchError as exc:
@@ -1020,10 +1024,11 @@ async def handle_digest_deep_link(message: types.Message, payload: str) -> bool:
     user_id = user_id_from_message(message)
 
     if payload == "ds":
+        subs = await asyncio.to_thread(get_user_subscriptions, user_id)
         await message.answer(
             render_digest_settings_text(user_id),
             parse_mode="HTML",
-            reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id)),
+            reply_markup=build_digest_settings_keyboard(subs),
         )
         return True
 
@@ -1047,10 +1052,11 @@ async def handle_digest_deep_link(message: types.Message, payload: str) -> bool:
             f"🚫 Подписка на <b>{html.escape(sub['channel_title']) if sub['channel_title'] else 'канал'}</b> удалена.",
             parse_mode="HTML",
         )
+        subs = await asyncio.to_thread(get_user_subscriptions, user_id)
         await message.answer(
             render_digest_settings_text(user_id),
             parse_mode="HTML",
-            reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id)),
+            reply_markup=build_digest_settings_keyboard(subs),
         )
         return True
 
@@ -1089,10 +1095,11 @@ async def handle_digest_deep_link(message: types.Message, payload: str) -> bool:
             f"↪️ <b>{html.escape(sub['channel_title']) if sub['channel_title'] else 'Канал'}</b> перенесён в {_PERIOD_TITLES[new_period].lower()} дайджест.",
             parse_mode="HTML",
         )
+        subs = await asyncio.to_thread(get_user_subscriptions, user_id)
         await message.answer(
             render_digest_settings_text(user_id),
             parse_mode="HTML",
-            reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id)),
+            reply_markup=build_digest_settings_keyboard(subs),
         )
         return True
 
@@ -1279,7 +1286,8 @@ async def callback_settings(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "menu_rem")
 async def callback_menu_reminders(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    if not get_user_messages(user_id_from_callback(callback)):
+    user_msgs = await asyncio.to_thread(get_user_messages, user_id_from_callback(callback))
+    if not user_msgs:
         await callback.answer("📭 Напоминаний нет. Перешли сообщение или напиши текст — отложу его.", show_alert=True)
         return
     await push_screen(state, "rem_list", tag=None, page=1)
@@ -1661,7 +1669,7 @@ def _reminder_tag(row_tag: str | None) -> str:
 
 async def render_rem_tags_screen(chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext):
     await state.set_state(None)
-    reminders = get_user_messages(chat_id)
+    reminders = await asyncio.to_thread(get_user_messages, chat_id)
     if not reminders:
         text = "📭 У тебя нет активных напоминаний."
         if isinstance(target, CallbackQuery):
@@ -1710,7 +1718,7 @@ async def render_rem_list_screen(chat_id: int, tag: str | None, page: int, targe
     await state.set_state(None)
     await state.update_data(rem_current_tag=tag, rem_current_page=page)
 
-    reminders = get_user_messages(chat_id)  # ordered by send_at
+    reminders = await asyncio.to_thread(get_user_messages, chat_id)  # ordered by send_at
     if tag:
         filtered = [r for r in reminders if _reminder_tag(r[4]) == tag]
     else:
@@ -1809,7 +1817,7 @@ async def render_rem_move_screen(chat_id: int, msg_id: int, target: types.Messag
         f"Выбери существующий тег ниже или пришли новый текстом:"
     )
 
-    tags = get_user_tags(chat_id)
+    tags = await asyncio.to_thread(get_user_tags, chat_id)
     await state.update_data(rem_move_tags=tags, rem_detail_id=msg_id)
 
     buttons = []
@@ -1838,7 +1846,8 @@ async def render_rem_move_screen(chat_id: int, msg_id: int, target: types.Messag
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message, state: FSMContext):
     await state.clear()
-    if not get_user_messages(user_id_from_message(message)):
+    user_msgs = await asyncio.to_thread(get_user_messages, user_id_from_message(message))
+    if not user_msgs:
         await message.answer("📭 У тебя нет активных напоминаний.\n\nДля дайджестов используй /list_digest.")
         return
     await push_screen(state, "rem_list", tag=None, page=1)
@@ -1849,10 +1858,11 @@ async def cmd_list(message: types.Message, state: FSMContext):
 async def cmd_list_digest(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = user_id_from_message(message)
+    subs = await asyncio.to_thread(get_user_subscriptions, user_id)
     await message.answer(
         render_digest_settings_text(user_id),
         parse_mode="HTML",
-        reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id)),
+        reply_markup=build_digest_settings_keyboard(subs),
     )
 
 
@@ -2087,10 +2097,11 @@ async def handle_unsub(callback: CallbackQuery):
 
     delete_subscription(user_id, sub_id)
     try:
+        subs = await asyncio.to_thread(get_user_subscriptions, user_id)
         await callback_message.edit_text(
             render_digest_settings_text(user_id),
             parse_mode="HTML",
-            reply_markup=build_digest_settings_keyboard(get_user_subscriptions(user_id)),
+            reply_markup=build_digest_settings_keyboard(subs),
         )
     except TelegramAPIError:
         pass
@@ -2241,7 +2252,7 @@ async def cmd_check(message: types.Message, state: FSMContext):
     if wait_seconds:
         await message.answer(f"⏳ Подожди {wait_seconds} с.")
         return
-    subs = get_user_subscriptions(user_id)
+    subs = await asyncio.to_thread(get_user_subscriptions, user_id)
     if not subs:
         await message.answer("📭 У тебя нет подписок для проверки.")
         return
@@ -2378,7 +2389,7 @@ async def _resolve_ai_channel(callback: CallbackQuery, state: FSMContext, prefix
 @dp.callback_query(F.data == "digest_ai")
 async def open_ai_menu(callback: CallbackQuery, state: FSMContext):
     user_id = user_id_from_callback(callback)
-    subs = get_user_subscriptions(user_id)
+    subs = await asyncio.to_thread(get_user_subscriptions, user_id)
     if not subs:
         await callback.answer("Сначала подпишись хотя бы на один канал.", show_alert=True)
         return
@@ -2504,7 +2515,7 @@ async def ai_summary(callback: CallbackQuery, state: FSMContext):
 
     await callback.answer("⏳ Готовлю саммари...")
     since = serialize_datetime(utc_now() - timedelta(days=30))
-    rows = get_digest_posts(user_id, since, channel_username=username)
+    rows = await asyncio.to_thread(get_digest_posts, user_id, since, channel_username=username)
     texts = [r["post_text"] for r in rows if r["post_text"]]
 
     if not texts:
@@ -3145,7 +3156,8 @@ async def cmd_test_digest(message: types.Message, state: FSMContext):
     if wait_seconds:
         await message.answer(f"⏳ Подожди {wait_seconds} с.")
         return
-    user_subs = [sub for sub in get_user_subscriptions(user_id) if not sub[5]]
+    raw_subs = await asyncio.to_thread(get_user_subscriptions, user_id)
+    user_subs = [sub for sub in raw_subs if not sub[5]]
 
     if not user_subs:
         await message.answer("📭 У тебя нет активных подписок для парсинга (учитываются только не на паузе).")
@@ -3802,7 +3814,7 @@ dp.include_router(fallback_router)
 async def check_messages():
     while True:
         now_str = serialize_datetime(utc_now())
-        pending = get_pending_messages(now_str)
+        pending = await asyncio.to_thread(get_pending_messages, now_str)
 
         for row in pending:
             db_id = row["id"]
@@ -3942,7 +3954,9 @@ async def process_user_edition(
                     }
                 )
                 try:
-                    add_digest_posts(user_id, result["username"], result["title"], result["posts"])
+                    await asyncio.to_thread(
+                        add_digest_posts, user_id, result["username"], result["title"], result["posts"]
+                    )
                 except Exception:
                     logger.exception("Не удалось сохранить посты в базу знаний")
 
@@ -4104,7 +4118,7 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
     now = utc_now()
     now_str = serialize_datetime(now)
     due_total = count_due_subscriptions(now_str)
-    due_subs = get_due_subscriptions(now_str, DIGEST_DUE_BATCH_SIZE)
+    due_subs = await asyncio.to_thread(get_due_subscriptions, now_str, DIGEST_DUE_BATCH_SIZE)
     if not due_subs:
         logger.info(
             "digest_cycle due_total=0 processed=0 channels=0 fetched_posts=0 "
@@ -4114,7 +4128,7 @@ async def run_digest_cycle(session: aiohttp.ClientSession, semaphore: asyncio.Se
         )
         return 0
 
-    editions, deferred_count = plan_due_editions(due_subs, now)
+    editions, deferred_count = await asyncio.to_thread(plan_due_editions, due_subs, now)
     edition_subs = [sub for subs in editions.values() for sub in subs]
     logger.info(
         "🔄 Начинаю проверку %s/%s due-дайджестов (batch_limit=%s, next_send_at <= %s): "
@@ -4216,6 +4230,8 @@ async def main():
         BOT_USERNAME = (me.username or "").lstrip("@")
     await bot.delete_webhook(drop_pending_updates=True)
     await channel_source.start()
+    if ai_assistant.is_enabled():
+        await ai_assistant.check_api_key()
     background_tasks = [
         asyncio.create_task(check_messages(), name="reminder-scheduler"),
         asyncio.create_task(check_digests(), name="digest-scheduler"),
@@ -4223,6 +4239,10 @@ async def main():
         asyncio.create_task(run_watchdog_loop(bot), name="watchdog-monitor"),
         asyncio.create_task(feed.run_autodelivery_loop(), name="feed-autodelivery"),
     ]
+    if ai_assistant.is_enabled():
+        background_tasks.append(
+            asyncio.create_task(ai_assistant.run_key_check_loop(), name="deepseek-key-check")
+        )
     logger.info("✅ Бот успешно запущен")
     logger.info("📋 Фоновые процессы:")
     logger.info("  • Напоминания: проверка каждые 30 сек")
@@ -4230,6 +4250,8 @@ async def main():
     logger.info("  • Очистка БД: раз в %d часов", CLEANUP_INTERVAL_SECONDS // 3600)
     logger.info("  • Watchdog: проверка каждые %d сек", WATCHDOG_CHECK_INTERVAL_SECONDS)
     logger.info("  • Автодоставка Ленты: проверка каждые %d сек", feed.FEED_AUTODELIVERY_CHECK_SECONDS)
+    if ai_assistant.is_enabled():
+        logger.info("  • Проверка ключа DeepSeek: раз в %d сек", ai_assistant.KEY_CHECK_INTERVAL_SECONDS)
     logger.info("🚀 Ожидаю входящих сообщений...")
     try:
         await dp.start_polling(bot)
