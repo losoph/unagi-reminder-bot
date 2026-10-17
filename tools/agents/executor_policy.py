@@ -3,10 +3,12 @@
 
     executor_policy.py <kind> [--json]     # печатает лестницу и выбранного исполнителя; код 1 — никто не доступен
 
-Приоритет экономии токенов (решение владельца 2026-10-16), от самых дорогих к самым дешёвым:
+Приоритет экономии токенов (решение владельца 2026-10-16, подтверждено 17.10), от самых дорогих к самым дешёвым:
     opencode  >  deepseek (dsh)  >  Jev (платит за каждое решение)  >  Claude  >  agy
-Поэтому исполнители пробуются в порядке dsh → agy, а дорогой opencode — только если вид задачи явно разрешён
-(`opencode_allowed`) и Jev может выбрать модель: opencode без решения Jev не запускается вообще.
+Бесплатны для нас agy и Argon (веб-Gemini, вручную), дёшевы Jev и dsh, дорог opencode. Поэтому основная нагрузка — на agy
+(«рабочая лошадка»), затем dsh, а opencode — последним и только если вид задачи явно разрешён (`opencode_allowed`)
+и Jev может выбрать модель: opencode без решения Jev не запускается вообще.
+Лестницы по видам задач лежат в tools/agents/orchestra.json (там же роли, лимиты и правила; `agents.sh orchestra`).
 Claude (наблюдатель) и Jev — не исполнители: первый принимает работу, второй выбирает модель (`route.sh`).
 """
 
@@ -21,9 +23,24 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import oc_budget  # noqa: E402
+import orchestra  # noqa: E402
 
 SAVE_ORDER = ("opencode", "dsh", "jev", "claude", "agy")  # от самых дорогих токенов к самым дешёвым
 KINDS = ("executor-complex", "executor-ux", "review", "adversarial-review", "docs", "merge-audit", "short-check")
+
+
+SCRIPT_EXECUTORS = ("dsh", "agy")  # исполнители, которых запускают скрипты; opencode добавляется последним, argon-web и claude — вручную
+
+
+def configured_ladder(kind: str) -> list[str]:
+    """Лестница вида из tools/agents/orchestra.json; пусто, если файла нет или вид не описан (тогда встроенные значения)."""
+    return orchestra.ladder(kind)
+
+
+def manual_steps(kind: str) -> list[str]:
+    """Ручные шаги лестницы (веб-Gemini Argon, наблюдатель): скрипты их не запускают, а только напоминают."""
+    manual = orchestra.manual_agents()
+    return [agent for agent in configured_ladder(kind) if agent in manual]
 
 
 def opencode_allowed(kind: str) -> bool:
@@ -32,13 +49,23 @@ def opencode_allowed(kind: str) -> bool:
     opencode не кеширует промпты: один агентный прогон стоил миллионы токенов, поэтому лимит — 5 млн токенов на сессию и
     1 млн на прогон (budget.json), а запускается он только по решению Jev. Разрешён для проверок и аудита; реализация — dsh/agy.
     """
-    # Решение владельца 16.10: лимит 5 млн токенов на сессию, Tokenn на Min; opencode — для проверок и аудита, качество выдачи ведём (quality.py).
+    # Решение владельца 16.10: лимит 5 млн токенов на сессию; opencode — для проверок и аудита, качество выдачи ведём (quality.py).
+    # С 17.10 разрешение читается из лестницы orchestra.json (opencode в ней — только у проверок и ревью).
+    configured = configured_ladder(kind)
+    if configured:
+        return "opencode" in configured
     return kind in ("review", "adversarial-review", "merge-audit", "short-check")
 
 
 def executor_order(kind: str) -> list[str]:
-    """Порядок попыток для вида задачи: сначала дешёвые по токенам исполнители, opencode — последним и только если разрешён."""
-    order = ["dsh", "agy"]
+    """Порядок попыток для вида задачи: сначала бесплатные и дешёвые исполнители, opencode — последним и только если разрешён."""
+    ladder = configured_ladder(kind)
+    if ladder:
+        order = [agent for agent in ladder if agent in SCRIPT_EXECUTORS]
+        if order:  # недостающих исполнителей добавляем в конце как запасные ступени; у чисто ручных видов (strategy) скриптовых нет
+            order += [agent for agent in SCRIPT_EXECUTORS if agent not in order]
+    else:
+        order = ["agy", "dsh"]  # встроенный порядок, если orchestra.json нет: сначала бесплатный agy
     if opencode_allowed(kind):
         order.append("opencode")
     return order
@@ -103,7 +130,7 @@ def choose(kind: str) -> dict:
         ladder.append({"agent": agent, "available": ok, "detail": detail})
         if ok and chosen is None:
             chosen = agent
-    return {"kind": kind, "executor": chosen, "ladder": ladder}
+    return {"kind": kind, "executor": chosen, "ladder": ladder, "manual": manual_steps(kind)}
 
 
 def main(argv):
@@ -116,6 +143,8 @@ def main(argv):
     else:
         print("ladder: " + " → ".join(f"{step['agent']}({'ok' if step['available'] else 'нет: ' + step['detail']})" for step in result["ladder"]))
         print(f"executor={result['executor'] or 'none'}")
+        if result["manual"]:
+            print("manual: " + ", ".join(result["manual"]) + " (вручную; см. agents.sh orchestra)")
     return 0 if result["executor"] else 1
 
 

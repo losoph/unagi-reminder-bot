@@ -80,6 +80,7 @@ CI (`.github/workflows/deploy.yml`) на push в `main`: ruff → `docker build`
 - **Роли:** Claude — наблюдатель (проверяет каждый коммит: ruff, тесты, чтение диффа, воспроизведение находок ревью); **agy**
   (Antigravity CLI, Gemini) и **opencode** (провайдер Tokenn, GPT) — исполнители и перекрёстные ревьюеры. Подробности и шаблоны —
   `tools/agents/README.md`, три непересекающихся слоя наблюдения — `docs/sprint/agy-progress-protocol.md`.
+- **Оптимальная конфигурация оркестра (17.10) — `tools/agents/orchestra.json`** (`agents.sh orchestra`): бесплатные agy (основная нагрузка) и Argon (веб, вручную) → дешёвые dsh и Jev → дорогой opencode только для коротких сверок и ревью; запуск треков — `agents.sh launch`. Подробности — раздел «Оптимальная конфигурация оркестра» в `tools/agents/README.md`.
 - **Каждая сессия агента — отдельная вкладка терминала** (владелец хочет видеть мысли); одна строка ASCII, без `cd` в кириллический путь.
 - **Вкладки не наследуют окружение наблюдателя.** agy без прокси отвечает `User location is not supported`: экспортировать
   `HTTPS_PROXY/HTTP_PROXY=http://127.0.0.1:18080` (туннель `gostpx`; алиас `setproxy` в `~/.zshrc` ведёт на мёртвые порты). Ключи (`TOKENN_API_KEY`,

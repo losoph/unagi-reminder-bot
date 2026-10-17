@@ -12,13 +12,16 @@ LOG_DIR="${AGY_LOG_DIR:-.agy}"; mkdir -p "$LOG_DIR"
 SUP="$LOG_DIR/supervise.log"
 say() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$SUP"; }
 
-_size() { wc -c < "$LOG_DIR/session.ndjson" 2>/dev/null || echo 0; }
+_size() { [ -f "$LOG_DIR/session.ndjson" ] && wc -c < "$LOG_DIR/session.ndjson" || echo 0; }
 prev="$(_size)"; sleep 20
 while [ "$(_size)" != "$prev" ]; do prev="$(_size)"; sleep 20; done
 
 for attempt in $(seq 1 "$MAX"); do
-  if git log --oneline -40 | grep -- "$DONE_MARK" >/dev/null; then
-    say "готово: маркер '$DONE_MARK' найден в истории"; exit 0
+  if git log --oneline -40 | grep -F -- "$DONE_MARK" >/dev/null; then
+    say "готово: маркер '$DONE_MARK' найден в истории: $(git log --oneline -40 | grep -F -m1 -- "$DONE_MARK")"
+    # 17.10: метка попала в сообщение коммита с брифом — агент не запускался, а супервизор рапортовал «готово». Показываем это явно.
+    [ "$attempt" != 1 ] || say "⚠ метка найдена ДО первого запуска agy: если это коммит брифа или чужой коммит, агент не запускался — перепишите сообщение без метки (git commit --amend)"
+    exit 0
   fi
   # Внимание: без AGY_KEEP_TREE супервизор сохраняет diff, затем git clean удаляет
   # все неотслеживаемые файлы, кроме каталога логов. Не храните там важные данные.
