@@ -42,7 +42,7 @@
 ```bash
 cd "$HOME/Library/CloudStorage/GoogleDrive-vctork@gmail.com/Мой диск/DEV/unagi"
 ~/.venvs/unagi/bin/ruff check .                                   # как в CI (ruff==0.16.8)
-~/.venvs/unagi/bin/python -m unittest discover -s tests           # 570 тестов, skipped=2 — штатно
+~/.venvs/unagi/bin/python -m unittest discover -s tests           # 680 тестов (skipped=4 локально: 1 без age, 1 без docker daemon, 2 перф-теста)
 PYTHON=~/.venvs/unagi/bin/python tools/agents/time_shift_tests.sh # +1d +7d +30d +365d -30d: нет зависимости от даты
 ```
 
@@ -55,7 +55,7 @@ Tier 3, формула не собралась) — `time_shift_tests.sh` зде
 CI (`.github/workflows/deploy.yml`) на push и PR в `main`:
 1. `ruff==0.16.8 check .`
 2. Сборка production-образа `docker build -t unagi-reminder-bot:test .`
-3. Регрессионные тесты в контейнере: 570 тестов, skipped=2.
+3. Регрессионные тесты в контейнере: 680 тестов (в CI-контейнере прогон идёт от root и без git/docker daemon, поэтому скипаются тесты харденинга, git-зависимые проверки оркестра/деплоя и 2 перф-теста).
 4. Смоук-тест ужесточённого контейнера (`ops/docker/smoke.py`): uid 10001, `read_only`, `cap_drop ALL`, `no-new-privileges`, tmpfs.
 5. SSH-деплой на push:
    - `git checkout HEAD -- docker-compose.yml` (сброс ручных правок compose на сервере);
@@ -63,7 +63,7 @@ CI (`.github/workflows/deploy.yml`) на push и PR в `main`:
    - проверка неразрешённых конфликтов `test -z "$(git ls-files -u)"`;
    - консистентный снимок БД `python3 ops/aiqu/backup_db.py` (правило «нет снимка — нет деплоя», ротация 14 копий, сжатие старых в `.db.gz`, BK1);
    - `docker compose up -d --build`;
-   - очистка висячих образов и старого кеша сборки `docker image prune -f` и `docker builder prune -f --filter until=48h` (защита диска от переполнения).
+   - очистка висячих образов и старого кеша сборки `docker image prune -f` и `docker builder prune -f --filter until=6h` (защита диска от переполнения: после достижения 86% порог удержания кеша сборки сокращён до 6h, при диске >= 85% удаляется `:rollback`).
 
 Проверено на сервере/копиях 17.10:
 - Контейнер работает без root: uid 10001 (`bot`), `entrypoint.sh` сбрасывает права через `setpriv`, ФС read-only;
@@ -130,13 +130,13 @@ CI (`.github/workflows/deploy.yml`) на push и PR в `main`:
 
 ## 7. Следующие шаги (состояние на 17.10.2026, вечер) — для новой сессии
 
-На проде `main`: контейнер без root (uid 10001, `read_only`, `cap_drop ALL`), DB1 (PRAGMA и батчи), BK1 (сжатие снимков БД в gzip, ротация по 2 суффиксам), деплой без autostash с `git pull --ff-only` и очисткой docker, лимит CPU 1.0 по умолчанию, MS1 (`bookmarks.py` в Router). Вход агентов — `agents.sh status` / `orchestra`. Тесты: **570 тестов, skipped=2**.
+На проде `main`: контейнер без root (uid 10001, `read_only`, `cap_drop ALL`), DB1 (PRAGMA и батчи), BK1 (сжатие снимков БД в gzip, ротация по 2 суффиксам), деплой без autostash с `git pull --ff-only` и очисткой docker, лимит CPU 1.0 по умолчанию, MS1 (`bookmarks.py` в Router). Вход агентов — `agents.sh status` / `orchestra`. Тесты: **680 тестов** (skipped=4 локально: 1 без age, 1 без docker daemon, 2 перф-теста; в CI без git/docker и от root дополнительно скипаются тесты харденинга и git-зависимые проверки).
 
-1. **Ворота G1 (решения владельца по Очереди 4, `docs/sprint/owner-decisions-2026-10-17.md`)**:
+1. **Ворота G1 (решения владельца по Очереди 4, [docs/sprint/owner-decisions-2026-10-17.md](docs/sprint/owner-decisions-2026-10-17.md), ветка `docs/owner-decisions-2026-10-17`)**:
    - Выбор модели курсоров: Вариант В (одно расписание со слотами времени и общим курсором) vs Вариант А (независимые выпуски);
    - Авто-разрешение конфликтов: 5 правил, по тегам — опираясь на замер `channels_multi_tag_or_period` из `prod_check.sh`;
    - Email-периоды: оставить на legacy-пути до ghsub (без двойной миграции) vs миграция в `digest_schedules`.
 2. **Ключ DeepSeek на проде недействителен** (HTTP 401): заменить владельцу, иначе ИИ-функции не работают.
-3. **Ворота G2 (MS2, настройки дайджеста в Router)**: завершить ревью и слияние `feat/ms2-digest-router` (инструмент `tools/handler_order.py` подтвердил 0 конфликтов диспетчеризации хендлеров).
+3. **Ворота G2 (MS2, настройки дайджеста в Router)**: завершить ревью и слияние `feat/ms2-digest-router` (PR 28; инструмент интроспекции `tools/handler_order.py` в ветке PR подтвердил 0 конфликтов диспетчеризации хендлеров).
 4. **Резервная доставка в MAX (Очередь 5)**: оценить приоритет по цифре `reminders_failed_30d` из `prod_check.sh` (после переезда в РФ зарубежный IP уходит, риск блокировки номера высокий).
 5. **Подготовка к переезду на сервер в РФ (окно 21–22.10)**: OVPN-туннель до Telegram DC, чек-лист `ops/aiqu/README.md`, перенос MTProto-сессии (строго один клиент в момент времени), снятие `network_mode: host` после проверки bridge.

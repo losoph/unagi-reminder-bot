@@ -131,7 +131,7 @@ docker compose up --build -d
 ## Для разработчиков и агентов
 
 - **Состояние релиза, проверки, деплой и откат**: [docs/HANDOFF.md](docs/HANDOFF.md).
-- **Архитектура системы и распил монолита**: [docs/architecture.md](docs/architecture.md) (роутеры `bookmarks.py`, `digest_settings.py`, инструмент верификации порядка хендлеров `tools/handler_order.py`).
+- **Архитектура системы и распил монолита**: [docs/architecture.md](docs/architecture.md) (роутер `bookmarks.py` в main; `digest_settings.py` и инструмент верификации порядка хендлеров `tools/handler_order.py` — на ревью в PR 28, ветка `feat/ms2-digest-router`).
 - **Мультиагентный оркестр**: спецификация `tools/agents/orchestra.json`, единый скрипт запуска и проверок `tools/agents/agents.sh` (`orchestra`, `launch`, `gate`).
 - **Журнал решений спринта**: пофайловая фиксация в [docs/sprint/progress/](docs/sprint/progress/).
 - **Контроль прода**: скрипт проверки [ops/aiqu/prod_check.sh](ops/aiqu/prod_check.sh) и руководство [ops/aiqu/README.md](ops/aiqu/README.md).

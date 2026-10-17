@@ -131,13 +131,13 @@
 
 Из аудита кода от 15.09.2026 и спринта 17.10.2026:
 
-- **Распил монолита `main.py`**: кластеры закладок (`bookmarks.py`, MS1) и настроек дайджеста (`digest_settings.py`, MS2) вынесены в Router с проверкой через `tools/handler_order.py`. Осталось вынести:
+- **Распил монолита `main.py`**: кластер закладок (`bookmarks.py`, MS1) вынесен в Router (влит в main). Кластер настроек дайджеста (`digest_settings.py`, MS2) подготовлен в Router и находится на ревью (PR 28, ветка `feat/ms2-digest-router`), порядок диспетчеризации хендлеров сверен утилитой `tools/handler_order.py`. Осталось вынести:
   - мастер оформления подписки `setup_digest`;
   - экспорт и импорт данных (`/export`, `/import`);
   - фоновые циклы доставки и обработчики технических алертов;
   - реестр клавиатур и экранов FSM.
 - **Синхронный доступ к SQLite в event loop**: `get_connection()` очищен от избыточных PRAGMA и chmod, очистка переведена на батчи (DB1). Осталось: вынос тяжелых синхронных запросов к БД в `asyncio.to_thread` / пул потоков для предотвращения задержек в цикле событий.
-- **HTTP-сессии на каждый запрос** в `ai_assistant.py`, `telegraph_publisher.py`, `scraper.py` — один общий `aiohttp.ClientSession`.
+- **HTTP-сессии на каждый запрос**: закрыто в CS1 (общая сессия `aiohttp.ClientSession`).
 - **Разрозненный `os.getenv`** в четырёх модулях — кандидат `pydantic-settings`.
 - **`render_screen` — цепочка `if/elif`** по именам экранов → реестр обработчиков.
 
@@ -145,7 +145,7 @@
 
 ## 7. Добавлено по итогам ночи 16.10.2026 и решений 17.10.2026
 
-Источники: [reviews/2026-10-16-security-dsh.md](reviews/2026-10-16-security-dsh.md), [reviews/2026-10-16-perf-arch-dsh.md](reviews/2026-10-16-perf-arch-dsh.md), `docs/sprint/owner-decisions-2026-10-17.md`.
+Источники: [reviews/2026-10-16-security-dsh.md](reviews/2026-10-16-security-dsh.md), [reviews/2026-10-16-perf-arch-dsh.md](reviews/2026-10-16-perf-arch-dsh.md), [docs/sprint/owner-decisions-2026-10-17.md](docs/sprint/owner-decisions-2026-10-17.md) (лист решений владельца по Очереди 4, ветка `docs/owner-decisions-2026-10-17`).
 
 - **Снятие `network_mode: host` у контейнера**: перевести контейнер в bridge-сеть после переезда на российский сервер и проверки маршрутизации через OVPN-туннель до Telegram DC.
 - **Лента, макет LV4**: тематические разделы (авто-темы), таймлайн сюжета недели, длина по запросу — пауза 48 ч до изучения релиза официальной ленты Telegram (ожидается 18.10).

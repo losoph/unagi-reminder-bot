@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Консистентный снимок SQLite перед деплоем: backup API, проверка, атомарная запись, ротация и сжатие.
 
-    python3 ops/aiqu/backup_db.py [--db storage/bot_data.db] [--dir storage/backups] [--keep 14] [--keep-raw 2] [--tag predeploy]
+    python3 ops/aiqu/backup_db.py [--db storage/bot_data.db] [--dir storage/backups] [--keep 14] [--keep-raw 2] [--tag predeploy] [--min-tables 1]
 
 Код выхода 0 — снимок создан и проверен; 1 — снимка нет (деплой нужно остановить); 2 — неверные аргументы.
 Ротация трогает только файлы вида bot_data-<время>-<tag>.db[.gz] этого же тега: ручные копии остаются.
@@ -25,7 +25,7 @@ def _tag_regex(db_stem: str, tag: str, suffix: str = r"\.db(?:\.gz)?") -> re.Pat
     return re.compile(rf"^{re.escape(db_stem)}-(\d{{8}}-\d{{6}})-{re.escape(tag)}{suffix}$")
 
 
-def snapshot(db: Path, directory: Path, tag: str, now: float | None = None) -> tuple[Path, int, int]:
+def snapshot(db: Path, directory: Path, tag: str, now: float | None = None, min_tables: int = 1) -> tuple[Path, int, int]:
     """Создаёт снимок и возвращает (путь, размер в байтах, число таблиц). Бросает RuntimeError при любой неточности."""
     if not db.is_file():
         raise RuntimeError(f"база не найдена: {db}")
@@ -42,6 +42,8 @@ def snapshot(db: Path, directory: Path, tag: str, now: float | None = None) -> t
             tables = target.execute("SELECT count(*) FROM sqlite_master WHERE type = 'table'").fetchone()[0]
         if verdict != "ok":
             raise RuntimeError(f"quick_check снимка: {verdict}")
+        if tables < min_tables:
+            raise RuntimeError(f"число таблиц в снимке: {tables} (ожидалось >= {min_tables})")
         os.chmod(partial, 0o600)
         os.replace(partial, final)
     except (sqlite3.Error, OSError) as exc:
@@ -137,14 +139,15 @@ def main(argv: list[str] | None = None, now: float | None = None) -> int:
     parser.add_argument("--keep", type=int, default=14)
     parser.add_argument("--keep-raw", type=int, default=2)
     parser.add_argument("--tag", default="predeploy")
+    parser.add_argument("--min-tables", type=int, default=1)
     args = parser.parse_args(argv)
-    if args.keep < 1 or args.keep_raw < 1 or not re.fullmatch(r"[A-Za-z0-9_-]+", args.tag):
-        print("некорректные --keep, --keep-raw или --tag", file=sys.stderr)
+    if args.keep < 1 or args.keep_raw < 1 or args.min_tables < 1 or not re.fullmatch(r"[A-Za-z0-9_-]+", args.tag):
+        print("некорректные --keep, --keep-raw, --min-tables или --tag", file=sys.stderr)
         return 2
     db = Path(args.db)
     directory = Path(args.dir) if args.dir else db.parent / "backups"
     try:
-        path, size, tables = snapshot(db, directory, args.tag, now=now)
+        path, size, tables = snapshot(db, directory, args.tag, now=now, min_tables=args.min_tables)
     except RuntimeError as exc:
         print(f"ОШИБКА резервной копии: {exc}", file=sys.stderr)
         return 1

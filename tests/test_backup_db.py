@@ -257,9 +257,18 @@ class BackupDbTests(unittest.TestCase):
         self.assertEqual(kv["raw_kept"], "2")
         self.assertTrue(int(kv["dir_total"]) > 0)
 
+    def test_empty_database_with_zero_tables_fails(self):
+        empty_db = self.root / "empty.db"
+        with contextlib.closing(sqlite3.connect(empty_db)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.commit()
+        self.assertEqual(backup_db.main(["--db", str(empty_db), "--dir", str(self.dir)]), 1)
+        self.assertEqual(list(self.dir.glob("*.db")), [])
+
     def test_bad_arguments_exit_2(self):
         self.assertEqual(backup_db.main(["--db", str(self.db), "--keep", "0"]), 2)
         self.assertEqual(backup_db.main(["--db", str(self.db), "--keep-raw", "0"]), 2)
+        self.assertEqual(backup_db.main(["--db", str(self.db), "--min-tables", "0"]), 2)
         self.assertEqual(backup_db.main(["--db", str(self.db), "--tag", "../evil"]), 2)
 
 
