@@ -26,7 +26,7 @@ jobs:
         run: pipx run ruff==0.16.8 check .
       # Тесты, требующие утилит хоста (git, docker): в образе python:3.12-slim их нет, поэтому в образе они пропускаются (skipUnless).
       - name: Run host environment regression tests (git/docker)
-        run: python3 -m unittest tests/test_deploy_sync.py tests/test_orchestra.py tests/test_dep2_deploy_verify.py -v
+        run: python3 -m unittest tests/test_deploy_sync.py tests/test_orchestra.py tests/test_dep2_deploy_verify.py tests/test_cron_files.py -v
       - name: Build production image
         run: docker build -t unagi-reminder-bot:test .
       # --entrypoint: тесты идут от root без точки входа, как раньше; под ограничениями контейнера образ проверяет смоук ниже.
@@ -70,23 +70,77 @@ jobs:
             git pull --ff-only origin main
             test -z "$(git ls-files -u)" || { echo "конфликт слияния в рабочем дереве сервера — деплой остановлен"; git status --short; exit 1; }
             # --- end sync
-            # Снимок БД до пересборки (миграции только добавляют, но откат данных должен быть возможен). Нет снимка — нет деплоя.
-            python3 ops/aiqu/backup_db.py --db storage/bot_data.db || { echo "резервная копия не создана — деплой остановлен"; exit 1; }
-            # Откатный тег: помечаем образ работающего контейнера перед сборкой (если контейнер есть; prune не удаляет тегированные образы).
+            # Снимок БД до пересборки не от root (миграции только добавляют, но откат данных должен быть возможен).
+            # Каталог storage/backups принадлежит uid 10001, чтобы файлы -wal/-shm не блокировали запись боту.
+            mkdir -p storage/backups && chown -R 10001:10001 storage
+            setpriv --reuid=10001 --regid=10001 --clear-groups python3 ops/aiqu/backup_db.py --db storage/bot_data.db || { echo "резервная копия не создана — деплой остановлен"; exit 1; }
+            # Откатный тег: обновляем rollback только если текущий контейнер здоров (State.Status=running и RestartCount=0).
+            # Сценарий: деплой упал на liveness, следующий деплой не должен затереть рабочий образ сломанным.
             current_image="$(docker inspect -f '{{.Image}}' unagi-bot 2>/dev/null || true)"
-            if [ -n "$current_image" ]; then
+            current_status="$(docker inspect -f '{{.State.Status}}' unagi-bot 2>/dev/null || echo missing)"
+            current_restarts="$(docker inspect -f '{{.RestartCount}}' unagi-bot 2>/dev/null || echo -1)"
+            if [ -n "$current_image" ] && [ "$current_status" = "running" ] && [ "$current_restarts" = "0" ]; then
               docker tag "$current_image" unagi-reminder-bot-bot:rollback 2>/dev/null || true
+            fi
+            # Диск до сборки (порог ALERT prod_check — 85%): очистка старого кеша и висячих образов перед up --build
+            disk_pre="$(df --output=pcent . 2>/dev/null | tail -n 1 | tr -dc '0-9')"
+            if [ -n "$disk_pre" ] && [ "$disk_pre" -ge 85 ]; then
+              echo "диск ${disk_pre}% >= 85% до сборки: очистка кеша сборки и висячих образов"
+              docker builder prune -f || true
+              docker image prune -f || true
             fi
             export GIT_SHA="$(git rev-parse --short HEAD)"
             docker compose up -d --build
             # --- liveness (tests/test_dep2_deploy_verify.py исполняет этот блок во временной среде)
-            sleep "${DEPLOY_WAIT_SECS:-20}"
-            status="$(docker inspect -f '{{.State.Status}}' unagi-bot 2>/dev/null || echo missing)"
-            restarts="$(docker inspect -f '{{.RestartCount}}' unagi-bot 2>/dev/null || echo -1)"
-            container_sha="$(docker inspect -f '{{ index .Config.Labels "org.unagi.git_sha" }}' unagi-bot 2>/dev/null || echo missing)"
-            if [ "$status" != "running" ] || [ "$restarts" != "0" ] || [ "$container_sha" != "$GIT_SHA" ]; then
-              echo "деплой остановлен: контейнер не в статусе running, перезапускался или метка версии не совпадает (status=$status, restart_count=$restarts, container_sha=$container_sha, expected=$GIT_SHA)"
+            wait_limit="${DEPLOY_WAIT_SECS:-60}"
+            [ "$wait_limit" -le 0 ] 2>/dev/null && wait_limit=60
+            interval=2
+            stable_target=10
+            elapsed=0
+            stable_seconds=0
+            prev_restarts=""
+            is_ready=0
+
+            while [ "$elapsed" -lt "$wait_limit" ]; do
+              sleep "$interval"
+              elapsed=$((elapsed + interval))
+
+              status="$(docker inspect -f '{{.State.Status}}' unagi-bot 2>/dev/null || echo missing)"
+              restarts="$(docker inspect -f '{{.RestartCount}}' unagi-bot 2>/dev/null || echo -1)"
+              container_sha="$(docker inspect -f '{{ index .Config.Labels "org.unagi.git_sha" }}' unagi-bot 2>/dev/null || echo missing)"
+
+              if [ "$status" != "running" ] || [ "$container_sha" != "$GIT_SHA" ] || [ "$restarts" -gt 1 ] 2>/dev/null || [ "$restarts" -lt 0 ] 2>/dev/null; then
+                stable_seconds=0
+                prev_restarts="$restarts"
+              elif ! docker exec unagi-bot test -f /run/unagi/ready >/dev/null 2>&1; then
+                stable_seconds=0
+                prev_restarts="$restarts"
+              else
+                if [ -n "$prev_restarts" ] && [ "$restarts" = "$prev_restarts" ]; then
+                  stable_seconds=$((stable_seconds + interval))
+                else
+                  stable_seconds=0
+                  prev_restarts="$restarts"
+                fi
+                if [ "$stable_seconds" -ge "$stable_target" ]; then
+                  is_ready=1
+                  break
+                fi
+              fi
+            done
+
+            if [ "$is_ready" != "1" ]; then
+              echo "деплой остановлен: контейнер не готов за ${wait_limit}s: не в статусе running, перезапускался, маркер готовности не найден или метка версии не совпадает (status=$status, restart_count=$restarts, container_sha=$container_sha, expected=$GIT_SHA, stable=${stable_seconds}s)"
               docker logs --tail 30 unagi-bot || true
+              # --- rollback
+              if docker inspect unagi-reminder-bot-bot:rollback >/dev/null 2>&1; then
+                echo "откат: запуск контейнера из unagi-reminder-bot-bot:rollback"
+                docker tag unagi-reminder-bot-bot:rollback unagi-reminder-bot-bot:latest
+                # Метка версии — не HEAD: в контейнере старый образ, prod_check должен показать ALERT «контейнер на старом коде».
+                GIT_SHA=rollback docker compose up -d
+                echo "откат выполнен"
+              fi
+              # --- end rollback
               exit 1
             fi
             # --- end liveness
@@ -103,5 +157,13 @@ jobs:
               # 18.10: кеш сборки 2 ГБ, из них 1,6 ГБ свободны, но моложе 6 ч — фильтр until их не берёт. Неиспользуемый кеш чистим целиком только при тревоге по диску.
               docker builder prune -f || true
             fi
-            # Cron-файлы из репозитория (разовое письмо с итогами спринта): идемпотентная установка, сбой не ломает деплой.
-            for f in ops/aiqu/cron.d/*; do [ -f "$f" ] && install -m 0644 -o root -g root "$f" "/etc/cron.d/$(basename "$f")" || true; done
+            # Cron-файлы из репозитория: удаление устаревших и идемпотентная установка актуальных
+            for installed in /etc/cron.d/unagi-*; do
+              if [ -f "$installed" ] && [ ! -f "ops/aiqu/cron.d/$(basename "$installed")" ]; then
+                echo "удаление устаревшего cron-файла: $installed"
+                rm -f "$installed" || true
+              fi
+            done
+            for f in ops/aiqu/cron.d/*; do
+              [ -f "$f" ] && install -m 0644 -o root -g root "$f" "/etc/cron.d/$(basename "$f")" || true
+            done

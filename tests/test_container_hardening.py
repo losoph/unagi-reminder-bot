@@ -63,6 +63,10 @@ class ComposeTests(unittest.TestCase):
         self.assertIn("org.unagi.git_sha", compose)
         self.assertIn("${GIT_SHA:-unknown}", compose)
 
+    def test_stop_grace_period(self):
+        compose = read("docker-compose.yml")
+        self.assertIn("stop_grace_period: 30s", compose)
+
     def test_ci_smoke_uses_compose_capabilities(self):
         workflow = read(".github", "workflows", "deploy.yml")
         in_ci = set(re.findall(r"--cap-add (\w+)", workflow))
