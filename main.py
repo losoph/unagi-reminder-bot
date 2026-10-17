@@ -6,6 +6,7 @@ import re
 import secrets
 import time
 from datetime import datetime, timedelta, tzinfo
+from pathlib import Path
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router, types
@@ -33,6 +34,7 @@ from data.database import (
     add_saved_message,
     add_subscription,
     add_telegraph_digest,
+    checkpoint_db,
     cleanup_old_records,
     CHANNEL_BACKLOG_MAX,
     CHANNEL_DELIVERY_BATCH_SIZE,
@@ -3976,8 +3978,64 @@ async def cleanup_database():
         await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
 
 
+READY_FILE_PATH = os.getenv("READY_FILE_PATH", "/run/unagi/ready")
+
+
+def write_ready_marker(path: str | None = None) -> bool:
+    target = Path(path if path is not None else READY_FILE_PATH)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("ready\n", encoding="utf-8")
+        logger.info("Маркер готовности создан: %s", target)
+        return True
+    except OSError as exc:
+        logger.warning("Не удалось записать маркер готовности %s: %s", target, exc)
+        return False
+
+
+def remove_ready_marker(path: str | None = None) -> None:
+    target = Path(path if path is not None else READY_FILE_PATH)
+    try:
+        target.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+_background_tasks: list[asyncio.Task] = []
+_shutdown_done = False
+
+
+async def perform_shutdown(tasks: list[asyncio.Task] | None = None) -> None:
+    global _shutdown_done
+    if _shutdown_done:
+        return
+    _shutdown_done = True
+    bg_tasks = tasks if tasks is not None else _background_tasks
+    logger.info("🛑 Начинается корректное завершение работы бота...")
+    for task in bg_tasks:
+        task.cancel()
+    if bg_tasks:
+        await asyncio.gather(*bg_tasks, return_exceptions=True)
+    await feed.cancel_backfill_tasks()
+    await channel_source.close()
+    if bot.session:
+        await bot.session.close()
+    remove_ready_marker()
+    try:
+        res = checkpoint_db()
+        logger.info("PRAGMA wal_checkpoint(TRUNCATE) выполнен: busy=%s, log=%s, checkpointed=%s", *res)
+    except Exception as exc:
+        logger.error("Ошибка при выполнении wal_checkpoint: %s", exc)
+    logger.info("Бот успешно остановлен")
+
+
+@dp.shutdown()
+async def on_shutdown() -> None:
+    await perform_shutdown()
+
+
 async def main():
-    global BOT_USERNAME
+    global BOT_USERNAME, _background_tasks
     init_db()
     # Register bot commands
     try:
@@ -4003,6 +4061,8 @@ async def main():
         background_tasks.append(
             asyncio.create_task(ai_assistant.run_key_check_loop(), name="deepseek-key-check")
         )
+    _background_tasks = background_tasks
+    write_ready_marker()
     logger.info("✅ Бот успешно запущен")
     logger.info("📋 Фоновые процессы:")
     logger.info("  • Напоминания: проверка каждые 30 сек")
@@ -4016,11 +4076,7 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
-        for task in background_tasks:
-            task.cancel()
-        await asyncio.gather(*background_tasks, return_exceptions=True)
-        await feed.cancel_backfill_tasks()
-        await channel_source.close()
+        await perform_shutdown()
 
 
 if __name__ == "__main__":

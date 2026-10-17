@@ -37,6 +37,18 @@ def liveness_block() -> str:
     ) + "\n"
 
 
+def rollback_block() -> str:
+    """Извлекает блок автоотката из deploy.yml."""
+    text = DEPLOY_YML.read_text(encoding="utf-8")
+    match = re.search(r"# --- rollback[^\n]*\n(.*?)# --- end rollback", text, re.S)
+    assert match, "в deploy.yml нет блока `# --- rollback … # --- end rollback`"
+    return "set -e\n" + "\n".join(
+        line.strip()
+        for line in match.group(1).splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ) + "\n"
+
+
 class Dep2ConfigTests(unittest.TestCase):
     def test_compose_has_git_sha_label(self):
         content = COMPOSE_YML.read_text(encoding="utf-8")
@@ -115,6 +127,31 @@ class Dep2ConfigTests(unittest.TestCase):
         self.assertIn("predeploy.db", content, "README должен содержать инструкцию по восстановлению снимка БД при откате")
         self.assertIn("миграци", content, "README должен предупреждать о миграциях БД при откате")
 
+    def test_deploy_tags_rollback_only_when_container_healthy(self):
+        content = DEPLOY_YML.read_text(encoding="utf-8")
+        self.assertIn("current_status", content)
+        self.assertIn("current_restarts", content)
+        self.assertIn('"$current_status" = "running"', content)
+        self.assertIn('"$current_restarts" = "0"', content)
+
+    def test_deploy_cleans_disk_before_build(self):
+        content = DEPLOY_YML.read_text(encoding="utf-8")
+        pre_disk_pos = content.find("disk_pre=")
+        compose_up_pos = content.find("docker compose up -d --build")
+        self.assertNotEqual(pre_disk_pos, -1, "deploy.yml должен проверять диск до сборки")
+        self.assertLess(pre_disk_pos, compose_up_pos, "Проверка диска должна быть ДО сборки")
+        self.assertIn("docker builder prune -f", content[:compose_up_pos])
+        self.assertIn("docker image prune -f", content[:compose_up_pos])
+
+    def test_deploy_runs_backup_as_non_root(self):
+        content = DEPLOY_YML.read_text(encoding="utf-8")
+        self.assertIn("setpriv --reuid=10001 --regid=10001 --clear-groups python3 ops/aiqu/backup_db.py", content)
+        self.assertIn("chown -R 10001:10001 storage", content)
+
+    def test_prod_check_sqlite_runs_as_non_root(self):
+        content = PROD_CHECK.read_text(encoding="utf-8")
+        self.assertIn("setpriv --reuid=10001 --regid=10001 --clear-groups sqlite3 -readonly", content)
+
 
 class Dep2LivenessExecutionTests(unittest.TestCase):
     def setUp(self):
@@ -135,6 +172,14 @@ if [ "$cmd" = "inspect" ]; then
     exit 1
   fi
   case "$*" in
+    *unagi-reminder-bot-bot:rollback*)
+      if [ "${{FAKE_ROLLBACK_EXISTS:-1}}" = "1" ]; then
+        echo "sha256:rollback123"
+        exit 0
+      else
+        exit 1
+      fi
+      ;;
     *State.Status*) echo "${{FAKE_STATUS:-running}}" ;;
     *State.RestartCount*)
       # В реальном Docker в .State нет поля RestartCount: Go template выводит <no value>
@@ -145,6 +190,12 @@ if [ "$cmd" = "inspect" ]; then
     *Image*) echo "${{FAKE_IMAGE:-sha256:current123}}" ;;
     *) echo "unknown inspect format: $*" >&2; exit 1 ;;
   esac
+elif [ "$cmd" = "exec" ]; then
+  if [ "${{FAKE_READY:-1}}" = "1" ]; then
+    exit 0
+  else
+    exit 1
+  fi
 elif [ "$cmd" = "logs" ]; then
   echo "fake container log tail"
   exit 0
@@ -229,6 +280,47 @@ fi
         result = self.run_liveness({"FAKE_DOCKER_FAIL": "1"})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("деплой остановлен", result.stdout + result.stderr)
+
+    def test_liveness_fails_when_ready_marker_missing(self):
+        result = self.run_liveness({"FAKE_READY": "0"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("деплой остановлен", result.stdout + result.stderr)
+        log_content = self.log_file.read_text(encoding="utf-8")
+        self.assertIn("docker logs --tail 30 unagi-bot", log_content)
+
+    def test_liveness_allows_single_restart_if_stable(self):
+        result = self.run_liveness({"FAKE_STATUS": "running", "FAKE_RESTARTS": "1", "FAKE_READY": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_liveness_triggers_auto_rollback_on_failure(self):
+        result = self.run_liveness({"FAKE_STATUS": "exited", "FAKE_ROLLBACK_EXISTS": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("откат: запуск контейнера из unagi-reminder-bot-bot:rollback", result.stdout + result.stderr)
+        self.assertIn("откат выполнен", result.stdout + result.stderr)
+        log_content = self.log_file.read_text(encoding="utf-8")
+        self.assertIn("docker tag unagi-reminder-bot-bot:rollback unagi-reminder-bot-bot:latest", log_content)
+        self.assertIn("docker compose up -d", log_content)
+
+    def test_liveness_skips_rollback_when_no_rollback_image(self):
+        result = self.run_liveness({"FAKE_STATUS": "exited", "FAKE_ROLLBACK_EXISTS": "0"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("откат выполнен", result.stdout + result.stderr)
+        log_content = self.log_file.read_text(encoding="utf-8")
+        self.assertNotIn("docker tag unagi-reminder-bot-bot:rollback", log_content)
+
+    def test_rollback_block_isolated_execution(self):
+        res = subprocess.run(
+            ["bash", "-c", rollback_block()],
+            env=self.env | {"FAKE_ROLLBACK_EXISTS": "1"},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("откат: запуск контейнера из unagi-reminder-bot-bot:rollback", res.stdout)
+        self.assertIn("откат выполнен", res.stdout)
+        log_content = self.log_file.read_text(encoding="utf-8")
+        self.assertIn("docker tag unagi-reminder-bot-bot:rollback unagi-reminder-bot-bot:latest", log_content)
+        self.assertIn("docker compose up -d", log_content)
 
     def test_fake_docker_rejects_state_restart_count_simulation(self):
         inspect_res = subprocess.run(

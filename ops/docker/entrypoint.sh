@@ -14,7 +14,10 @@ SMTP_DIR="${MSMTPRC_DIR:-/run/unagi}"
 
 if [ "$(id -u)" -eq 0 ]; then
     # ./storage — bind-mount с хоста: раньше им владел root, а боту нужно писать БД, WAL и снимки.
+    mkdir -p "$STORAGE/backups"
     chown -R "$BOT_UID:$BOT_GID" "$STORAGE"
+    # /run/unagi — tmpfs для SMTP-конфига и маркера готовности ready: передаём права боту
+    [ -d "$SMTP_DIR" ] && chown "$BOT_UID:$BOT_GID" "$SMTP_DIR"
     # Исходный msmtprc на хосте закрыт 0600 для root. Бот читает копию из tmpfs: на диск и в образ она не попадает.
     if [ -f "$SMTP_SRC" ] && [ -d "$SMTP_DIR" ]; then
         { (umask 077 && cp "$SMTP_SRC" "$SMTP_DIR/msmtprc") && chown "$BOT_UID:$BOT_GID" "$SMTP_DIR/msmtprc"; } \

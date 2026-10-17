@@ -32,11 +32,17 @@ remote() {
   echo "log_errors=$(printf '%s\n' "$logs" | grep -cE ' - (ERROR|CRITICAL) - |Traceback')"
   echo "last_error=$(printf '%s\n' "$logs" | grep -E ' - (ERROR|CRITICAL) - ' | tail -n 1 | cut -c1-200)"
   echo "last_digest_cycle=$(printf '%s\n' "$logs" | grep 'digest_cycle' | tail -n 1 | cut -c1-24)"
-  echo "feed_builds=$(printf '%s\n' "$logs" | grep -c 'feed_build')"
-  echo "db_check=$(sqlite3 -readonly storage/bot_data.db 'pragma quick_check;' 2>&1 | head -n 1)"
-  echo "db_tables=$(sqlite3 -readonly storage/bot_data.db "select count(*) from sqlite_master where type='table';" 2>&1)"
+  sql_ro() {
+    if command -v setpriv >/dev/null 2>&1; then
+      setpriv --reuid=10001 --regid=10001 --clear-groups sqlite3 -readonly "$@"
+    else
+      sqlite3 -readonly "$@"
+    fi
+  }
+  echo "db_check=$(sql_ro storage/bot_data.db 'pragma quick_check;' 2>&1 | head -n 1)"
+  echo "db_tables=$(sql_ro storage/bot_data.db "select count(*) from sqlite_master where type='table';" 2>&1)"
   # OPS1: цифры для решений владельца. Пустой результат или ошибка не ломают prod_check.
-  stats="$(sqlite3 -readonly storage/bot_data.db < ops/aiqu/prod_stats.sql 2>/dev/null || true)"
+  stats="$(sql_ro storage/bot_data.db < ops/aiqu/prod_stats.sql 2>/dev/null || true)"
   [ -n "$stats" ] && printf '%s\n' "$stats"
   echo "disk_pct=$(df --output=pcent . | tail -n 1 | tr -dc '0-9')"
   # Чем занят диск: образы, кеш сборки, контейнеры (85–86% после BK1 и prune — неизвестно, что именно растёт). Сбой не ломает проверку.

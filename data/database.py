@@ -3629,3 +3629,14 @@ def update_feed_autodelivery_last_run(user_id: int, period: str, last_run_at: da
             (dt_str, user_id, period),
         )
         conn.commit()
+
+
+def checkpoint_db() -> tuple[int, int, int]:
+    """Сбрасывает WAL-лог в основную БД через PRAGMA wal_checkpoint(TRUNCATE).
+
+    Возвращает (busy, log, checkpointed).
+    """
+    with get_connection() as conn:
+        row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        return tuple(row) if row else (0, 0, 0)
+
