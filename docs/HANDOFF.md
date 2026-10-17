@@ -60,7 +60,7 @@ CI (`.github/workflows/deploy.yml`) на push в `main`: ruff → `docker build`
 
 Проверено на сервере/копиях 15.10:
 - миграция на **реальной копии прод-БД**: 17 → 20 таблиц, ни одна строка существующих таблиц не изменилась, повтор идемпотентен, `integrity_check = ok`;
-- релиз не меняет `docker-compose.yml`, `Dockerfile`, `requirements.txt` — локальная правка на сервере (`cpus: 1.5 → 1.0` в compose) не помешает `git pull`;
+- релиз не меняет `docker-compose.yml`, `Dockerfile`, `requirements.txt` — локальная правка на сервере (`cpus: 1.5 → 1.0` в compose) не помешает `git pull` (деплой идёт с `--autostash`, при конфликте останавливается до пересборки);
 - новые переменные окружения (`FEED_*`, `MAX_FEED_CHANNELS`, `MAX_IMPORT_FEED`) имеют значения по умолчанию — менять `.env` на проде не нужно.
 
 ## 4. Деплой и откат

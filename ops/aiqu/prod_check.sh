@@ -74,7 +74,7 @@ if [ "$age" = none ]; then say WARN "резервные копии: нет"
 elif [ "$age" -gt "${WARN_BACKUP_HOURS:-48}" ]; then say WARN "резервная копия: ${age} ч назад"
 else say OK "резервная копия: ${age} ч назад"; fi
 say OK "память контейнера: $(get mem)"
-[ "$(get compose_dirty)" = 0 ] || say WARN "docker-compose.yml на проде изменён вручную: git pull при деплое может не пройти"
+[ "$(get compose_dirty)" = 0 ] && say OK "docker-compose.yml: без ручных правок" || say OK "docker-compose.yml: ручная правка на проде (cpus), деплой сохраняет её через --autostash"
 proc="$(get proc)"
 if printf '%s' "$proc" | grep -q '^Uid: 0 '; then
   say WARN "права процесса: бот работает от root"

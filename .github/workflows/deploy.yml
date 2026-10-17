@@ -54,7 +54,8 @@ jobs:
           script: |
             set -e
             cd ~/projects/unagi-reminder-bot
-            git pull origin main
+            # --autostash: на сервере в docker-compose.yml вручную стоит cpus: 1.0 (docs/HANDOFF.md); без него pull отказался бы сливать изменённый compose.
+            git pull --autostash origin main
             # Снимок БД до пересборки (миграции только добавляют, но откат данных должен быть возможен). Нет снимка — нет деплоя.
             python3 ops/aiqu/backup_db.py --db storage/bot_data.db || { echo "резервная копия не создана — деплой остановлен"; exit 1; }
             docker compose up -d --build
