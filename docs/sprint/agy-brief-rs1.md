@@ -1,0 +1,2 @@
+# RS1 — реестр экранов вместо цепочки if/elif в render_screen
+ОБЩЕЕ: тесты и линтер только из venv: ~/.venvs/unagi/bin/ruff check . и ~/.venvs/unagi/bin/python -m unittest discover -s tests — всё зелёное, тесты не ослаблять; без pip install; параллельно другой трек правит main.py — не трогай код вне области задачи. Прогресс — docs/sprint/progress/<МЕТКА>.md. Коммит локально, push запрещён; первая строка сообщения коммита заканчивается маркером задачи. Маркер: (RS1).
