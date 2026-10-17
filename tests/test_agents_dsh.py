@@ -288,14 +288,23 @@ class AgentsShTests(DshBase):
         self.assertIn("jev=unset", status.stdout)
         pick = self.run_script("agents.sh", "pick", "review")
         self.assertEqual(pick.returncode, 0, pick.stderr)
-        self.assertIn("executor=dsh", pick.stdout)
+        self.assertRegex(pick.stdout, r"executor=(agy|dsh)")  # agy первый, если он установлен; в CI-контейнере его нет — тогда dsh
         self.assertEqual(self.run_script("agents.sh", "bogus").returncode, 2)
 
-    def test_check_auto_builds_brief_without_tools_and_uses_dsh(self):
+    def test_orchestra_config_is_valid_and_printed(self):
+        valid = self.run_script("agents.sh", "orchestra", "validate")
+        self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+        shown = self.run_script("agents.sh", "orchestra")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertIn("executor-complex    agy → dsh", shown.stdout)
+        self.assertIn("review              agy → dsh → opencode", shown.stdout)
+        self.assertIn("strategy            argon-web* → claude*", shown.stdout)
+
+    def test_check_builds_brief_without_tools_for_dsh(self):
         context = self.dir / "ctx.txt"
         context.write_text("def f():\n    return 1\n", encoding="utf-8")
         env = self.env | {"AGENTS_CHECK_WORKTREE": str(self.worktree)}
-        proc = self.run_script("agents.sh", "check", "auto", "t", "Есть ли ошибка?", context, self.dir / "checks.ndjson", env=env)
+        proc = self.run_script("agents.sh", "check", "dsh", "t", "Есть ли ошибка?", context, self.dir / "checks.ndjson", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         task = (self.dir / "task.txt").read_text(encoding="utf-8")
         self.assertIn("КОРОТКАЯ СВЕРКА", task)
@@ -325,22 +334,34 @@ class PolicyTests(DshBase):
         self.addCleanup(restore)
         self.policy = load("executor_policy")
 
-    def test_ladder_is_dsh_then_agy_and_opencode_only_for_checks_and_audits(self):
+    def test_ladder_is_agy_then_dsh_and_opencode_only_for_checks_and_audits(self):
+        # Приоритет стоимости (владелец, 17.10): agy бесплатный и несёт основную нагрузку, dsh платный, opencode дорогой и последний.
         for kind in self.policy.KINDS:
             order = self.policy.executor_order(kind)
-            self.assertEqual(order[:2], ["dsh", "agy"])
+            self.assertEqual(order[:2], ["agy", "dsh"], kind)
             self.assertEqual("opencode" in order, kind in ("review", "adversarial-review", "merge-audit", "short-check"), kind)
-        self.assertEqual(self.policy.choose("review")["executor"], "dsh")
+            if "opencode" in order:
+                self.assertEqual(order[-1], "opencode", kind)
+        self.assertEqual(self.policy.choose("review")["executor"], "agy")
 
-    def test_exhausted_dsh_budget_falls_back_to_agy(self):
+    def test_unavailable_agy_falls_back_to_dsh_and_exhausted_dsh_budget_stops_the_ladder(self):
+        real = self.policy.availability
+        self.policy.availability = lambda agent, kind: (False, "agy недоступен (тест)") if agent == "agy" else real(agent, kind)
+        self.assertEqual(self.policy.choose("review")["executor"], "dsh")
         os.environ["DSH_SPRINT_TOKEN_LIMIT"] = "1000"
         result = self.policy.choose("review")
-        self.assertEqual(result["executor"], "agy")
-        self.assertFalse(result["ladder"][0]["available"])
+        self.assertIsNone(result["executor"])  # opencode без ключа Jev недоступен, ручные ступени скрипты не запускают
+        self.assertFalse(result["ladder"][1]["available"])
+
+    def test_manual_steps_are_reported_but_never_run_by_scripts(self):
+        self.assertEqual(self.policy.manual_steps("strategy"), ["argon-web", "claude"])
+        self.assertEqual(self.policy.executor_order("strategy"), [])
+        self.assertIsNone(self.policy.choose("strategy")["executor"])
+        self.assertIn("argon-web", self.policy.manual_steps("adversarial-review"))
 
     def test_allowed_opencode_needs_a_jev_key_and_budget(self):
         self.policy.opencode_allowed = lambda kind: kind == "merge-audit"
-        self.assertEqual(self.policy.executor_order("merge-audit"), ["dsh", "agy", "opencode"])
+        self.assertEqual(self.policy.executor_order("merge-audit"), ["agy", "dsh", "opencode"])
         os.environ["DSH_SPRINT_TOKEN_LIMIT"] = "1000"
         os.environ["PATH"] = f"{self.dir / 'bin'}:{os.environ['PATH']}"
         fake_oc = self.dir / "bin" / "opencode"

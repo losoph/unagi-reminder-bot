@@ -12,7 +12,10 @@
 #   agents.sh route <agent> <kind> "<описание>" [--dry-run]   # только выбор модели (Jev или статическая политика)
 #   agents.sh report                                   # что решил Jev, откаты, стоимость решений и качество выдачи агентов
 #   agents.sh rate <agent> <model> <title> <good|partial|bad> [заметка]   # оценка выдачи (журнал .agents/quality.ndjson)
-# kind: executor-complex | executor-ux | review | adversarial-review | docs | merge-audit | short-check
+#   agents.sh orchestra [validate]                     # зафиксированная конфигурация оркестра (tools/agents/orchestra.json): роли, лестницы, лимиты, правила
+#   agents.sh launch <agent> <worktree> <brief.md> <метка> [kind] [--exec]
+#                                                       # проверки перед запуском (бриф закоммичен, метка не в истории) и готовые команды для вкладки и монитора
+# kind: executor-complex | executor-ux | review | adversarial-review | docs | merge-audit | short-check | strategy (ручной: Argon + Claude)
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$SCRIPT_DIR/agent_env.sh"
@@ -20,7 +23,7 @@ agent_env_load OPENROUTER_API_KEY TYPESAFE_API_KEY
 . "$SCRIPT_DIR/dsh_bin.sh"
 PY="${PYTHON:-python3}"
 
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 
 status() {
   "$PY" "$SCRIPT_DIR/oc_budget.py" status --all
@@ -75,30 +78,85 @@ check_agent() {
   if [ "$agent" = auto ]; then
     agent="$("$PY" "$SCRIPT_DIR/executor_policy.py" short-check | sed -n 's/^executor=//p')"
     [ -n "$agent" ] && [ "$agent" != none ] || { echo "нет доступного исполнителя для короткой сверки" >&2; return 1; }
-    [ "$agent" != agy ] || { echo "для короткой сверки выбран agy: используйте agy_watch.sh run" >&2; return 2; }
   fi
   local work; work="$(mktemp -d "${TMPDIR:-/tmp}/agents-check.XXXXXX")"; trap 'rm -rf "$work"' RETURN
   {
     echo "ЭТО КОРОТКАЯ СВЕРКА. Не используй инструменты, не читай файлы, не запускай команды, ничего не меняй: весь нужный контекст ниже."
-    echo "Ответь по-русски, не длиннее 200 слов: только подтверждаемые контекстом дефекты в формате «файл:строка — суть — сценарий воспроизведения»,"
+    echo "Ответь по-русски, не длиннее 200 слов: только подтверждаемые контекстом дефекты в формате «файл:строка (или функция/раздел, если номеров строк в контексте нет) — суть — сценарий воспроизведения»,"
     echo "затем одной строкой вердикт: OK или ЕСТЬ ЗАМЕЧАНИЯ. Если контекста не хватает — скажи, чего именно, не гадай."
     echo; echo "ВОПРОС: $question"; echo; echo "КОНТЕКСТ (обрезан до ${OC_CHECK_MAX_BYTES:-24000} байт):"
     head -c "${OC_CHECK_MAX_BYTES:-24000}" "$context"
   } > "$work/brief.md"
   mkdir -p "$(dirname "$log")"
+  if [ "$agent" = agy ]; then
+    # agy — бесплатный и первый в лестнице: сверка идёт через agy_watch.sh run (ответ печатает `result`); журнал — во временной папке
+    local model="${AGY_MODEL:-$("$PY" "$SCRIPT_DIR/orchestra.py" get models.agy.default 2>/dev/null || echo gemini-3.8-flash-medium)}"
+    local proxy="${AGY_PROXY:-$("$PY" "$SCRIPT_DIR/orchestra.py" get models.agy.proxy 2>/dev/null || echo http://127.0.0.1:8095)}"
+    mkdir -p "$work/agy"
+    ( cd "${AGENTS_CHECK_WORKTREE:-$PWD}" && AGY_LOG_DIR="$work/agy" AGY_MODEL="$model" AGY_PROXY="$proxy" "$SCRIPT_DIR/agy_watch.sh" run "$work/brief.md" )
+    return $?
+  fi
   # не exec: нужен trap для очистки временной папки
-  "$0" run "$agent" short-check "${AGENTS_CHECK_WORKTREE:-$PWD}" "$work/brief.md" "$log" "check-$title" --review
+  # opencode: текст сверки идёт в сообщении (--inline): gpt-6.1-sol не получает содержимое вложения; dsh флаг не нужен
+  local extra=(); [ "$agent" != opencode ] || extra=(--inline)
+  "$0" run "$agent" short-check "${AGENTS_CHECK_WORKTREE:-$PWD}" "$work/brief.md" "$log" "check-$title" --review ${extra[@]+"${extra[@]}"}
 }
 
 watch_agent() {
   [ $# -eq 2 ] || { usage >&2; return 2; }
   local agent="$1" log="$2"
+  # период дайджеста монитора — из orchestra.json (limits.monitor_digest_sec), PERIOD из окружения важнее
+  PERIOD="${PERIOD:-$("$PY" "$SCRIPT_DIR/orchestra.py" get limits.monitor_digest_sec 2>/dev/null || echo 300)}"
   case "$agent" in
-    dsh) touch "$log"; tail -n +1 -F "$log" 2>/dev/null | PERIOD="${PERIOD:-300}" "$PY" -u "$SCRIPT_DIR/dsh_digest.py" ;;
-    opencode) touch "$log"; tail -n +1 -F "$log" 2>/dev/null | PERIOD="${PERIOD:-300}" "$PY" -u "$SCRIPT_DIR/oc_digest.py" ;;
-    agy) AGY_LOG_DIR="$(dirname "$log")" "$SCRIPT_DIR/agy_watch.sh" digest "${PERIOD:-300}" ;;
+    dsh) touch "$log"; tail -n +1 -F "$log" 2>/dev/null | PERIOD="$PERIOD" "$PY" -u "$SCRIPT_DIR/dsh_digest.py" ;;
+    opencode) touch "$log"; tail -n +1 -F "$log" 2>/dev/null | PERIOD="$PERIOD" "$PY" -u "$SCRIPT_DIR/oc_digest.py" ;;
+    agy) AGY_LOG_DIR="$(dirname "$log")" "$SCRIPT_DIR/agy_watch.sh" digest "$PERIOD" ;;
     *) echo "неизвестный агент: $agent" >&2; return 2 ;;
   esac
+}
+
+# Проверки перед запуском трека и готовые команды для вкладки терминала и монитора (правила и лимиты — orchestra.json).
+launch_agent() {
+  [ $# -ge 4 ] || { usage >&2; return 2; }
+  local agent="$1" worktree="$2" brief="$3" marker="$4" kind="executor-complex" doexec=0 arg
+  shift 4
+  for arg in "$@"; do case "$arg" in --exec) doexec=1 ;; *) kind="$arg" ;; esac; done
+  case "$agent" in dsh|agy) ;; *) echo "launch: агент dsh или agy (opencode — agents.sh check, Argon — вручную через браузер)" >&2; return 2 ;; esac
+  [[ "$worktree" = /* ]] || worktree="$PWD/$worktree"
+  git -C "$worktree" rev-parse --show-toplevel >/dev/null 2>&1 || { echo "⛔ $worktree — не git-репозиторий/worktree" >&2; return 3; }
+  git -C "$worktree" ls-files --error-unmatch -- "$brief" >/dev/null 2>&1 \
+    || { echo "⛔ бриф $brief не закоммичен в $worktree: супервизор agy чистит неотслеживаемые файлы — закоммитьте бриф до запуска" >&2; return 3; }
+  git -C "$worktree" diff --quiet HEAD -- "$brief" 2>/dev/null \
+    || { echo "⛔ бриф $brief изменён после коммита — закоммитьте правки брифа" >&2; return 3; }
+  local title="${marker#(}"; title="${title%)}"
+  local depth hit; depth="$("$PY" "$SCRIPT_DIR/orchestra.py" get limits.marker_history_depth 2>/dev/null || echo 40)"
+  hit="$(git -C "$worktree" log --oneline -"$depth" | grep -F -- "($title)" | head -n 1)"
+  if [ -n "$hit" ]; then
+    echo "⛔ метка ($title) уже есть в истории: $hit" >&2
+    echo "   Супервизор сочтёт задачу выполненной и не запустит агента. Если это коммит с брифом — перепишите его сообщение без метки (git commit --amend)." >&2
+    return 3
+  fi
+  local digest tabs; digest="$("$PY" "$SCRIPT_DIR/orchestra.py" get limits.monitor_digest_sec 2>/dev/null || echo 240)"
+  tabs="$("$PY" "$SCRIPT_DIR/orchestra.py" get limits.terminal_tabs_max 2>/dev/null || echo 6)"
+  local routed model effort; routed="$("$SCRIPT_DIR/route.sh" "$agent" "$kind" "$title" 2>&1)" || { printf '%s\n' "$routed" >&2; return 2; }
+  model="$(routed_field "$routed" model)"; effort="$(routed_field "$routed" effort)"
+  local term mon
+  if [ "$agent" = agy ]; then
+    lsof -nP -iTCP:8095 -sTCP:LISTEN >/dev/null 2>&1 || echo "⚠ прокси agy на :8095 не слушает (функция agy из ~/.zshrc поднимет его сама)" >&2
+    local proxy attempts; proxy="$("$PY" "$SCRIPT_DIR/orchestra.py" get models.agy.proxy 2>/dev/null || echo http://127.0.0.1:8095)"
+    attempts="$("$PY" "$SCRIPT_DIR/orchestra.py" get limits.supervise_attempts 2>/dev/null || echo 6)"
+    term="cd $worktree && AGY_LOG_DIR=.agy AGY_MODEL=$model AGY_PROXY=$proxy tools/agents/agy_supervise.sh $brief '($title)' $attempts"
+    mon="cd $worktree && AGY_LOG_DIR=.agy tools/agents/agy_watch.sh digest $digest"
+  else
+    term="cd $worktree && mkdir -p .agents && tools/agents/agents.sh run dsh $kind $worktree $brief .agents/$title.ndjson $title"
+    mon="cd $worktree && tools/agents/agents.sh watch dsh .agents/$title.ndjson"
+  fi
+  echo "agent=$agent model=$model effort=$effort kind=$kind"
+  echo "terminal: $term"
+  echo "monitor : $mon"
+  echo "(вкладок терминала не больше $tabs; монитор живёт 30 минут — перевзвести)"
+  [ "$doexec" = 1 ] || return 0
+  exec bash -c "$term"
 }
 
 cmd="${1:-help}"; [ $# -eq 0 ] || shift
@@ -111,6 +169,8 @@ case "$cmd" in
   watch) watch_agent "$@" ;;
   report) "$PY" "$SCRIPT_DIR/jev_report.py" "$@"; "$PY" "$SCRIPT_DIR/quality.py" report ;;
   rate) "$PY" "$SCRIPT_DIR/quality.py" rate "$@" ;;
+  orchestra) if [ "${1:-}" = validate ]; then "$PY" "$SCRIPT_DIR/orchestra.py" validate; else "$PY" "$SCRIPT_DIR/orchestra.py" show; fi ;;
+  launch) launch_agent "$@" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac
