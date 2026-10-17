@@ -431,8 +431,8 @@ class ExportDbTests(unittest.TestCase):
 
     def test_backup_failure_aborts_restore_code_4(self):
         """Если целевая БД существует, но снимок создать не удалось — отказ с кодом 4, БД не тронута."""
-        # Создаём существующую целевую БД
-        self._populate_db(self.dest_db, tables=2, schema="utc_v1", user_version=0)
+        # Создаём существующую целевую БД с совместимой схемой
+        self._populate_db(self.dest_db, tables=3, schema="utc_v1", user_version=0)
         dest_hash_before = hashlib.sha256(self.dest_db.read_bytes()).hexdigest()
 
         code = export_db.main(
@@ -472,7 +472,7 @@ class ExportDbTests(unittest.TestCase):
 
     def test_dry_run_does_not_modify_target_or_make_backup(self):
         """Флаг --dry-run выполняет шаги 1-3, не заменяет БД и не создаёт снимок."""
-        self._populate_db(self.dest_db, tables=2, schema="utc_v1", user_version=0)
+        self._populate_db(self.dest_db, tables=3, schema="utc_v1", user_version=0)
         dest_hash_before = hashlib.sha256(self.dest_db.read_bytes()).hexdigest()
 
         code = export_db.main(
@@ -739,6 +739,364 @@ class ExportDbTests(unittest.TestCase):
             self.assertEqual(verdict, "ok")
             users = conn.execute("SELECT id, name FROM users").fetchall()
             self.assertEqual(users, [(1, "alice"), (2, "bob")])
+
+    def test_empty_or_foreign_db_rejected_code_5(self):
+        """Пункт 1: пустая база (0 таблиц) или чужая SQLite-БД (без app_meta) отвергаются при restore (код 5)."""
+        self._populate_db(self.dest_db, tables=3, schema="utc_v1", user_version=0)
+        dest_hash_before = hashlib.sha256(self.dest_db.read_bytes()).hexdigest()
+
+        # Создаём БД без app_meta ("чужая" БД)
+        foreign_db = self.base_dir / "foreign.db"
+        with sqlite3.connect(str(foreign_db)) as conn:
+            conn.execute("CREATE TABLE foreign_table (id INT)")
+            conn.commit()
+
+        # Попытка экспорта БД без app_meta должна отвергаться с кодом 1
+        code_exp = export_db.main(
+            ["export", "--db", str(foreign_db), "--recipient", "age1test", "--out", str(self.export_dir)]
+        )
+        self.assertEqual(code_exp, 1)
+
+        # Создаём искусственный экспорт пустой БД с 0 таблиц
+        empty_mem = sqlite3.connect(":memory:")
+        empty_bytes = empty_mem.serialize()
+        empty_mem.close()
+
+        # Шифруем фейковым age
+        prefix = b"age-encryption.org/v1\n-> fake-x25519\n\n"
+        enc_empty = prefix + bytes(b ^ 0x5A for b in empty_bytes)
+        self.export_dir.mkdir(parents=True, exist_ok=True)
+        empty_age_path = self.export_dir / "empty-20260101-000000-migrate.db.age"
+        empty_age_path.write_bytes(enc_empty)
+        empty_manifest = {
+            "format_version": 1,
+            "created_at": "2026-01-01T00:00:00Z",
+            "sha256": hashlib.sha256(enc_empty).hexdigest(),
+            "size": len(enc_empty),
+            "plaintext_size": len(empty_bytes),
+            "sqlite_user_version": 0,
+            "tables": 0,
+            "app_schema": "empty",
+            "age_recipients_count": 1,
+        }
+        empty_age_path.with_name(f"{empty_age_path.name}.json").write_text(
+            json.dumps(empty_manifest, indent=2), encoding="utf-8"
+        )
+
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf):
+            r_code = export_db.main(
+                [
+                    "restore",
+                    "--in",
+                    str(empty_age_path),
+                    "--identity",
+                    str(self.key_file),
+                    "--db",
+                    str(self.dest_db),
+                ]
+            )
+        self.assertEqual(r_code, 5)
+        self.assertIn("пуста (0 таблиц) или не является базой бота", err_buf.getvalue())
+        # Целевая БД не тронута
+        self.assertEqual(hashlib.sha256(self.dest_db.read_bytes()).hexdigest(), dest_hash_before)
+
+    def test_newer_schema_with_same_utc_v1_fails_code_3(self):
+        """Пункт 2: новые таблицы/колонки при том же utc_v1 блокируют restore с кодом 3 без --force-schema."""
+        # Целевая БД: 2 таблицы (app_meta, users) с utc_v1
+        self._populate_db(self.dest_db, tables=2, schema="utc_v1", user_version=0)
+        dest_hash_before = hashlib.sha256(self.dest_db.read_bytes()).hexdigest()
+
+        # Исходная БД: те же utc_v1, но 3 таблицы (notes)
+        newer_db = self.base_dir / "newer_structure.db"
+        self._populate_db(newer_db, tables=3, schema="utc_v1", user_version=0)
+
+        code = export_db.main(
+            ["export", "--db", str(newer_db), "--recipient", "age1test", "--out", str(self.export_dir)]
+        )
+        self.assertEqual(code, 0)
+        age_file = list(self.export_dir.glob("newer_structure-*.db.age"))[0]
+
+        # Без --force-schema -> код 3
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf):
+            r_code = export_db.main(
+                [
+                    "restore",
+                    "--in",
+                    str(age_file),
+                    "--identity",
+                    str(self.key_file),
+                    "--db",
+                    str(self.dest_db),
+                ]
+            )
+        self.assertEqual(r_code, 3)
+        self.assertIn("НОВЕЕ", err_buf.getvalue())
+        self.assertIn("новые таблицы", err_buf.getvalue())
+        self.assertEqual(hashlib.sha256(self.dest_db.read_bytes()).hexdigest(), dest_hash_before)
+
+        # С --force-schema -> код 0
+        r_force = export_db.main(
+            [
+                "restore",
+                "--in",
+                str(age_file),
+                "--identity",
+                str(self.key_file),
+                "--db",
+                str(self.dest_db),
+                "--force-schema",
+            ]
+        )
+        self.assertEqual(r_force, 0)
+        with sqlite3.connect(str(self.dest_db)) as conn:
+            tables = conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchone()[0]
+            self.assertEqual(tables, 3)
+
+    def test_active_shm_without_wal_blocks_restore_code_1(self):
+        """Пункт 3: наличие файла -shm (при 0-байтном -wal) указывает на живой бот и блокирует restore."""
+        self._populate_db(self.dest_db, tables=3, schema="utc_v1", user_version=0)
+        dest_hash_before = hashlib.sha256(self.dest_db.read_bytes()).hexdigest()
+
+        code = export_db.main(
+            ["export", "--db", str(self.src_db), "--recipient", "age1test", "--out", str(self.export_dir)]
+        )
+        self.assertEqual(code, 0)
+        age_file = list(self.export_dir.glob("source-*.db.age"))[0]
+
+        # Создаём -wal размером 0 и непустой -shm
+        wal_file = self.dest_db.with_name(f"{self.dest_db.name}-wal")
+        wal_file.touch()
+        shm_file = self.dest_db.with_name(f"{self.dest_db.name}-shm")
+        shm_file.write_bytes(b"x" * 32768)
+
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf):
+            r_code = export_db.main(
+                [
+                    "restore",
+                    "--in",
+                    str(age_file),
+                    "--identity",
+                    str(self.key_file),
+                    "--db",
+                    str(self.dest_db),
+                ]
+            )
+        self.assertEqual(r_code, 1)
+        self.assertIn("активный WAL-файл / SHM-файл", err_buf.getvalue())
+        self.assertIn("docker compose stop unagi-bot", err_buf.getvalue())
+        self.assertEqual(hashlib.sha256(self.dest_db.read_bytes()).hexdigest(), dest_hash_before)
+
+    def test_format_version_and_age_v1_header_validated_code_5(self):
+        """Пункт 5: проверка format_version != 1 и заголовка отличного от age-encryption.org/v1 возвращает код 5."""
+        code = export_db.main(
+            ["export", "--db", str(self.src_db), "--recipient", "age1test", "--out", str(self.export_dir)]
+        )
+        self.assertEqual(code, 0)
+        age_file = list(self.export_dir.glob("source-*.db.age"))[0]
+        manifest_file = age_file.with_name(f"{age_file.name}.json")
+
+        # 1. format_version: 2 -> код 5
+        m = json.loads(manifest_file.read_text(encoding="utf-8"))
+        m["format_version"] = 2
+        manifest_file.write_text(json.dumps(m), encoding="utf-8")
+        self.assertEqual(export_db.main(["verify", "--in", str(age_file)]), 5)
+
+        # 2. Восстанавливаем format_version, портим заголовок age
+        m["format_version"] = 1
+        manifest_file.write_text(json.dumps(m), encoding="utf-8")
+        raw = age_file.read_bytes()
+        bad_header_raw = raw.replace(b"age-encryption.org/v1", b"age-encryption.org/v2")
+        age_file.write_bytes(bad_header_raw)
+        # Обновляем хеш и размер, чтобы проверить именно заголовок
+        m["sha256"] = hashlib.sha256(bad_header_raw).hexdigest()
+        m["size"] = len(bad_header_raw)
+        manifest_file.write_text(json.dumps(m), encoding="utf-8")
+        self.assertEqual(export_db.main(["verify", "--in", str(age_file)]), 5)
+
+    def test_export_rejects_unencrypted_age_bin_output_code_1(self):
+        """Пункт 6: если AGE_BIN выдаёт незашифрованные данные, экспорт отклоняется с кодом 1."""
+        # Создаём обёртку-имитатор сломанного age (возвращающую входной поток без шифрования)
+        broken_wrapper = self.base_dir / "broken_age"
+        broken_wrapper.write_text(f"#!{sys.executable}\nimport sys\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n")
+        broken_wrapper.chmod(0o755)
+
+        with patch.dict(os.environ, {"AGE_BIN": str(broken_wrapper)}):
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                code = export_db.main(
+                    [
+                        "export",
+                        "--db",
+                        str(self.src_db),
+                        "--recipient",
+                        "age1test",
+                        "--out",
+                        str(self.export_dir),
+                        "--tag",
+                        "brokenage",
+                    ]
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("не содержит заголовок age-encryption.org/v1", err_buf.getvalue())
+            # Файл не был записан
+            broken_files = list(self.export_dir.glob("*brokenage*.db.age"))
+            self.assertEqual(len(broken_files), 0)
+
+    def test_no_plaintext_or_restore_tmp_leak_across_operations(self):
+        """Пункт 7: отсутствие утечек plaintext и очистка *-restore-*.tmp при успешном restore, dry-run и сбоях."""
+        code = export_db.main(
+            ["export", "--db", str(self.src_db), "--recipient", "age1test", "--out", str(self.export_dir)]
+        )
+        self.assertEqual(code, 0)
+        age_file = list(self.export_dir.glob("source-*.db.age"))[0]
+
+        target_dir = self.base_dir / "restore_leak_test"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        test_db = target_dir / "target.db"
+
+        # 1. --dry-run
+        self.assertEqual(
+            export_db.main(
+                [
+                    "restore",
+                    "--in",
+                    str(age_file),
+                    "--identity",
+                    str(self.key_file),
+                    "--db",
+                    str(test_db),
+                    "--dry-run",
+                ]
+            ),
+            0,
+        )
+        self.assertFalse(list(target_dir.glob("*-restore-*.tmp")))
+        self.assertFalse(test_db.exists())
+
+        # 2. Успешный restore
+        self.assertEqual(
+            export_db.main(
+                [
+                    "restore",
+                    "--in",
+                    str(age_file),
+                    "--identity",
+                    str(self.key_file),
+                    "--db",
+                    str(test_db),
+                ]
+            ),
+            0,
+        )
+        self.assertFalse(list(target_dir.glob("*-restore-*.tmp")))
+
+        # 3. Сбой quick_check во временном файле: проверяем cleanup
+        corrupt_age_file = self.export_dir / "corrupt-20260101-000000-corrupt.db.age"
+        garbage_plain = b"this is not a valid sqlite database at all 1234567890"
+        enc_garbage = b"age-encryption.org/v1\n-> fake-x25519\n\n" + bytes(b ^ 0x5A for b in garbage_plain)
+        corrupt_age_file.write_bytes(enc_garbage)
+        corrupt_manifest = {
+            "format_version": 1,
+            "created_at": "2026-01-01T00:00:00Z",
+            "sha256": hashlib.sha256(enc_garbage).hexdigest(),
+            "size": len(enc_garbage),
+            "plaintext_size": len(garbage_plain),
+            "sqlite_user_version": 0,
+            "tables": 0,
+            "app_schema": "empty",
+            "age_recipients_count": 1,
+        }
+        corrupt_age_file.with_name(f"{corrupt_age_file.name}.json").write_text(
+            json.dumps(corrupt_manifest), encoding="utf-8"
+        )
+
+        r_corrupt = export_db.main(
+            [
+                "restore",
+                "--in",
+                str(corrupt_age_file),
+                "--identity",
+                str(self.key_file),
+                "--db",
+                str(test_db),
+            ]
+        )
+        self.assertEqual(r_corrupt, 5)
+        self.assertFalse(list(target_dir.glob("*-restore-*.tmp")))
+
+    def test_error_handling_and_prerestore_rotation(self):
+        """Пункт 10: ошибки параметров не дают traceback, повторный экспорт не затирает файл, prerestore ротируются."""
+        # 1. --out указывает на существующий файл (FileExistsError) -> код 1 без traceback
+        existing_file = self.base_dir / "regular_file.txt"
+        existing_file.touch()
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf):
+            code_out = export_db.main(
+                ["export", "--db", str(self.src_db), "--recipient", "age1test", "--out", str(existing_file)]
+            )
+        self.assertEqual(code_out, 1)
+        self.assertIn("не удалось создать каталог вывода", err_buf.getvalue())
+
+        # 2. Манифест в виде JSON-списка [] -> код 5 без TypeError traceback
+        self.export_dir.mkdir(parents=True, exist_ok=True)
+        list_age = self.export_dir / "listmanifest-20260101-000000-tag.db.age"
+        list_age.write_bytes(b"age-encryption.org/v1\n...")
+        list_manifest = list_age.with_name(f"{list_age.name}.json")
+        list_manifest.write_text("[]", encoding="utf-8")
+        v_code, _, v_err = export_db.verify_export_file(list_age)
+        self.assertEqual(v_code, 5)
+        self.assertIn("JSON-объектом", v_err)
+
+        # 3. Повторный экспорт в ту же секунду с тем же тегом завершается с кодом 1
+        now_fixed = 1700000000.0
+        code1 = export_db.main(
+            ["export", "--db", str(self.src_db), "--recipient", "age1test", "--out", str(self.export_dir), "--tag", "dup"],
+            now=now_fixed,
+        )
+        self.assertEqual(code1, 0)
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf):
+            code2 = export_db.main(
+                ["export", "--db", str(self.src_db), "--recipient", "age1test", "--out", str(self.export_dir), "--tag", "dup"],
+                now=now_fixed,
+            )
+        self.assertEqual(code2, 1)
+        self.assertIn("файл экспорта уже существует", err_buf.getvalue())
+
+        # 4. Пре-рестор снимки ротируются и сжимаются (тег prerestore)
+        target = self.base_dir / "rotation_target.db"
+        self._populate_db(target, tables=3, schema="utc_v1", user_version=0)
+        age_file = list(self.export_dir.glob("source-*.db.age"))[0]
+        snap_dir = self.base_dir / "prerestore_backups"
+
+        # Восстанавливаем 3 раза с разными отметками времени
+        for i in range(3):
+            r_code = export_db.main(
+                [
+                    "restore",
+                    "--in",
+                    str(age_file),
+                    "--identity",
+                    str(self.key_file),
+                    "--db",
+                    str(target),
+                    "--backup-dir",
+                    str(snap_dir),
+                ],
+                now=now_fixed + (i * 100),
+            )
+            self.assertEqual(r_code, 0)
+
+        # Проверяем, что снимки prerestore были сжаты: должно остаться 2 .db и 1 .db.gz
+        raw_snaps = list(snap_dir.glob("*.db"))
+        gz_snaps = list(snap_dir.glob("*.db.gz"))
+        self.assertEqual(len(raw_snaps), 2)
+        self.assertEqual(len(gz_snaps), 1)
 
 
 if __name__ == "__main__":

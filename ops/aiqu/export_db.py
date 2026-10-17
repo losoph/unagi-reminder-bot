@@ -36,10 +36,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 try:
-    from ops.aiqu.backup_db import snapshot
+    from ops.aiqu.backup_db import compress_old_snapshots, rotate, snapshot
 except ImportError:
     # Запасной вариант при вызове из нестандартных путей
     snapshot = None  # type: ignore[assignment]
+    rotate = None  # type: ignore[assignment]
+    compress_old_snapshots = None  # type: ignore[assignment]
 
 
 def find_age_bin() -> str | None:
@@ -70,8 +72,51 @@ def extract_db_meta(conn: sqlite3.Connection) -> tuple[int, int, str]:
                 app_schema = str(row[0])
                 break
     if app_schema is None:
-        app_schema = str(user_version) if user_version else "utc_v1"
+        app_schema = str(user_version) if user_version else ("empty" if tables_count == 0 else "unknown")
     return tables_count, user_version, app_schema
+
+
+class SchemaComparisonResult(tuple):
+    """Кортеж (is_newer, is_older), расширенный атрибутом reason для детальной диагностики."""
+
+    def __new__(cls, is_newer: bool, is_older: bool, reason: str | None = None):
+        return super().__new__(cls, (is_newer, is_older))
+
+    def __init__(self, is_newer: bool, is_older: bool, reason: str | None = None):
+        self.is_newer = is_newer
+        self.is_older = is_older
+        self.reason = reason
+
+
+def get_db_schema_structure(conn: sqlite3.Connection) -> dict[str, set[str]]:
+    """Возвращает структуру схемы {имя_таблицы: множество_колонок} для всех пользовательских таблиц."""
+    cur = conn.cursor()
+    tables = cur.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall()
+    structure: dict[str, set[str]] = {}
+    for (t_name,) in tables:
+        cols = cur.execute(f"PRAGMA table_info({t_name})").fetchall()
+        structure[t_name] = {col[1] for col in cols}
+    return structure
+
+
+def get_code_schema_structure() -> dict[str, set[str]] | None:
+    """Возвращает эталонную структуру схемы из кода data.database.init_db(), если модуль доступен."""
+    try:
+        import data.database as db
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            orig_db_path = getattr(db, "DB_PATH", None)
+            try:
+                db.DB_PATH = tmp.name
+                db.init_db()
+                with closing(sqlite3.connect(tmp.name)) as conn:
+                    return get_db_schema_structure(conn)
+            finally:
+                if orig_db_path is not None:
+                    db.DB_PATH = orig_db_path
+    except Exception:
+        return None
 
 
 def parse_schema_version(val: str | int) -> tuple[int, ...]:
@@ -87,25 +132,56 @@ def compare_schemas(
     export_user_version: int,
     target_schema: str,
     target_user_version: int,
-) -> tuple[bool, bool]:
+    export_structure: dict[str, set[str]] | None = None,
+    target_structure: dict[str, set[str]] | None = None,
+) -> SchemaComparisonResult:
     """Сравнивает версии схемы экспорта и целевой базы/кода.
 
-    Возвращает (is_newer, is_older).
+    Возвращает SchemaComparisonResult(is_newer, is_older, reason).
     """
     if export_user_version != target_user_version and (export_user_version > 0 or target_user_version > 0):
         if export_user_version > target_user_version:
-            return True, False
-        return False, True
+            return SchemaComparisonResult(True, False, f"user_version ({export_user_version} > {target_user_version})")
+        return SchemaComparisonResult(False, True, f"user_version ({export_user_version} < {target_user_version})")
 
     exp_parsed = parse_schema_version(export_schema)
     tar_parsed = parse_schema_version(target_schema)
 
-    if exp_parsed != tar_parsed:
+    if exp_parsed != tar_parsed and exp_parsed != (0,) and tar_parsed != (0,):
         if exp_parsed > tar_parsed:
-            return True, False
-        return False, True
+            return SchemaComparisonResult(True, False, f"версия схемы ({export_schema} > {target_schema})")
+        return SchemaComparisonResult(False, True, f"версия схемы ({export_schema} < {target_schema})")
 
-    return False, False
+    if export_structure is not None and target_structure is not None:
+        newer_details: list[str] = []
+        older_details: list[str] = []
+
+        # Проверка новых таблиц в экспорте
+        new_tables = set(export_structure.keys()) - set(target_structure.keys())
+        if new_tables:
+            newer_details.append(f"новые таблицы: {sorted(new_tables)}")
+
+        # Проверка отсутствующих таблиц
+        missing_tables = set(target_structure.keys()) - set(export_structure.keys())
+        if missing_tables:
+            older_details.append(f"отсутствующие таблицы: {sorted(missing_tables)}")
+
+        # Проверка колонок в общих таблицах
+        common_tables = set(export_structure.keys()) & set(target_structure.keys())
+        for t in sorted(common_tables):
+            new_cols = export_structure[t] - target_structure[t]
+            if new_cols:
+                newer_details.append(f"новые колонки в {t}: {sorted(new_cols)}")
+            missing_cols = target_structure[t] - export_structure[t]
+            if missing_cols:
+                older_details.append(f"отсутствующие колонки в {t}: {sorted(missing_cols)}")
+
+        if newer_details:
+            return SchemaComparisonResult(True, False, "; ".join(newer_details))
+        if older_details:
+            return SchemaComparisonResult(False, True, "; ".join(older_details))
+
+    return SchemaComparisonResult(False, False, None)
 
 
 def verify_export_file(file_path: Path) -> tuple[int, dict | None, str | None]:
@@ -129,18 +205,30 @@ def verify_export_file(file_path: Path) -> tuple[int, dict | None, str | None]:
     except (OSError, json.JSONDecodeError) as exc:
         return 5, None, f"ошибка чтения манифеста: {exc}"
 
+    if not isinstance(manifest, dict):
+        return 5, None, "манифест должен быть JSON-объектом"
+
     required_keys = ("format_version", "created_at", "sha256", "size", "plaintext_size")
     for key in required_keys:
         if key not in manifest:
             return 5, None, f"в манифесте отсутствует обязательное поле: {key}"
+
+    if manifest.get("format_version") != 1:
+        return 5, None, f"неподдерживаемая версия формата манифеста: {manifest.get('format_version')} (ожидается 1)"
+
+    if not isinstance(manifest.get("size"), int) or not isinstance(manifest.get("plaintext_size"), int):
+        return 5, None, "поля size и plaintext_size должны быть целыми числами"
+
+    if manifest["plaintext_size"] <= 0:
+        return 5, None, f"некорректный plaintext_size: {manifest['plaintext_size']}"
 
     try:
         actual_bytes = file_path.read_bytes()
     except OSError as exc:
         return 1, None, f"ошибка чтения файла: {exc}"
 
-    if not actual_bytes.startswith(b"age-encryption.org/"):
-        return 5, None, f"неверный заголовок age: {actual_bytes[:22]!r}"
+    if not actual_bytes.startswith(b"age-encryption.org/v1"):
+        return 5, None, f"неверный заголовок age (ожидается age-encryption.org/v1): {actual_bytes[:25]!r}"
 
     actual_size = len(actual_bytes)
     if actual_size != manifest["size"]:
@@ -173,10 +261,14 @@ def cmd_export(args: argparse.Namespace, now: float | None = None) -> int:
         if not rf.is_file():
             print(f"ОШИБКА: файл получателей не найден: {recipients_file}", file=sys.stderr)
             return 1
-        for line in rf.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                recipient_list.append(line)
+        try:
+            for line in rf.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    recipient_list.append(line)
+        except OSError as exc:
+            print(f"ОШИБКА: чтение файла получателей {rf}: {exc}", file=sys.stderr)
+            return 1
 
     recipients_count = len(recipient_list)
     if recipients_count == 0:
@@ -201,8 +293,23 @@ def cmd_export(args: argparse.Namespace, now: float | None = None) -> int:
                 print(f"ОШИБКА: PRAGMA quick_check снимка в памяти: {verdict}", file=sys.stderr)
                 return 1
             tables, user_version, app_schema = extract_db_meta(mem_conn)
+            has_app_meta = (
+                mem_conn.execute(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'app_meta'"
+                ).fetchone()[0]
+                > 0
+            )
+            if tables == 0 or not has_app_meta:
+                print(
+                    "ОШИБКА: исходная БД пуста (0 таблиц) или не является базой бота (нет таблицы app_meta).",
+                    file=sys.stderr,
+                )
+                return 1
             plaintext_bytes = mem_conn.serialize()
             plaintext_size = len(plaintext_bytes)
+            if plaintext_size == 0:
+                print("ОШИБКА: сериализованный снимок пуст (0 байт).", file=sys.stderr)
+                return 1
     except Exception as exc:
         print(f"ОШИБКА: не удалось создать снимок базы в памяти: {exc}", file=sys.stderr)
         return 1
@@ -234,8 +341,19 @@ def cmd_export(args: argparse.Namespace, now: float | None = None) -> int:
         print("ОШИБКА: age вернул пустой шифротекст.", file=sys.stderr)
         return 1
 
+    if not ciphertext.startswith(b"age-encryption.org/v1"):
+        print(
+            "ОШИБКА: вывод age не содержит заголовок age-encryption.org/v1 (возможна ошибка AGE_BIN или открытый текст).",
+            file=sys.stderr,
+        )
+        return 1
+
     out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"ОШИБКА: не удалось создать каталог вывода {out_dir}: {exc}", file=sys.stderr)
+        return 1
 
     cur_time = args.now if args.now is not None else (time.time() if now is None else now)
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(cur_time))
@@ -243,6 +361,9 @@ def cmd_export(args: argparse.Namespace, now: float | None = None) -> int:
 
     final_name = f"{db_path.stem}-{stamp}-{args.tag}.db.age"
     final_path = out_dir / final_name
+    if final_path.exists():
+        print(f"ОШИБКА: файл экспорта уже существует: {final_path}", file=sys.stderr)
+        return 1
     partial_path = out_dir / f"{final_name}.partial"
 
     cipher_sha256 = hashlib.sha256(ciphertext).hexdigest()
@@ -306,11 +427,17 @@ def cmd_restore(args: argparse.Namespace, now: float | None = None) -> int:
 
     target_db = Path(args.db)
     wal_file = target_db.with_name(f"{target_db.name}-wal")
-    if wal_file.exists() and wal_file.stat().st_size > 0:
+    shm_file = target_db.with_name(f"{target_db.name}-shm")
+    if (wal_file.exists() and wal_file.stat().st_size > 0) or shm_file.exists():
+        active = []
+        if wal_file.exists() and wal_file.stat().st_size > 0:
+            active.append(f"{wal_file.name} ({wal_file.stat().st_size} байт)")
+        if shm_file.exists():
+            active.append(f"{shm_file.name}")
         print(
-            f"ОШИБКА: обнаружен активный WAL-файл {wal_file} (размер {wal_file.stat().st_size} байт). "
+            f"ОШИБКА: обнаружен активный WAL-файл / SHM-файл ({', '.join(active)}). "
             "Контейнер запущен или БД не была корректно закрыта. "
-            "Остановите контейнер и дождитесь сброса WAL перед восстановлением.",
+            "Остановите контейнер (docker compose stop unagi-bot) и дождитесь сброса WAL перед восстановлением.",
             file=sys.stderr,
         )
         return 1
@@ -367,17 +494,24 @@ def cmd_restore(args: argparse.Namespace, now: float | None = None) -> int:
 
     # Запись во временный файл в ЦЕЛЕВОМ каталоге с правами 0600 и немедленный quick_check
     target_dir = target_db.parent
-    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"ОШИБКА: не удалось создать целевой каталог {target_dir}: {exc}", file=sys.stderr)
+        return 1
 
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(
-            dir=target_dir, prefix=f"{target_db.stem}-restore-", suffix=".tmp", delete=False
-        ) as tmp_file:
-            tmp_path = Path(tmp_file.name)
-            tmp_file.write(plaintext_bytes)
-
-        os.chmod(tmp_path, 0o600)
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=target_dir, prefix=f"{target_db.stem}-restore-", suffix=".tmp", delete=False
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                tmp_file.write(plaintext_bytes)
+            os.chmod(tmp_path, 0o600)
+        except OSError as exc:
+            print(f"ОШИБКА: запись временного файла восстановления: {exc}", file=sys.stderr)
+            return 1
 
         # Немедленный PRAGMA quick_check
         try:
@@ -386,47 +520,71 @@ def cmd_restore(args: argparse.Namespace, now: float | None = None) -> int:
                 if verdict != "ok":
                     print(f"ОШИБКА: PRAGMA quick_check расшифрованной БД: {verdict}", file=sys.stderr)
                     return 5
-                _, restored_user_version, restored_app_schema = extract_db_meta(conn)
+                restored_tables, restored_user_version, restored_app_schema = extract_db_meta(conn)
+                has_app_meta = (
+                    conn.execute(
+                        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'app_meta'"
+                    ).fetchone()[0]
+                    > 0
+                )
+                if restored_tables == 0 or not has_app_meta:
+                    print(
+                        "ОШИБКА: расшифрованная БД пуста (0 таблиц) или не является базой бота (нет таблицы app_meta).",
+                        file=sys.stderr,
+                    )
+                    return 5
+                restored_structure = get_db_schema_structure(conn)
         except sqlite3.Error as exc:
             print(f"ОШИБКА: расшифрованный файл повреждён: {exc}", file=sys.stderr)
             return 5
 
         # (3) сравнение версии схемы
+        target_structure = None
         if target_db.is_file():
             try:
                 with closing(sqlite3.connect(str(target_db))) as tconn:
                     _, target_user_version, target_app_schema = extract_db_meta(tconn)
+                    target_structure = get_db_schema_structure(tconn)
             except sqlite3.Error:
                 target_user_version = 0
-                target_app_schema = "utc_v1"
+                target_app_schema = "unknown"
+                target_structure = get_code_schema_structure()
         else:
             target_user_version = 0
-            target_app_schema = "utc_v1"
+            target_app_schema = "code"
+            code_struct = get_code_schema_structure()
+            if code_struct and any(tbl in code_struct for tbl in restored_structure if tbl != "app_meta"):
+                target_structure = code_struct
 
-        is_newer, is_older = compare_schemas(
+        cmp_res = compare_schemas(
             restored_app_schema,
             restored_user_version,
             target_app_schema,
             target_user_version,
+            export_structure=restored_structure,
+            target_structure=target_structure,
         )
+        is_newer, is_older = cmp_res
 
         if is_newer:
+            diff_suffix = f" [{cmp_res.reason}]" if cmp_res.reason else ""
             if not args.force_schema:
                 print(
                     f"ОШИБКА: схема экспорта ({restored_app_schema}, user_version={restored_user_version}) "
-                    f"НОВЕЕ схемы целевой БД/кода ({target_app_schema}, user_version={target_user_version}). "
+                    f"НОВЕЕ схемы целевой БД/кода ({target_app_schema}, user_version={target_user_version}){diff_suffix}. "
                     "Отказ. Используйте --force-schema для принудительного восстановления.",
                     file=sys.stderr,
                 )
                 return 3
             print(
-                f"ПРЕДУПРЕЖДЕНИЕ: схема экспорта ({restored_app_schema}) новее целевой БД ({target_app_schema}); "
+                f"ПРЕДУПРЕЖДЕНИЕ: схема экспорта ({restored_app_schema}) новее целевой БД ({target_app_schema}){diff_suffix}; "
                 "восстановление разрешено через --force-schema.",
                 file=sys.stderr,
             )
         elif is_older:
+            diff_suffix = f" [{cmp_res.reason}]" if cmp_res.reason else ""
             print(
-                f"ПРЕДУПРЕЖДЕНИЕ: схема экспорта ({restored_app_schema}) старее схемы целевой БД ({target_app_schema}).",
+                f"ПРЕДУПРЕЖДЕНИЕ: схема экспорта ({restored_app_schema}) старее схемы целевой БД ({target_app_schema}){diff_suffix}.",
                 file=sys.stderr,
             )
 
@@ -444,6 +602,12 @@ def cmd_restore(args: argparse.Namespace, now: float | None = None) -> int:
             try:
                 snap_path, snap_size, snap_tables = snapshot(target_db, backup_dir, tag="prerestore", now=cur_time)
                 print(f"prerestore backup ok path={snap_path} size={snap_size} tables={snap_tables}")
+                try:
+                    if rotate and compress_old_snapshots:
+                        rotate(target_db, backup_dir, "prerestore", keep=14)
+                        compress_old_snapshots(target_db, backup_dir, "prerestore", keep_raw=2)
+                except Exception as clean_exc:
+                    print(f"ПРЕДУПРЕЖДЕНИЕ: уборка снимков prerestore не завершена: {clean_exc}", file=sys.stderr)
             except Exception as exc:
                 print(f"ОШИБКА: обязательный снимок перед заменой не создан: {exc}", file=sys.stderr)
                 return 4

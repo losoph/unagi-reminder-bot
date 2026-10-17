@@ -6,6 +6,9 @@ __pycache__
 *.db
 *.db-shm
 *.db-wal
+storage/exports/
+*.age
+*.partial
 .env
 .env.local
 .DS_Store
