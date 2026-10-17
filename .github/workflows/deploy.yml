@@ -63,7 +63,20 @@ jobs:
             # --- end sync
             # Снимок БД до пересборки (миграции только добавляют, но откат данных должен быть возможен). Нет снимка — нет деплоя.
             python3 ops/aiqu/backup_db.py --db storage/bot_data.db || { echo "резервная копия не создана — деплой остановлен"; exit 1; }
+            # Откатный тег: помечаем текущий образ перед сборкой (если образ есть; prune не удаляет тегированные образы).
+            docker tag unagi-reminder-bot-bot:latest unagi-reminder-bot-bot:rollback 2>/dev/null || true
+            export GIT_SHA="$(git rev-parse --short HEAD)"
             docker compose up -d --build
+            # --- liveness (tests/test_dep2_deploy_verify.py исполняет этот блок во временной среде)
+            sleep "${DEPLOY_WAIT_SECS:-20}"
+            status="$(docker inspect -f '{{.State.Status}}' unagi-bot 2>/dev/null || echo missing)"
+            restarts="$(docker inspect -f '{{.State.RestartCount}}' unagi-bot 2>/dev/null || echo -1)"
+            if [ "$status" != "running" ] || [ "$restarts" != "0" ]; then
+              echo "деплой остановлен: контейнер не в статусе running или перезапускался (status=$status, restart_count=$restarts)"
+              docker logs --tail 30 unagi-bot || true
+              exit 1
+            fi
+            # --- end liveness
             # Диск: каждая пересборка оставляет прежние слои образа и кеш сборки (78% → 82% за три деплоя 17.10, порог тревоги prod_check — 85%).
             # Только висячие образы и старый кеш сборки; запущенный контейнер и его образ не затрагиваются. Сбой очистки деплой не ломает.
             docker image prune -f || true

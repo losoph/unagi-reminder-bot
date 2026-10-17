@@ -4,6 +4,7 @@ services:
       context: .
     container_name: unagi-bot
     restart: unless-stopped
+    labels: {org.unagi.git_sha: "${GIT_SHA:-unknown}"}
     # host оставлен сознательно: бот наследует маршрутизацию хоста (OVPN-туннель до Telegram DC
     # после переезда, см. ops/aiqu/README.md). Убрать — только вместе с проверкой маршрутов.
     network_mode: host
