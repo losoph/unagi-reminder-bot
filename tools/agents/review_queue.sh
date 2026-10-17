@@ -10,7 +10,8 @@ OUT="$MAIN/.agents/reviews"; mkdir -p "$OUT"
 FACTS="$(python3 "$MAIN/tools/agents/orchestra.py" get facts | python3 -c 'import json,sys; [print("- "+f) for f in json.loads(sys.stdin.read())]')"
 review_one() {
   local wt="$1" tag="$2" waited=0 limit="${REVIEW_WAIT_MIN:-180}"
-  until git -C "$wt" log --oneline -40 | grep -qF "($tag)"; do
+  # не `git log | grep -q`: при pipefail ранний выход grep -q даёт SIGPIPE у git и условие никогда не выполняется
+  until [[ "$(git -C "$wt" log --oneline -40)" == *"($tag)"* ]]; do
     sleep 60; waited=$((waited + 1))
     [ "$waited" -lt "$limit" ] || { echo "$tag: маркер не появился за ${limit} мин" > "$OUT/$tag.txt"; return 1; }
   done
