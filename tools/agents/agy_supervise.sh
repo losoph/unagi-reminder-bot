@@ -12,7 +12,7 @@ LOG_DIR="${AGY_LOG_DIR:-.agy}"; mkdir -p "$LOG_DIR"
 SUP="$LOG_DIR/supervise.log"
 say() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$SUP"; }
 
-_size() { wc -c < "$LOG_DIR/session.ndjson" 2>/dev/null || echo 0; }
+_size() { [ -f "$LOG_DIR/session.ndjson" ] && wc -c < "$LOG_DIR/session.ndjson" || echo 0; }
 prev="$(_size)"; sleep 20
 while [ "$(_size)" != "$prev" ]; do prev="$(_size)"; sleep 20; done
 
