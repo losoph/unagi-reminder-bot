@@ -1,0 +1,5 @@
+# Разовое письмо с итогами спринта 17–18.10: воскресенье 18.10.2026, 19:00 МСК (часовой пояс сервера Europe/Moscow).
+# Отправляет ровно один раз (флаг в /var/lib/tldw/unagi); устанавливается деплоем (.github/workflows/deploy.yml). Текст — docs/ALERT-SPRINT-2026-10-18.md.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 19 18 10 * root /root/projects/unagi-reminder-bot/ops/aiqu/unagi-status-alert.sh --once 2026-10-18 --file docs/ALERT-SPRINT-2026-10-18.md --subject "[aiqu] unagi: итоги спринта 17-18.10, развилки и следующие шаги" >> /var/log/unagi-status-alert.log 2>&1

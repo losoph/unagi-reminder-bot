@@ -68,3 +68,5 @@ jobs:
             # Только висячие образы и старый кеш сборки; запущенный контейнер и его образ не затрагиваются. Сбой очистки деплой не ломает.
             docker image prune -f || true
             docker builder prune -f --filter until=6h || true
+            # Cron-файлы из репозитория (разовое письмо с итогами спринта): идемпотентная установка, сбой не ломает деплой.
+            for f in ops/aiqu/cron.d/*; do [ -f "$f" ] && install -m 0644 -o root -g root "$f" "/etc/cron.d/$(basename "$f")" || true; done
