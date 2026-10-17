@@ -4,9 +4,30 @@ services:
       context: .
     container_name: unagi-bot
     restart: unless-stopped
+    # host оставлен сознательно: бот наследует маршрутизацию хоста (OVPN-туннель до Telegram DC
+    # после переезда, см. ops/aiqu/README.md). Убрать — только вместе с проверкой маршрутов.
     network_mode: host
     env_file:
       - .env
+    environment:
+      # Копия SMTP-конфига для пользователя bot (кладёт ops/docker/entrypoint.sh); важнее значения из .env.
+      MSMTPRC_PATH: /run/unagi/msmtprc
+    # Ревью п.7. Процесс бота — uid 10001 без capabilities и с no-new-privileges. Привилегии ниже нужны
+    # только точке входа, пока она от root передаёт storage боту и копирует msmtprc; setuid их снимает.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /run/unagi:size=1m,mode=0755
     volumes:
       - ./storage:/app/storage
       # SMTP для email-дайджестов — тот же msmtp-конфиг, что у серверных алертов.

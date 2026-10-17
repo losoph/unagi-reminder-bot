@@ -38,6 +38,12 @@ remote() {
   newest="$(ls -1t storage/backups/*.db 2>/dev/null | head -n 1)"
   echo "backup_age_h=$([ -n "$newest" ] && echo $(( ( $(date +%s) - $(stat -c %Y "$newest") ) / 3600 )) || echo none)"
   echo "mem=$(docker stats --no-stream --format '{{.MemUsage}}' "$2" 2>/dev/null)"
+  echo "compose_dirty=$(git status --porcelain --untracked-files=no docker-compose.yml | wc -l | tr -d ' ')"
+  proc="$(docker exec "$2" sh -c 'grep -E "^(Uid|CapEff|NoNewPrivs):" /proc/1/status | tr -s "[:blank:]" " " | tr "\n" ";"' 2>&1 | cut -c1-150)"
+  echo "proc=$proc"
+  # Тот же пользователь, под которым работает бот: от root файл msmtprc читается всегда и проверка ничего бы не показала.
+  uid="$(printf '%s' "$proc" | sed -n 's/^Uid: \([0-9]*\) .*/\1/p')"
+  echo "email=$(docker exec -u "${uid:-0}" "$2" python -c 'import email_digest; print(email_digest.is_enabled())' 2>&1 | tail -n 1 | cut -c1-100)"
   echo "now=$(date '+%F %T')"
 }
 
@@ -68,4 +74,18 @@ if [ "$age" = none ]; then say WARN "резервные копии: нет"
 elif [ "$age" -gt "${WARN_BACKUP_HOURS:-48}" ]; then say WARN "резервная копия: ${age} ч назад"
 else say OK "резервная копия: ${age} ч назад"; fi
 say OK "память контейнера: $(get mem)"
+[ "$(get compose_dirty)" = 0 ] || say WARN "docker-compose.yml на проде изменён вручную: git pull при деплое может не пройти"
+proc="$(get proc)"
+if printf '%s' "$proc" | grep -q '^Uid: 0 '; then
+  say WARN "права процесса: бот работает от root"
+elif printf '%s' "$proc" | grep -Eq 'CapEff: 0+;' && printf '%s' "$proc" | grep -q 'NoNewPrivs: 1'; then
+  say OK "права процесса: не root, без capabilities, no-new-privs"
+else
+  say WARN "права процесса: $proc"
+fi
+case "$(get email)" in
+  True) say OK "email-дайджесты: SMTP-конфиг читается ботом" ;;
+  False) say WARN "email-дайджесты выключены: нет SMTP-конфига или он недоступен боту" ;;
+  *) say WARN "email-дайджесты: проверка не удалась: $(get email)" ;;
+esac
 exit "$status"

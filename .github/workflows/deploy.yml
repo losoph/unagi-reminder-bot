@@ -3,6 +3,9 @@ name: Deploy to VDS
 on:
   push:
     branches: [ "main" ]
+  # Проверки (без деплоя) на PR: ужесточение контейнера нельзя проверить иначе, чем собрав образ.
+  pull_request:
+    branches: [ "main" ]
 
 permissions:
   contents: read
@@ -17,11 +20,28 @@ jobs:
         run: pipx run ruff==0.16.8 check .
       - name: Build production image
         run: docker build -t unagi-reminder-bot:test .
+      # --entrypoint: тесты идут от root без точки входа, как раньше; под ограничениями контейнера образ проверяет смоук ниже.
       - name: Run regression tests
-        run: docker run --rm unagi-reminder-bot:test python -m unittest discover -s tests -v
+        run: docker run --rm --entrypoint python unagi-reminder-bot:test -m unittest discover -s tests -v
+      # Флаги те же, что в docker-compose.yml (согласованность держит tests/test_container_hardening.py).
+      - name: Smoke test hardened container
+        run: |
+          storage="$(mktemp -d)"
+          secrets="$(mktemp -d)"
+          # Как на проде: msmtprc принадлежит root и закрыт 0600.
+          printf 'defaults\nhost smtp.example.test\nport 587\nfrom unagi@example.test\nuser unagi\npassword secret\n' | sudo tee "$secrets/msmtprc" > /dev/null
+          sudo chown root:root "$secrets/msmtprc"
+          sudo chmod 0600 "$secrets/msmtprc"
+          docker run --rm --network host --read-only \
+            --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add SETUID --cap-add SETGID \
+            --security-opt no-new-privileges:true --tmpfs /tmp:size=64m,mode=1777 --tmpfs /run/unagi:size=1m,mode=0755 \
+            -v "$storage:/app/storage" -v "$secrets/msmtprc:/run/secrets/msmtprc:ro" \
+            -e DB_PATH=/app/storage/bot_data.db -e MSMTPRC_PATH=/run/unagi/msmtprc -e BOT_TOKEN=123456:smoke \
+            unagi-reminder-bot:test python ops/docker/smoke.py
 
   deploy:
     needs: test
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Deploy via SSH
@@ -32,6 +52,7 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT || 22 }}
           script: |
+            set -e
             cd ~/projects/unagi-reminder-bot
             git pull origin main
             # Снимок БД до пересборки (миграции только добавляют, но откат данных должен быть возможен). Нет снимка — нет деплоя.
