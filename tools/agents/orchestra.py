@@ -4,6 +4,7 @@
     orchestra.py show                 # роли, лестницы по видам задач, модели, лимиты, правила
     orchestra.py get <путь.через.точку>   # одно значение, например limits.monitor_digest_sec
     orchestra.py ladder <kind>        # порядок исполнителей для вида задачи, по одному в строке
+    orchestra.py path                 # путь к используемому файлу
     orchestra.py validate             # проверка согласованности; код 1, если найдены проблемы
 
 Файл можно подменить переменной AGENT_ORCHESTRA (тесты, эксперименты). Нет файла или он битый — модули, которые его читают,
@@ -141,6 +142,9 @@ def main(argv: list[str]) -> int:
         steps = ladder(argv[1])
         print("\n".join(steps))
         return 0 if steps else 1
+    if cmd == "path":
+        print(path())
+        return 0
     if cmd == "validate":
         problems = validate()
         for line in problems:

@@ -13,6 +13,7 @@
 #   agents.sh report                                   # что решил Jev, откаты, стоимость решений и качество выдачи агентов
 #   agents.sh rate <agent> <model> <title> <good|partial|bad> [заметка]   # оценка выдачи (журнал .agents/quality.ndjson)
 #   agents.sh orchestra [validate]                     # зафиксированная конфигурация оркестра (tools/agents/orchestra.json): роли, лестницы, лимиты, правила
+#   agents.sh gate <PR> [вопрос]                       # предслиянная сверка: факты среды (orchestra.json) + дифф PR → короткая сверка (agy → dsh → opencode)
 #   agents.sh launch <agent> <worktree> <brief.md> <метка> [kind] [--exec]
 #                                                       # проверки перед запуском (бриф закоммичен, метка не в истории) и готовые команды для вкладки и монитора
 # kind: executor-complex | executor-ux | review | adversarial-review | docs | merge-audit | short-check | strategy (ручной: Argon + Claude)
@@ -23,7 +24,7 @@ agent_env_load OPENROUTER_API_KEY TYPESAFE_API_KEY
 . "$SCRIPT_DIR/dsh_bin.sh"
 PY="${PYTHON:-python3}"
 
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
 
 status() {
   "$PY" "$SCRIPT_DIR/oc_budget.py" status --all
@@ -115,6 +116,18 @@ watch_agent() {
   esac
 }
 
+# Предслиянная сверка PR: факты среды из orchestra.json + дифф (≤ лимита) → короткая сверка независимым исполнителем.
+gate_pr() {
+  [ $# -ge 1 ] || { usage >&2; return 2; }
+  local pr="$1" question="${2:-Найди дефекты, из-за которых слияние этого PR сломает деплой, прод или тесты в среде из «ФАКТЫ СРЕДЫ»: несовместимые значения, зависимость от инструментов, которых нет в CI-образе, пропущенные места использования.}"
+  command -v gh >/dev/null 2>&1 || { echo "gate: нужен gh" >&2; return 2; }
+  local work ctx; work="$(mktemp -d "${TMPDIR:-/tmp}/agents-gate.XXXXXX")"; ctx="$work/context.txt"; trap 'rm -rf "$work"' RETURN
+  { echo "ФАКТЫ СРЕДЫ:"; "$PY" -c 'import json,sys; [print("- "+f) for f in json.load(open(sys.argv[1])).get("facts", [])]' "$("$PY" "$SCRIPT_DIR/orchestra.py" path)"
+    echo; echo "PR #$pr: $(gh pr view "$pr" --json title --jq .title)"; echo; echo "ДИФФ:"; gh pr diff "$pr"; } > "$ctx" 2>/dev/null
+  [ -s "$ctx" ] || { echo "gate: не удалось получить дифф PR #$pr" >&2; return 1; }
+  "$0" check auto "gate-$pr" "$question" "$ctx" "${GATE_LOG:-.agents/gate.ndjson}"
+}
+
 # Проверки перед запуском трека и готовые команды для вкладки терминала и монитора (правила и лимиты — orchestra.json).
 launch_agent() {
   [ $# -ge 4 ] || { usage >&2; return 2; }
@@ -171,6 +184,7 @@ case "$cmd" in
   rate) "$PY" "$SCRIPT_DIR/quality.py" rate "$@" ;;
   orchestra) if [ "${1:-}" = validate ]; then "$PY" "$SCRIPT_DIR/orchestra.py" validate; else "$PY" "$SCRIPT_DIR/orchestra.py" show; fi ;;
   launch) launch_agent "$@" ;;
+  gate) gate_pr "$@" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac
