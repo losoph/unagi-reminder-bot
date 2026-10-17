@@ -39,6 +39,8 @@ remote() {
   stats="$(sqlite3 -readonly storage/bot_data.db < ops/aiqu/prod_stats.sql 2>/dev/null || true)"
   [ -n "$stats" ] && printf '%s\n' "$stats"
   echo "disk_pct=$(df --output=pcent . | tail -n 1 | tr -dc '0-9')"
+  # Чем занят диск: образы, кеш сборки, контейнеры (85–86% после BK1 и prune — неизвестно, что именно растёт). Сбой не ломает проверку.
+  echo "docker_df=$(docker system df --format '{{.Type}} {{.Size}} (можно освободить {{.Reclaimable}})' 2>/dev/null | tr '\n' ';' | cut -c1-300)"
   # Снимки БД (BK1): сколько несжатых и сжатых, сколько места они занимают, и размер самой БД — видно, работает ли сжатие.
   echo "backups_raw=$(ls -1 storage/backups/*.db 2>/dev/null | wc -l | tr -d ' ')"
   echo "backups_gz=$(ls -1 storage/backups/*.db.gz 2>/dev/null | wc -l | tr -d ' ')"
@@ -89,6 +91,7 @@ say OK "сборок Ленты за $SINCE: $(get feed_builds)"
 [ "$(get db_check)" = ok ] && say OK "БД: quick_check ok, таблиц $(get db_tables)" || say ALERT "БД: $(get db_check)"
 disk="$(get disk_pct)"
 if [ "${disk:-100}" -ge "${ALERT_DISK_PCT:-85}" ]; then say ALERT "диск: $disk%"; else say OK "диск: $disk%"; fi
+[ -n "$(get docker_df)" ] && say OK "docker: $(get docker_df)"
 age="$(get backup_age_h)"
 if [ "$age" = none ]; then say WARN "резервные копии: нет"
 elif [ "$age" -gt "${WARN_BACKUP_HOURS:-48}" ]; then say WARN "резервная копия: ${age} ч назад"
