@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,13 @@ TOOLS = ROOT / "tools" / "agents"
 
 def load_orchestra():
     spec = importlib.util.spec_from_file_location("orchestra", TOOLS / "orchestra.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_progress_index():
+    spec = importlib.util.spec_from_file_location("progress_index", TOOLS / "progress_index.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -143,6 +151,68 @@ class LaunchTests(unittest.TestCase):
         proc = self.launch("opencode", str(self.repo), "docs/brief.md", "(T5)")
         self.assertEqual(proc.returncode, 2)
 
+    def test_brief_demanding_append_to_progress_md_warns_without_error(self):
+        (self.repo / "docs" / "legacy.md").write_text("допиши в docs/sprint/progress.md блок T6\n", encoding="utf-8")
+        self.git("add", "docs/legacy.md")
+        self.git("commit", "-q", "-m", "docs: бриф со старым протоколом")
+        proc = self.launch("agy", str(self.repo), "docs/legacy.md", "(T6)")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("docs/sprint/progress.md", proc.stderr)
+        self.assertIn("docs/sprint/progress/<МЕТКА>.md", proc.stderr)
+
+
+class ProgressIndexTests(unittest.TestCase):
+    """Сборка индекса журнала решений (tools/agents/progress_index.py)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.progress_dir = self.dir / "docs" / "sprint" / "progress"
+        self.progress_dir.mkdir(parents=True)
+        self.mod = load_progress_index()
+
+    def test_synthetic_directory_index_collection_and_formatting(self):
+        (self.progress_dir / "README.md").write_text("# Игнорируемый индекс\n", encoding="utf-8")
+        (self.progress_dir / "T10.md").write_text(
+            "## T10 Управление алертами\n- Решение: inline-кнопки\n- Компромисс: нет\n",
+            encoding="utf-8",
+        )
+        (self.progress_dir / "PRG1.md").write_text(
+            "# PRG1 Убрать конфликты — (PRG1)\n- Решение: per-task файлы\n",
+            encoding="utf-8",
+        )
+
+        entries = self.mod.collect_progress_entries(self.progress_dir)
+        labels = [e["label"] for e in entries]
+        self.assertIn("T10", labels)
+        self.assertIn("PRG1", labels)
+        self.assertNotIn("README", labels)
+
+        t10_entry = next(e for e in entries if e["label"] == "T10")
+        self.assertEqual(t10_entry["title"], "T10 Управление алертами")
+        self.assertEqual(t10_entry["filename"], "T10.md")
+        self.assertTrue(t10_entry["commit_date"])
+
+        md = self.mod.format_index_markdown(entries)
+        self.assertIn("| Метка | Дата коммита | Заголовок | Файл |", md)
+        self.assertIn("PRG1", md)
+        self.assertIn("T10", md)
+        self.assertIn("T10.md", md)
+
+    def test_cli_execution_on_synthetic_dir(self):
+        (self.progress_dir / "SEC1.md").write_text("## SEC1 Безопасность\n- Решение: правки\n", encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(TOOLS / "progress_index.py"), str(self.progress_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SEC1", proc.stdout)
+        self.assertIn("Безопасность", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
+
