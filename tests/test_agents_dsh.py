@@ -227,6 +227,40 @@ class AgentsShTests(DshBase):
         self.assertIn("oc_variants.py apply", proc.stderr)
         self.assertFalse((self.dir / "opencode-started").exists())
 
+    def _oc_args_after_run(self, *flags):
+        fake_oc = self.dir / "bin" / "opencode"
+        fake_oc.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > '{self.dir}/oc-args.txt'\n", encoding="utf-8")
+        fake_oc.chmod(fake_oc.stat().st_mode | stat.S_IEXEC)
+        env = self.env | {"PATH": f"{self.dir / 'bin'}:{os.environ['PATH']}", "OC_BUDGET": "off"}
+        proc = self.run_script("oc_run.sh", self.worktree, "Tokenn/gpt-6.1-sol", self.brief, self.dir / "o.ndjson", "OC", *flags, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return (self.dir / "oc-args.txt").read_text(encoding="utf-8")
+
+    def test_oc_run_attaches_the_brief_by_default(self):
+        text = self._oc_args_after_run("--review")
+        self.assertIn("\n-f\n", f"\n{text}")
+        self.assertIn(str(self.brief), text)
+        self.assertNotIn("сделай дело", text)
+
+    def test_oc_run_inline_sends_the_brief_text_in_the_message_without_attachment(self):
+        # gpt-6.1-sol не получает содержимое вложения: короткие сверки без инструментов идут текстом в сообщении.
+        text = self._oc_args_after_run("--review", "--inline")
+        self.assertNotIn("\n-f\n", f"\n{text}")
+        self.assertIn("сделай дело", text)
+        self.assertIn("Do not modify any files or create commits.", text)
+
+    def test_oc_run_stops_a_hung_agent_by_wall_clock(self):
+        # Зависший шлюз (ни одного события) не должен держать наблюдателя: OC_RUN_TIMEOUT прерывает прогон кодом 142.
+        fake_oc = self.dir / "bin" / "opencode"
+        fake_oc.write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
+        fake_oc.chmod(fake_oc.stat().st_mode | stat.S_IEXEC)
+        env = self.env | {"PATH": f"{self.dir / 'bin'}:{os.environ['PATH']}", "OC_BUDGET": "off", "OC_RUN_TIMEOUT": "1"}
+        started = time.monotonic()
+        proc = self.run_script("oc_run.sh", self.worktree, "Tokenn/gpt-6.1-sol", self.brief, self.dir / "o.ndjson", "OC", "--inline", env=env)
+        self.assertEqual(proc.returncode, 142, proc.stderr)
+        self.assertIn("OC_RUN_TIMEOUT", proc.stderr)
+        self.assertLess(time.monotonic() - started, 15)
+
     def test_oc_variants_apply_adds_only_variants_backs_up_and_is_idempotent(self):
         config = self.dir / "opencode.json"
         original = {"model": "x", "provider": {"Tokenn": {"options": {"apiKey": "SECRET-DO-NOT-PRINT"}, "models": {"codex-5.3": {"name": "codex-5.3"}, "gpt-6.1-sol": {"variants": {"low": {"reasoningEffort": "minimal"}}}}}}}

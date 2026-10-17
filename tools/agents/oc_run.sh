@@ -3,14 +3,15 @@
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ "$#" -lt 5 ]; then
-  echo "использование: oc_run.sh <worktree> <model> <brief.md> <log.ndjson> <title> [--review] [--effort low|medium|high]" >&2
+  echo "использование: oc_run.sh <worktree> <model> <brief.md> <log.ndjson> <title> [--review] [--inline] [--effort low|medium|high]" >&2
   exit 2
 fi
 WORKTREE="$1" MODEL="$2" BRIEF="$3" LOG="$4" TITLE="$5"; shift 5
-MODE="" EFFORT=""
+MODE="" EFFORT="" INLINE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --review) MODE="--review"; shift ;;
+    --inline) INLINE=1; shift ;;
     --effort) EFFORT="${2:?нужен уровень}"; shift 2 ;;
     *) echo "неизвестный аргумент: $1" >&2; exit 2 ;;
   esac
@@ -38,13 +39,27 @@ MESSAGE="Read the task brief, complete it, run the relevant checks, and commit t
 if [ "$MODE" = "--review" ]; then
   MESSAGE="Read the task brief and review the current changes. Do not modify any files or create commits."
 fi
+# --inline: текст брифа идёт прямо в сообщение, без вложения `-f`. Нужен для коротких сверок без инструментов: gpt-6.1-sol
+# содержимого вложения не получает (видит только имя brief.md), а бриф сверки запрещает читать файлы — модель отвечала «нет diff».
+OC_ARGS=(run --standalone --auto --thinking --format json -m "$MODEL" --title "$TITLE")
+if [ "$INLINE" = 1 ]; then
+  if [ "$MODE" = "--review" ]; then
+    MESSAGE="Review the task below. Do not modify any files or create commits."
+  else
+    MESSAGE="Complete the task below, run the relevant checks, and commit the changes locally."
+  fi
+  MESSAGE="$MESSAGE"$'\n\n'"$(cat "$BRIEF")"
+else
+  OC_ARGS+=(-f "$BRIEF")
+fi
 
 # --standalone не использует фоновый сервис opencode: сервис может не видеть ключ провайдера текущего shell и отвечать 401.
 # Предохранитель — прямой потомок этого скрипта (не подоболочка), чтобы остановить соседа `opencode run` по родителю.
 GUARD=(env OC_GUARD_COUNT_FILE="$GUARD_COUNT" python3 -u "$SCRIPT_DIR/oc_budget.py" guard --title "$TITLE")
 [ "${OC_BUDGET:-on}" != "off" ] || GUARD=(cat)
 set +e
-opencode run --standalone --auto --thinking --format json -m "$MODEL" --title "$TITLE" -f "$BRIEF" "$MESSAGE" \
+# Предохранитель по времени: зависший шлюз (прогон без единого события) не должен держать наблюдателя бесконечно. alarm переживает exec.
+perl -e 'alarm shift; exec @ARGV' "${OC_RUN_TIMEOUT:-900}" opencode "${OC_ARGS[@]}" "$MESSAGE" \
   | "${GUARD[@]}" \
   | tee -a "$LOG" | python3 -u "$SCRIPT_DIR/oc_pretty.py"
 codes=("${PIPESTATUS[@]}")
@@ -52,6 +67,7 @@ set -e
 code="${codes[0]}"
 # Предохранитель оборвал поток (код 3): opencode получает SIGPIPE, фиксируем причину, а не «ошибку модели».
 [ "${codes[1]:-0}" = 3 ] && { code=3; echo "⛔ бюджет токенов opencode исчерпан — прогон остановлен" >&2; }
+[ "$code" = 142 ] && echo "⏱ opencode не уложился в ${OC_RUN_TIMEOUT:-900} с (OC_RUN_TIMEOUT) — прогон прерван" >&2
 # Поток не содержит последний шаг прогона: доучитываем расход по `opencode stats` (источник истины).
 [ "${OC_BUDGET:-on}" = "off" ] || python3 "$SCRIPT_DIR/oc_budget.py" settle --title "$TITLE" --before "$BEFORE" --guard-file "$GUARD_COUNT" || true
 python3 - "$LOG" "$TITLE" "$code" <<'PY'
