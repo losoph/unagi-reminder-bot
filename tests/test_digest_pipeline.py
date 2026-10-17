@@ -455,7 +455,7 @@ class FakeClientSession:
         self.pages_map = pages_map
         self.requested_urls = []
 
-    def get(self, url, headers=None):
+    def get(self, url, headers=None, **kwargs):
         self.requested_urls.append(url)
         html = self.pages_map.get(url, "<html><body></body></html>")
         return FakeResponse(html)

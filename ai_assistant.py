@@ -3,6 +3,8 @@ import os
 
 import aiohttp
 
+from http_session import get_session
+
 logger = logging.getLogger(__name__)
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -22,6 +24,7 @@ async def ask(
     *,
     max_tokens: int = 800,
     temperature: float = 0.4,
+    session: aiohttp.ClientSession | None = None,
 ) -> str | None:
     """Send a single-turn prompt to DeepSeek. Returns None if disabled or on error."""
     if not DEEPSEEK_API_KEY:
@@ -42,18 +45,20 @@ async def ask(
         "Content-Type": "application/json",
     }
 
+    http_sess = session or get_session()
     try:
-        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
-            async with session.post(
-                f"{DEEPSEEK_BASE_URL}/chat/completions",
-                json=payload,
-                headers=headers,
-            ) as response:
-                if response.status != 200:
-                    body = await response.text()
-                    logger.error("DeepSeek HTTP %s: %s", response.status, body[:300])
-                    return None
-                data = await response.json()
+        post_req = http_sess.post(
+            f"{DEEPSEEK_BASE_URL}/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        async with post_req as response:
+            if response.status != 200:
+                body = await response.text()
+                logger.error("DeepSeek HTTP %s: %s", response.status, body[:300])
+                return None
+            data = await response.json()
         return (data["choices"][0]["message"]["content"] or "").strip() or None
     except Exception:
         logger.exception("DeepSeek request failed")
