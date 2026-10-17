@@ -62,7 +62,7 @@ class DigestEmailRenderingTests(unittest.TestCase):
         # Summary line, per-channel heading, bold first sentence and «Читать» link — as on Telegraph.
         self.assertIn("2 канала · 3 поста", html_body)
         self.assertIn("<h4", html_body)
-        self.assertIn("<b>Первое предложение.</b>", html_body)
+        self.assertIn("<b>Первое предложение</b>", html_body)
         self.assertIn('href="https://t.me/example/1"', html_body)
         self.assertIn(">Читать</a>", html_body)
 

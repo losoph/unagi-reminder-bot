@@ -6,6 +6,12 @@ import re
 import aiohttp
 
 from data.database import delete_app_meta, get_app_meta, set_app_meta
+from feed_render import (
+    _clean_post_text,
+    _extract_title_and_essence,
+    _normalize_caps_title,
+    _truncate_by_word,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +93,12 @@ def _build_summary(sections: list[dict]) -> list:
     minutes = max(1, round(total_words / _READING_WPM))
     summary_line = f"{describe_counts(len(sections), total_posts)} · ~{minutes} мин чтения"
     items = [
-        {"tag": "li", "children": [f"{section.get('title') or 'Канал'} — {len(section.get('posts', []))}"]}
+        {
+            "tag": "li",
+            "children": [
+                f"{section.get('title') or 'Канал'} — {plural_ru(len(section.get('posts', [])), 'пост', 'поста', 'постов')}"
+            ],
+        }
         for section in sections
     ]
     return [
@@ -97,25 +108,67 @@ def _build_summary(sections: list[dict]) -> list:
     ]
 
 
+def _build_card_node(title: str, essence: str, link: str | None = None) -> dict:
+    children: list = [{"tag": "b", "children": [title]}]
+    if link:
+        children.append("  ")
+        children.append({"tag": "a", "attrs": {"href": str(link)}, "children": ["Читать"]})
+    if essence:
+        children.append({"tag": "br"})
+        children.append(essence)
+    return {"tag": "p", "children": children}
+
+
 def _build_post_node(post: dict, max_chars: int | None = None) -> dict:
     if max_chars is None:
         max_chars = TELEGRAPH_POST_CHARS
     text = (post.get("text") or "").strip()
     if max_chars and len(text) > max_chars:
-        text = text[: max_chars - 3] + "..."
-    children: list = []
-    if text:
-        first, rest = _split_first_sentence(text)
-        children.append("🔹 ")
-        children.append({"tag": "b", "children": [first]})
-        if rest:
-            children.append(" " + rest)
-    link = post.get("link")
-    if link:
-        if children:
-            children.append("  ")
-        children.append({"tag": "a", "attrs": {"href": link}, "children": ["Читать"]})
-    return {"tag": "p", "children": children or [" "]}
+        text = text[: max_chars - 1] + "…"
+    clean = _clean_post_text(text)
+    title, essence = _extract_title_and_essence(clean, max_title=140, max_essence=300)
+    if not title:
+        title = "Без названия"
+    return _build_card_node(title, essence, post.get("link"))
+
+
+def _select_channel_posts(posts: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Partition channel posts into cards (up to 3 most substantial) and short items.
+
+    Selection is deterministic: length of essence, presence of link, clean text length.
+    Preserves original relative order within both cards and short items.
+    """
+    if not posts:
+        return [], []
+
+    parsed = []
+    for idx, post in enumerate(posts):
+        text = (post.get("text") or "").strip()
+        if TELEGRAPH_POST_CHARS and len(text) > TELEGRAPH_POST_CHARS:
+            text = text[: TELEGRAPH_POST_CHARS - 1] + "…"
+        clean = _clean_post_text(text)
+        title, essence = _extract_title_and_essence(clean, max_title=140, max_essence=300)
+        if not title:
+            title = "Без названия"
+        has_link = 1 if bool(post.get("link")) else 0
+        parsed.append({
+            "post": post,
+            "title": title,
+            "essence": essence,
+            "clean": clean,
+            "orig_idx": idx,
+            "score": (len(essence), has_link, len(clean), -idx),
+        })
+
+    if len(parsed) <= 3:
+        return parsed, []
+
+    scored = sorted(parsed, key=lambda it: it["score"], reverse=True)
+    card_indices = {it["orig_idx"] for it in scored[:3]}
+
+    cards = [it for it in parsed if it["orig_idx"] in card_indices]
+    shorts = [it for it in parsed if it["orig_idx"] not in card_indices]
+    return cards, shorts
 
 
 def _build_actions_node(actions: dict) -> dict | None:
@@ -152,8 +205,27 @@ def build_content(sections: list[dict], *, with_actions: bool = False) -> list:
         current_group = group
         title = section.get("title") or "Канал"
         nodes.append({"tag": "h4", "children": [str(title)]})
-        for post in section.get("posts", []):
-            nodes.append(_build_post_node(post))
+        cards, shorts = _select_channel_posts(section.get("posts", []))
+        for card in cards:
+            nodes.append(_build_card_node(card["title"], card["essence"], card["post"].get("link")))
+        if shorts:
+            nodes.append({"tag": "p", "children": [{"tag": "b", "children": ["Коротко"]}]})
+            short_li = []
+            for item in shorts:
+                clean = item["clean"]
+                clean_len = len(" ".join(clean.split()))
+                if clean_len < 80:
+                    short_title = _normalize_caps_title(" ".join(clean.split()))
+                else:
+                    short_title = item["title"]
+                short_title = _truncate_by_word(short_title or "Без названия", 100)
+                link = item["post"].get("link")
+                if link:
+                    li_children = [{"tag": "a", "attrs": {"href": str(link)}, "children": [short_title]}]
+                else:
+                    li_children = [short_title]
+                short_li.append({"tag": "li", "children": li_children})
+            nodes.append({"tag": "ul", "children": short_li})
         omitted_count = section.get("omitted_count", 0)
         ch_user = (section.get("username") or section.get("channel_username") or "").lstrip("@")
         if omitted_count > 0 and ch_user:
@@ -173,15 +245,36 @@ def build_content(sections: list[dict], *, with_actions: bool = False) -> list:
     return nodes
 
 
+def _is_short_label(node: dict) -> bool:
+    if isinstance(node, dict) and node.get("tag") == "p":
+        children = node.get("children", [])
+        if len(children) == 1 and isinstance(children[0], dict) and children[0].get("tag") == "b":
+            return children[0].get("children") in (["Коротко"], ["Коротко:"])
+    return False
+
+
 def _is_post_node(node: dict) -> bool:
-    if not isinstance(node, dict) or node.get("tag") != "p":
+    if not isinstance(node, dict):
+        return False
+    tag = node.get("tag")
+    if tag == "li":
+        return True
+    if tag != "p":
+        return False
+    if _is_short_label(node):
         return False
     children = node.get("children", [])
     for child in children:
         if child == "🔹 ":
             return True
-        if isinstance(child, dict) and child.get("tag") == "a" and child.get("children") == ["Читать"]:
-            return True
+        if isinstance(child, dict):
+            if child.get("tag") == "a" and child.get("children") == ["Читать"]:
+                return True
+            if child.get("tag") == "b":
+                b_text = "".join(str(c) for c in child.get("children", []))
+                if "⚠️ Выпуск усечён" in b_text or "мин чтения" in b_text:
+                    return False
+                return True
     return False
 
 
@@ -210,26 +303,50 @@ def _truncate_to_limit(content: list, max_bytes: int = _MAX_CONTENT_BYTES) -> li
     if _content_bytes(content) <= max_bytes:
         return content
 
+    # Keep track of table-of-contents ul (if present) so it is not truncated as a post list
+    toc_ul = content[1] if len(content) > 1 and content[1].get("tag") == "ul" else None
+
     omitted_posts = 0
     while content:
         notice = _build_truncation_notice(omitted_posts + 1)
         if _content_bytes(content + [notice]) <= max_bytes:
             break
+
+        if content[-1].get("tag") == "ul" and content[-1] is not toc_ul:
+            ul_children = content[-1].get("children")
+            if ul_children:
+                ul_children.pop()
+                omitted_posts += 1
+            if not ul_children:
+                content.pop()
+            continue
+
         node = content.pop()
         if _is_post_node(node):
             omitted_posts += 1
 
-    # Remove trailing empty group/channel headers or hr
-    while content and content[-1].get("tag") in ("h3", "h4", "hr"):
+    # Remove trailing empty group/channel headers, hr, or short labels
+    while content and (content[-1].get("tag") in ("h3", "h4", "hr") or _is_short_label(content[-1])):
         content.pop()
 
     if omitted_posts > 0:
         notice = _build_truncation_notice(omitted_posts)
         while content and _content_bytes(content + [notice]) > max_bytes:
+            if content[-1].get("tag") == "ul" and content[-1] is not toc_ul:
+                ul_children = content[-1].get("children")
+                if ul_children:
+                    ul_children.pop()
+                    omitted_posts += 1
+                    notice = _build_truncation_notice(omitted_posts)
+                if not ul_children:
+                    content.pop()
+                continue
             node = content.pop()
             if _is_post_node(node):
                 omitted_posts += 1
                 notice = _build_truncation_notice(omitted_posts)
+        while content and (content[-1].get("tag") in ("h3", "h4", "hr") or _is_short_label(content[-1])):
+            content.pop()
         content.append(notice)
         logger.warning(
             "Telegraph content truncated to %d bytes: %d posts omitted",
