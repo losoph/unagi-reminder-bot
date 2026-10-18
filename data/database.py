@@ -656,6 +656,10 @@ def init_db():
             "ALTER TABLE channel_posts ADD COLUMN fwd_from_post_id INTEGER",
             "ALTER TABLE channels ADD COLUMN channel_id INTEGER",
             "ALTER TABLE channels ADD COLUMN feed_backfilled_at DATETIME",
+            # raw_feed для ghsub: '' — медиа нет, NULL — неизвестно (посты до этой миграции).
+            "ALTER TABLE channel_posts ADD COLUMN media_kind TEXT",
+            "ALTER TABLE channel_posts ADD COLUMN is_forward INTEGER",
+            "ALTER TABLE channel_posts ADD COLUMN link_urls TEXT",
             "ALTER TABLE user_alert_settings ADD COLUMN last_alert_sent_at DATETIME",
             "ALTER TABLE user_alert_settings ADD COLUMN consecutive_failures INTEGER DEFAULT 0",
         ):
@@ -1872,6 +1876,9 @@ def upsert_channel_posts(channel_username: str, posts: list[dict], source: str) 
             serialize_datetime(post["metrics_at"]) if post.get("metrics_at") else None,
             post.get("fwd_from_channel_id"),
             post.get("fwd_from_post_id"),
+            post.get("media_kind"),
+            None if post.get("is_forward") is None else int(bool(post["is_forward"])),
+            json.dumps(post["link_urls"], ensure_ascii=False) if post.get("link_urls") is not None else None,
         )
         for post in posts
         if post.get("id") is not None
@@ -1885,9 +1892,9 @@ def upsert_channel_posts(channel_username: str, posts: list[dict], source: str) 
             INSERT INTO channel_posts (
                 channel_username, post_id, post_text, post_link, post_time, source, created_at,
                 views, reactions_total, reactions_json, forwards, replies, metrics_at,
-                fwd_from_channel_id, fwd_from_post_id
+                fwd_from_channel_id, fwd_from_post_id, media_kind, is_forward, link_urls
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_username, post_id) DO UPDATE SET
                 post_text = excluded.post_text,
                 post_link = excluded.post_link,
@@ -1900,7 +1907,10 @@ def upsert_channel_posts(channel_username: str, posts: list[dict], source: str) 
                 replies = CASE WHEN excluded.metrics_at IS NOT NULL THEN excluded.replies ELSE channel_posts.replies END,
                 metrics_at = CASE WHEN excluded.metrics_at IS NOT NULL THEN excluded.metrics_at ELSE channel_posts.metrics_at END,
                 fwd_from_channel_id = COALESCE(excluded.fwd_from_channel_id, channel_posts.fwd_from_channel_id),
-                fwd_from_post_id = COALESCE(excluded.fwd_from_post_id, channel_posts.fwd_from_post_id)
+                fwd_from_post_id = COALESCE(excluded.fwd_from_post_id, channel_posts.fwd_from_post_id),
+                media_kind = COALESCE(excluded.media_kind, channel_posts.media_kind),
+                is_forward = COALESCE(excluded.is_forward, channel_posts.is_forward),
+                link_urls = COALESCE(excluded.link_urls, channel_posts.link_urls)
             ''',
             rows,
         )
@@ -3144,6 +3154,23 @@ def get_email_delivery(user_id: int) -> tuple[str | None, set[str]]:
     return row["email"], {p for p in (row["email_periods"] or "").split(",") if p}
 
 
+FEED_EMAIL_TOKEN = "feed"
+
+
+def list_feed_email_recipients() -> list[tuple[int, str]]:
+    """(user_id, address) пользователей с подтверждённой почтой и включённой почтовой Лентой."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT user_id, email, email_periods FROM user_emails "
+            "WHERE email IS NOT NULL AND email != '' ORDER BY user_id"
+        ).fetchall()
+    return [
+        (row["user_id"], row["email"])
+        for row in rows
+        if FEED_EMAIL_TOKEN in (row["email_periods"] or "").split(",")
+    ]
+
+
 def set_email_period(user_id: int, period: str, enabled: bool) -> bool:
     email, periods = get_email_delivery(user_id)
     if not email:
@@ -3488,6 +3515,9 @@ def get_feed_candidate_posts(
                 cp.metrics_at,
                 cp.fwd_from_channel_id,
                 cp.fwd_from_post_id,
+                cp.media_kind,
+                cp.is_forward,
+                cp.link_urls,
                 c.channel_id,
                 fs.channel_title,
                 fs.tag
@@ -3531,6 +3561,9 @@ def get_feed_candidate_posts(
             "channel_id": row["channel_id"],
             "fwd_from_channel_id": row["fwd_from_channel_id"],
             "fwd_from_post_id": row["fwd_from_post_id"],
+            "media_kind": row["media_kind"],
+            "is_forward": row["is_forward"],
+            "link_urls": row["link_urls"],
         })
     return result
 

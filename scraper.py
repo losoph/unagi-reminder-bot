@@ -49,6 +49,26 @@ def _extract_post_id(link: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
+_WEB_MEDIA_CLASSES = (
+    "tgme_widget_message_photo_wrap",
+    "tgme_widget_message_video_player",
+    "tgme_widget_message_roundvideo_player",
+    "tgme_widget_message_document",
+    "tgme_widget_message_voice_player",
+    "tgme_widget_message_sticker_wrap",
+    "tgme_widget_message_grouped_wrap",
+)
+
+
+def _web_media_kind(msg) -> str:
+    """'' — no media, 'poll' or 'media' for a t.me/s message block (link previews are not media)."""
+    if msg.find(class_="tgme_widget_message_poll") is not None:
+        return "poll"
+    if any(msg.find(class_=cls) is not None for cls in _WEB_MEDIA_CLASSES):
+        return "media"
+    return ""
+
+
 def _parse_channel_html_page(
     html_text: str,
     clean_username: str,
@@ -116,6 +136,11 @@ def _parse_channel_html_page(
                 "time": post_time,
                 "text": text,
                 "link": link,
+                "media_kind": _web_media_kind(msg),
+                "is_forward": msg.find(class_="tgme_widget_message_forwarded_from") is not None,
+                "link_urls": list(dict.fromkeys(
+                    a["href"] for a in text_elem.find_all("a", href=True) if a["href"].startswith(("http://", "https://"))
+                )),
             }
         )
 

@@ -40,6 +40,7 @@ from data.database import (
     CHANNEL_DELIVERY_BATCH_SIZE,
     clear_email_periods,
     confirm_email_code,
+    FEED_EMAIL_TOKEN,
     clear_subscription_failure,
     count_due_subscriptions,
     count_email_sends_for_address,
@@ -133,6 +134,7 @@ dp = Dispatcher()
 import reminders_ux
 import user_prefs
 import feed
+import ghsub_raw_feed
 import bookmarks
 from bookmarks import (  # noqa: F401
     SaveState,
@@ -208,11 +210,13 @@ from digest_settings import (  # noqa: F401
     render_subscription_actions,
     reschedule_user_period,
     resolve_digest_settings,
+    resolve_user_digest_settings,
     resume_all_subscriptions,
     resume_subscription,
     save_digest_monthday,
     save_digest_monthly_mode,
     save_digest_time,
+    sync_weekly_email_schedule,
     save_digest_weekday,
     set_subscription_folder,
     unsubscribe_all_confirmed,
@@ -429,7 +433,8 @@ def chunk_html_text(lines, max_length=4000):
 feed.configure(
     get_next_digest_time=get_next_digest_time,
     format_digest_schedule=format_digest_schedule,
-    resolve_digest_settings=resolve_digest_settings,
+    # Лента в Telegram идёт по времени, выбранному пользователем; почтовое окно ghsub её не касается.
+    resolve_digest_settings=resolve_user_digest_settings,
 )
 
 
@@ -1084,6 +1089,7 @@ async def handle_digest_deep_link(message: types.Message, payload: str) -> bool:
 
     if payload == "em_off":
         if clear_email_periods(user_id):
+            sync_weekly_email_schedule(user_id)
             await message.answer("📭 Письма с дайджестами отключены — все дайджесты снова приходят сюда, в Telegram. Вернуть почту — /email.")
         else:
             await message.answer("Письма с дайджестами и так не приходят. Настроить — /email.")
@@ -3107,6 +3113,16 @@ def build_email_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             ]
             for period in _PERIOD_TITLES
         ]
+        if settings().email.delivery == "ghsub":
+            feed_on = FEED_EMAIL_TOKEN in email_periods
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"Лента за неделю: {'📧 Почта' if feed_on else '— не присылать'}",
+                        callback_data="email_feed_toggle",
+                    )
+                ]
+            )
         rows += [
             [
                 InlineKeyboardButton(text="✏️ Сменить адрес", callback_data="email_set"),
@@ -3157,6 +3173,8 @@ async def toggle_email_period(callback: CallbackQuery):
         return
     to_email = period not in email_periods
     set_email_period(user_id, period, to_email)
+    if period == "weekly":
+        sync_weekly_email_schedule(user_id)
     name = _PERIOD_PLURAL[period]
     warning = (
         f"📧 Теперь {name} дайджесты приходят только на почту {address}.\n\n"
@@ -3169,10 +3187,32 @@ async def toggle_email_period(callback: CallbackQuery):
     await callback.answer(warning, show_alert=True)
 
 
+@dp.callback_query(F.data == "email_feed_toggle")
+async def toggle_email_feed(callback: CallbackQuery):
+    """Почтовая Лента: раз в неделю посты каналов Ленты уходят в ghsub, он отбирает главное в общее письмо."""
+    user_id = user_id_from_callback(callback)
+    address, email_periods = get_email_delivery(user_id)
+    if not address:
+        await callback.answer("Сначала подтверди адрес почты.", show_alert=True)
+        return
+    to_email = FEED_EMAIL_TOKEN not in email_periods
+    set_email_period(user_id, FEED_EMAIL_TOKEN, to_email)
+    text, markup = build_email_menu(user_id)
+    await edit_or_answer(callback, text, reply_markup=markup)
+    await callback.answer(
+        f"📧 Главное из Ленты за неделю будет приходить на {address} в воскресном письме. "
+        "Лента в Telegram работает как раньше."
+        if to_email
+        else "Лента на почту отключена."
+    )
+
+
 @dp.callback_query(F.data == "email_delete")
 async def remove_email(callback: CallbackQuery):
     _, email_periods = get_email_delivery(user_id_from_callback(callback))
     delete_user_email(user_id_from_callback(callback))
+    if "weekly" in email_periods:
+        sync_weekly_email_schedule(user_id_from_callback(callback))
     text, markup = build_email_menu(user_id_from_callback(callback))
     await edit_or_answer(callback, text, reply_markup=markup)
     if email_periods:
@@ -4086,6 +4126,10 @@ async def main():
         asyncio.create_task(run_watchdog_loop(bot), name="watchdog-monitor"),
         asyncio.create_task(feed.run_autodelivery_loop(), name="feed-autodelivery"),
     ]
+    if settings().email.delivery == "ghsub":
+        background_tasks.append(
+            asyncio.create_task(ghsub_raw_feed.run_raw_feed_export_loop(channel_source), name="ghsub-raw-feed")
+        )
     if ai_assistant.is_enabled():
         background_tasks.append(
             asyncio.create_task(ai_assistant.run_key_check_loop(), name="deepseek-key-check")
@@ -4099,6 +4143,8 @@ async def main():
     logger.info("  • Очистка БД: раз в %d часов", CLEANUP_INTERVAL_SECONDS // 3600)
     logger.info("  • Watchdog: проверка каждые %d сек", WATCHDOG_CHECK_INTERVAL_SECONDS)
     logger.info("  • Автодоставка Ленты: проверка каждые %d сек", feed.FEED_AUTODELIVERY_CHECK_SECONDS)
+    if settings().email.delivery == "ghsub":
+        logger.info("  • Выгрузка Ленты для ghsub (raw_feed): по воскресеньям, проверка каждые %d сек", ghsub_raw_feed.CHECK_INTERVAL_SECONDS)
     if ai_assistant.is_enabled():
         logger.info("  • Проверка ключа DeepSeek: раз в %d сек", ai_assistant.KEY_CHECK_INTERVAL_SECONDS)
     logger.info("🚀 Ожидаю входящих сообщений...")

@@ -23,6 +23,33 @@ FEED_METRICS_STALE_THRESHOLDS: dict[str, float] = {
 }
 
 
+def _describe_media_and_links(message) -> tuple[str, list[str]]:
+    """Kind of attached media ('' — none, 'poll', 'media') and URLs hidden from the plain text.
+
+    A link preview (MessageMediaWebPage) is not media: the post is still text. URLs visible
+    in the text are taken from the text itself by the exporters.
+    """
+    media = getattr(message, "media", None)
+    media_name = type(media).__name__ if media is not None else ""
+    if not media_name or media_name == "MessageMediaWebPage":
+        media_kind = ""
+    elif media_name == "MessageMediaPoll":
+        media_kind = "poll"
+    else:
+        media_kind = "media"
+
+    urls: list[str] = []
+    for entity in getattr(message, "entities", None) or []:
+        url = getattr(entity, "url", None)
+        if isinstance(url, str) and url:
+            urls.append(url)
+    if media_name == "MessageMediaWebPage":
+        url = getattr(getattr(media, "webpage", None), "url", None)
+        if isinstance(url, str) and url:
+            urls.append(url)
+    return media_kind, list(dict.fromkeys(urls))
+
+
 class HybridChannelSource:
     """Read channel history through MTProto, with an optional Telegram Web fallback."""
 
@@ -187,6 +214,7 @@ class HybridChannelSource:
                     from_id = getattr(fwd_from, "from_id", None)
                     fwd_from_channel_id = getattr(from_id, "channel_id", None)
                     fwd_from_post_id = getattr(fwd_from, "channel_post", None)
+                media_kind, link_urls = _describe_media_and_links(message)
 
                 posts.append(
                     {
@@ -202,6 +230,9 @@ class HybridChannelSource:
                         "metrics_at": metrics_at,
                         "fwd_from_channel_id": fwd_from_channel_id,
                         "fwd_from_post_id": fwd_from_post_id,
+                        "media_kind": media_kind,
+                        "is_forward": fwd_from is not None,
+                        "link_urls": link_urls,
                     }
                 )
 

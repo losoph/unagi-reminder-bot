@@ -23,6 +23,7 @@ from aiogram.types import (
     Message,
 )
 
+from config import settings as app_settings
 import email_digest
 from data.database import (
     add_subscription,
@@ -118,7 +119,30 @@ def get_default_digest_settings(period: str, now: datetime | None = None) -> dic
     }
 
 
+# ghsub склеивает недельное письмо в воскресенье 07:10 МСК и берёт файлы, лежащие в ящике к 06:15.
+# Цикл дайджестов просыпается раз в DIGEST_CHECK_INTERVAL_SECONDS (по умолчанию 30 мин), поэтому почтовый
+# недельный дайджест ставится на воскресенье 05:00 — с запасом на интервал цикла и чтение каналов.
+GHSUB_WEEKLY_PIN: dict[str, int] = {"weekday": 6, "send_hour": 5, "send_minute": 0}
+
+
+def is_weekly_pinned_for_ghsub(user_id: int) -> bool:
+    """Недельный дайджест уходит на почту через ghsub — его время задаёт ghsub, а не пользователь."""
+    if app_settings().email.delivery != "ghsub":
+        return False
+    _, email_periods = get_email_delivery(user_id)
+    return "weekly" in email_periods
+
+
 def resolve_digest_settings(user_id: int, period: str, now: datetime | None = None) -> dict[str, int | str]:
+    """Расписание, по которому реально уходит дайджест периода (с учётом почтового окна ghsub)."""
+    resolved = resolve_user_digest_settings(user_id, period, now)
+    if period == "weekly" and is_weekly_pinned_for_ghsub(user_id):
+        resolved.update(GHSUB_WEEKLY_PIN)
+    return resolved
+
+
+def resolve_user_digest_settings(user_id: int, period: str, now: datetime | None = None) -> dict[str, int | str]:
+    """Расписание периода, выбранное пользователем (без почтового окна ghsub)."""
     defaults = get_default_digest_settings(period, now)
     stored = get_digest_settings(user_id).get(period)
     if stored is None:
@@ -440,6 +464,12 @@ def render_digest_schedule_text(user_id: int, period: str) -> str:
         "",
         f"Сейчас: {format_digest_schedule(period, settings)}",
     ]
+    if period == "weekly" and is_weekly_pinned_for_ghsub(user_id):
+        lines.append(
+            "📧 Еженедельный дайджест уходит на почту в общем недельном письме, которое собирается "
+            "в воскресенье утром, поэтому он готовится в воскресенье в 05:00. "
+            "Выбранное здесь время вернётся, если переключить дайджест обратно в Telegram."
+        )
     if period == "monthly":
         mode = "по дате" if settings.get("monthly_mode") == "date" else "по дню недели"
         lines.append(f"Режим: {mode}")
@@ -540,6 +570,12 @@ def reschedule_user_period(user_id: int, period: str):
     next_send_at = serialize_datetime(get_next_digest_time(period, local_now(), settings))
     update_subscriptions_next_send_at(user_id, period, next_send_at)
     return next_send_at
+
+
+def sync_weekly_email_schedule(user_id: int) -> None:
+    """Пересчитать недельное расписание после смены почтовой доставки (только при доставке через ghsub)."""
+    if app_settings().email.delivery == "ghsub":
+        reschedule_user_period(user_id, "weekly")
 
 
 async def _refresh_digest_settings(callback: CallbackQuery):
