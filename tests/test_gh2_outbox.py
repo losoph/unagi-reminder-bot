@@ -124,6 +124,8 @@ class Gh2OutboxTests(unittest.TestCase):
             self.assertEqual(files[0], f"{expected_edition_id}.json")
             self.assertEqual(data["kind"], "digest")
             self.assertEqual(data["recipient"], "unagi-42")
+            # Решение 18.10: адрес едет в выпуске (источник правды — unagi), ghsub своего списка для них не ведёт
+            self.assertEqual(data["recipient_email"], "user@example.com")
             self.assertIn("Газета", data["title"])
             self.assertEqual(data["period"], "daily")
 
@@ -341,6 +343,17 @@ class Gh2OutboxTests(unittest.TestCase):
                 # Outbox file should exist
                 files = [f for f in os.listdir(self.tmp_dir) if f.endswith(".json")]
                 self.assertEqual(len(files), 1)
+
+    def test_recipient_email_written_only_for_a_clean_single_line_address(self):
+        """Адрес с переводом строки/пробелом/двумя @ в выпуск не попадает (защита от инъекции заголовков письма в ghsub)."""
+        from ghsub_outbox import build_ghsub_edition
+
+        sections = self._sample_sections(1)
+        for bad in ("a@b.c\nBcc: x@y.z", "a b@c.de", "a@@b.cd", "plain", ""):
+            data = build_ghsub_edition(sections, "Газета", user_id=7, address=bad, scheduled_at="2026-10-18T07:00:00Z")
+            self.assertNotIn("recipient_email", data, repr(bad))
+        data = build_ghsub_edition(sections, "Газета", user_id=7, address="ok@example.com", scheduled_at="2026-10-18T07:00:00Z")
+        self.assertEqual(data["recipient_email"], "ok@example.com")
 
     def test_strip_html_helper(self):
         """Verify strip_html helper."""

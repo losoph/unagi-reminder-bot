@@ -329,6 +329,10 @@ def build_ghsub_edition(
         "items": items,
     }
 
+    # Решение 18.10 (консенсус Claude + Argon + Jev): источник правды об адресе — unagi (подтверждение кодом); ghsub берёт адрес из выпуска.
+    # Только одна строка вида a@b.c без пробелов и переводов строк; иначе поле не пишется и ghsub отклонит выпуск (рядом нет адреса — нет письма).
+    if address and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", address) and len(address) <= 254 and address.isprintable():
+        payload["recipient_email"] = address
     bot_username = get_bot_username()
     if bot_username:
         payload["manage_url"] = f"https://t.me/{bot_username}?start=email"
