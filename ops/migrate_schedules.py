@@ -137,8 +137,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     ):
         try:
             conn.execute(statement)
-        except sqlite3.OperationalError:
-            pass
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_subscriptions_folder ON subscriptions(folder_id, is_disabled)"
