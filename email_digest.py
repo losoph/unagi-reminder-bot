@@ -101,6 +101,8 @@ _CONFIG = load_config()
 
 
 def is_enabled() -> bool:
+    if settings().email.delivery == "ghsub":
+        return True
     return _CONFIG is not None
 
 

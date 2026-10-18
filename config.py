@@ -166,6 +166,8 @@ class EmailConfig:
     smtp_user: str = ""
     smtp_password: str = ""
     smtp_from: str = ""
+    delivery: str = "unagi"
+    outbox_dir: str = "storage/ghsub-outbox"
 
 
 @dataclass(frozen=True)
@@ -293,6 +295,8 @@ def _build_email_config(env: Mapping[str, str]) -> EmailConfig:
         smtp_user=env.get("SMTP_USER", ""),
         smtp_password=env.get("SMTP_PASSWORD", ""),
         smtp_from=env.get("SMTP_FROM", ""),
+        delivery=env.get("EMAIL_DELIVERY", "unagi").strip().lower() or "unagi",
+        outbox_dir=env.get("EMAIL_OUTBOX_DIR", "storage/ghsub-outbox").strip() or "storage/ghsub-outbox",
     )
 
 
