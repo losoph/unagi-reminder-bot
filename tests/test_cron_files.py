@@ -31,13 +31,12 @@ def extract_cron_sync_block() -> str:
 
 
 class CronFilesValidationTests(unittest.TestCase):
-    def test_cron_directory_exists_and_not_empty(self):
+    def test_cron_directory_exists(self):
+        # Разовые письма хостит ghsub (18.10.2026), своих cron-заданий в unagi сейчас нет; каталог держит .gitkeep.
         self.assertTrue(CRON_DIR.is_dir(), f"Каталог {CRON_DIR} должен существовать")
-        files = [p for p in CRON_DIR.iterdir() if p.is_file()]
-        self.assertGreater(len(files), 0, "Каталог cron.d не должен быть пуст")
 
     def test_cron_files_naming_and_formatting(self):
-        files = [p for p in CRON_DIR.iterdir() if p.is_file()]
+        files = [p for p in CRON_DIR.iterdir() if p.is_file() and p.name != ".gitkeep"]
         for cron_file in files:
             name = cron_file.name
             with self.subTest(file=name):
@@ -73,8 +72,10 @@ class CronCleanupExecutionTests(unittest.TestCase):
         # 1. unagi-status-alert (актуальный из репозитория)
         # 2. unagi-stale-job (устаревший, которого нет в репозитории — должен быть удалён)
         # 3. sysstat (системный файл без префикса unagi- — НЕ должен быть удалён)
-        repo_files = [p.name for p in CRON_DIR.iterdir() if p.is_file()]
-        self.assertIn("unagi-status-alert", repo_files)
+        repo_cron = Path(self.tmp.name) / "repo_cron"
+        repo_cron.mkdir()
+        (repo_cron / "unagi-status-alert").write_text("new content\n", encoding="utf-8")
+        repo_files = ["unagi-status-alert"]
 
         current_file = self.mock_etc_cron / "unagi-status-alert"
         stale_file = self.mock_etc_cron / "unagi-stale-job"
@@ -88,11 +89,11 @@ class CronCleanupExecutionTests(unittest.TestCase):
         test_script = f"""
 set -e
 for installed in "{self.mock_etc_cron}"/unagi-*; do
-  if [ -f "$installed" ] && [ ! -f "{CRON_DIR}/$(basename "$installed")" ]; then
+  if [ -f "$installed" ] && [ ! -f "{repo_cron}/$(basename "$installed")" ]; then
     rm -f "$installed" || true
   fi
 done
-for f in "{CRON_DIR}"/*; do
+for f in "{repo_cron}"/*; do
   [ -f "$f" ] && cp "$f" "{self.mock_etc_cron}/$(basename "$f")" || true
 done
 """
@@ -108,7 +109,7 @@ done
         for name in repo_files:
             target = self.mock_etc_cron / name
             self.assertTrue(target.exists(), f"Файл {name} должен быть установлен в {self.mock_etc_cron}")
-            self.assertEqual(target.read_bytes(), (CRON_DIR / name).read_bytes())
+            self.assertEqual(target.read_bytes(), (repo_cron / name).read_bytes())
 
 
 if __name__ == "__main__":

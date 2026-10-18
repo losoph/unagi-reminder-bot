@@ -33,6 +33,7 @@ from data.database import (
     get_channel_feed_backfilled_at,
     get_channel_scan_cursor,
     get_digest_settings,
+    get_email_delivery,
     get_feed_autodelivery,
     get_feed_candidate_posts,
     get_feed_edition,
@@ -59,6 +60,7 @@ from data.database import (
     upsert_channel_posts,
     utc_now,
 )
+import email_digest
 from config import settings
 from feed_ai import FEED_AI_TIMEOUT_SECONDS, build_overview
 from feed_ranking import rank_feed
@@ -240,7 +242,7 @@ def build_feed_edition_keyboard(user_id: int, period: str) -> InlineKeyboardMark
         )
     else:
         autodel_btn = InlineKeyboardButton(
-            text="🔔 Присылать автоматически",
+            text="🔔 Присылать регулярно",
             callback_data=f"feed_autodel_prompt_{period}",
         )
     return InlineKeyboardMarkup(
@@ -454,13 +456,24 @@ def _autodelivery_base(autodelivery_row: dict | Any) -> datetime | None:
 
 
 def autodelivery_schedule_settings(user_id: int, period: str, autodelivery_row: dict | Any) -> dict[str, int | str] | None:
-    """Настройки дайджеста для расписания автодоставки. Без сохранённых настроек день недели/месяца по умолчанию
-    берётся от точки отсчёта, а не от «сегодня»: срок и текст на экране /feed не «плывут» по дням."""
+    """Настройки расписания автодоставки: собственные (время, день недели/месяца), а у старых записей без своего
+    времени — настройки дайджеста. Недостающий день недели/месяца берётся от точки отсчёта, а не от «сегодня»:
+    срок и текст на экране /feed не «плывут» по дням."""
     digest_period = FEED_TO_DIGEST_PERIOD.get(period)
     base_local = _autodelivery_base(autodelivery_row)
     if not digest_period or base_local is None:
         return None
-    return _resolve_digest_settings(user_id, digest_period, now=base_local)
+    resolved = dict(_resolve_digest_settings(user_id, digest_period, now=base_local))
+    keys = autodelivery_row.keys()
+    if "send_hour" in keys and autodelivery_row["send_hour"] is not None:
+        resolved["send_hour"] = int(autodelivery_row["send_hour"])
+        resolved["send_minute"] = int(autodelivery_row["send_minute"] or 0)
+        if autodelivery_row["weekday"] is not None:
+            resolved["weekday"] = int(autodelivery_row["weekday"])
+        if autodelivery_row["month_day"] is not None:
+            resolved["month_day"] = int(autodelivery_row["month_day"])
+        resolved["monthly_mode"] = "date"
+    return resolved
 
 
 def get_autodelivery_due_time(
@@ -708,17 +721,12 @@ def build_feed_main_keyboard(
         rows.append([
             InlineKeyboardButton(text="➕ Из моих подписок", callback_data="feed_personal")
         ])
-    if autodeliveries:
-        p_names = {"day": "день", "week": "неделю", "month": "месяц"}
-        for ad in autodeliveries:
-            p = ad["period"]
-            p_name = p_names.get(p, p)
-            rows.append([
-                InlineKeyboardButton(
-                    text=f"🔕 Отключить автодоставку ({p_name})",
-                    callback_data=f"feed_autodel_off_{p}",
-                )
-            ])
+    rows.append([
+        InlineKeyboardButton(
+            text="🔔 Регулярная отправка" + (f" ({len(autodeliveries)})" if autodeliveries else ""),
+            callback_data="fsch",
+        )
+    ])
     rows.append([
         InlineKeyboardButton(text="ℹ️ Как добавить", callback_data="feed_help")
     ])
@@ -831,14 +839,8 @@ async def render_feed_main(target: types.Message | types.CallbackQuery, user_id:
 
     lines = [f"📰 <b>Лента</b> — главное из {total} каналов"]
     if autodeliveries:
-        p_names = {"day": "день", "week": "неделя", "month": "месяц"}
         for ad in autodeliveries:
-            p = ad["period"]
-            p_nom = p_names.get(p, p)
-            digest_p = FEED_TO_DIGEST_PERIOD.get(p, "weekly")
-            settings = autodelivery_schedule_settings(user_id, p, ad) or _resolve_digest_settings(user_id, digest_p)
-            sched_str = _format_digest_schedule(digest_p, settings)
-            lines.append(f"🔔 <b>Автодоставка</b>: {p_nom} — {sched_str}")
+            lines.append(f"🔔 {_sched_row_text(user_id, ad)}")
     text = "\n\n".join(lines)
     kb = build_feed_main_keyboard(total, show_personal_btn=is_owner, autodeliveries=autodeliveries)
 
@@ -1509,44 +1511,223 @@ async def show_edition_or_feed(callback: types.CallbackQuery, user_id: int, peri
     await render_feed_main(callback, user_id, edit=True)
 
 
+# --- Регулярная отправка Ленты: свой период, время и канал доставки (Telegram / почта) ---------------------------------
+
+_SCHED_PERIOD_TITLES = {"day": "☀️ День", "week": "🗓 Неделя", "month": "📆 Месяц"}
+_SCHED_MONTH_DAYS = (1, 5, 10, 15, 20, 25, 28)
+_WEEKDAY_SHORT_RU = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+
+
+def _sched_row_text(user_id: int, ad: dict) -> str:
+    period = ad["period"]
+    settings_ = autodelivery_schedule_settings(user_id, period, ad) or {}
+    where = "📧 почта" if (ad.get("delivery") or "telegram") == "email" else "💬 Telegram"
+    return f"{_SCHED_PERIOD_TITLES.get(period, period)}: {_format_digest_schedule(FEED_TO_DIGEST_PERIOD[period], settings_)} · {where}"
+
+
+async def _sched_edit(callback: types.CallbackQuery, text: str, rows: list[list[InlineKeyboardButton]]) -> None:
+    if callback.message:
+        try:
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        except TelegramAPIError:
+            pass
+    with contextlib.suppress(TelegramAPIError):  # на запрос уже мог быть дан ответ (выход из «Выкл.»)
+        await callback.answer()
+
+
+def _sched_parse(data: str, prefix: str, count: int) -> list[str] | None:
+    parts = data.removeprefix(prefix).split("_")
+    if len(parts) != count or parts[0] not in FEED_TO_DIGEST_PERIOD:
+        return None
+    return parts
+
+
+def _sched_int(value: str, low: int, high: int) -> int | None:
+    if value == "n":
+        return None
+    try:
+        number = int(value)
+    except ValueError:
+        raise ValueError(value) from None
+    if not low <= number <= high:
+        raise ValueError(value)
+    return number
+
+
+@router.callback_query(F.data == "fsch")
+async def cb_sched_overview(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    ads = {ad["period"]: ad for ad in await asyncio.to_thread(list_user_feed_autodeliveries, user_id)}
+    lines = ["🔔 <b>Регулярная отправка Ленты</b>", "", "Выбери период: Лента будет приходить сама, в выбранное время и туда, куда удобно."]
+    rows = []
+    for period, title in _SCHED_PERIOD_TITLES.items():
+        if period in ads:
+            lines.append(f"• {_sched_row_text(user_id, ads[period])}")
+            rows.append([
+                InlineKeyboardButton(text=f"✏️ {title}", callback_data=f"fschp_{period}"),
+                InlineKeyboardButton(text="🔕 Выкл.", callback_data=f"feed_autodel_off_{period}"),
+            ])
+        else:
+            rows.append([InlineKeyboardButton(text=f"➕ {title}", callback_data=f"fschp_{period}")])
+    rows.append([InlineKeyboardButton(text="🔙 К Ленте", callback_data="feed_main")])
+    await _sched_edit(callback, "\n".join(lines), rows)
+
+
+async def _sched_hours(callback: types.CallbackQuery, period: str) -> None:
+    rows = [
+        [InlineKeyboardButton(text=f"{h:02d}", callback_data=f"fschh_{period}_{h}") for h in range(start, start + 6)]
+        for start in range(0, 24, 6)
+    ]
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="fsch")])
+    await _sched_edit(callback, f"🔔 <b>Лента: {_SCHED_PERIOD_TITLES[period]}</b>\n\nВо сколько присылать? Час (по твоему времени бота):", rows)
+
+
+@router.callback_query(F.data.startswith("fschp_"))
+async def cb_sched_period(callback: types.CallbackQuery):
+    parts = _sched_parse(callback.data, "fschp_", 1)
+    if parts is None:
+        await callback.answer("Эта кнопка устарела. Открой /feed.", show_alert=True)
+        return
+    await _sched_hours(callback, parts[0])
+
+
+@router.callback_query(F.data.startswith("fschh_"))
+async def cb_sched_hour(callback: types.CallbackQuery):
+    parts = _sched_parse(callback.data, "fschh_", 2)
+    try:
+        hour = _sched_int(parts[1], 0, 23) if parts else None
+    except ValueError:
+        hour = None
+    if parts is None or hour is None:
+        await callback.answer("Эта кнопка устарела. Открой /feed.", show_alert=True)
+        return
+    period = parts[0]
+    rows = [[InlineKeyboardButton(text=f"{hour:02d}:{m:02d}", callback_data=f"fschm_{period}_{hour}_{m}") for m in (0, 15, 30, 45)]]
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"fschp_{period}")])
+    await _sched_edit(callback, f"🔔 <b>Лента: {_SCHED_PERIOD_TITLES[period]}</b>\n\nМинуты:", rows)
+
+
+async def _sched_delivery_step(callback: types.CallbackQuery, period: str, hour: int, minute: int, weekday: int | None, month_day: int | None):
+    user_id = callback.from_user.id
+    address, _ = await asyncio.to_thread(get_email_delivery, user_id)
+    email_ok = bool(address) and email_digest.smtp_available()
+    wd = "n" if weekday is None else weekday
+    md = "n" if month_day is None else month_day
+    settings_ = {"send_hour": hour, "send_minute": minute, "weekday": weekday or 0, "month_day": month_day or 1, "monthly_mode": "date"}
+    when = _format_digest_schedule(FEED_TO_DIGEST_PERIOD[period], settings_)
+    rows = [[InlineKeyboardButton(text="💬 В Telegram", callback_data=f"fschx_{period}_{hour}_{minute}_{wd}_{md}_tg")]]
+    if email_ok:
+        rows.append([InlineKeyboardButton(text="📧 На почту", callback_data=f"fschx_{period}_{hour}_{minute}_{wd}_{md}_em")])
+        hint = f"Почта: {html.escape(address)}"
+    else:
+        hint = "Чтобы получать Ленту на почту, подтверди адрес в /email — здесь появится вариант «📧 На почту»."
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"fschh_{period}_{hour}")])
+    await _sched_edit(callback, f"🔔 <b>Лента: {_SCHED_PERIOD_TITLES[period]}</b> — {when}\n\nКуда присылать?\n{hint}", rows)
+
+
+@router.callback_query(F.data.startswith("fschm_"))
+async def cb_sched_minute(callback: types.CallbackQuery):
+    parts = _sched_parse(callback.data, "fschm_", 3)
+    try:
+        hour, minute = (_sched_int(parts[1], 0, 23), _sched_int(parts[2], 0, 59)) if parts else (None, None)
+    except ValueError:
+        hour = minute = None
+    if parts is None or hour is None or minute is None:
+        await callback.answer("Эта кнопка устарела. Открой /feed.", show_alert=True)
+        return
+    period = parts[0]
+    base = f"{period}_{hour}_{minute}"
+    if period == "day":
+        await _sched_delivery_step(callback, period, hour, minute, None, None)
+    elif period == "week":
+        rows = [[InlineKeyboardButton(text=name, callback_data=f"fschw_{base}_{i}") for i, name in enumerate(_WEEKDAY_SHORT_RU)]]
+        rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"fschh_{period}_{hour}")])
+        await _sched_edit(callback, "🔔 <b>Лента: 🗓 Неделя</b>\n\nВ какой день недели?", rows)
+    else:
+        buttons = [InlineKeyboardButton(text=str(d), callback_data=f"fschd_{base}_{d}") for d in _SCHED_MONTH_DAYS]
+        rows = [buttons[:4], buttons[4:]]
+        rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"fschh_{period}_{hour}")])
+        await _sched_edit(callback, "🔔 <b>Лента: 📆 Месяц</b>\n\nКакого числа месяца? (28 — чтобы выпуск был в любом месяце)", rows)
+
+
+@router.callback_query(F.data.startswith("fschw_"))
+async def cb_sched_weekday(callback: types.CallbackQuery):
+    parts = _sched_parse(callback.data, "fschw_", 4)
+    try:
+        values = [_sched_int(parts[1], 0, 23), _sched_int(parts[2], 0, 59), _sched_int(parts[3], 0, 6)] if parts else None
+    except ValueError:
+        values = None
+    if parts is None or values is None or None in values:
+        await callback.answer("Эта кнопка устарела. Открой /feed.", show_alert=True)
+        return
+    await _sched_delivery_step(callback, parts[0], values[0], values[1], values[2], None)
+
+
+@router.callback_query(F.data.startswith("fschd_"))
+async def cb_sched_month_day(callback: types.CallbackQuery):
+    parts = _sched_parse(callback.data, "fschd_", 4)
+    try:
+        values = [_sched_int(parts[1], 0, 23), _sched_int(parts[2], 0, 59), _sched_int(parts[3], 1, 31)] if parts else None
+    except ValueError:
+        values = None
+    if parts is None or values is None or None in values:
+        await callback.answer("Эта кнопка устарела. Открой /feed.", show_alert=True)
+        return
+    await _sched_delivery_step(callback, parts[0], values[0], values[1], None, values[2])
+
+
+@router.callback_query(F.data.startswith("fschx_"))
+async def cb_sched_save(callback: types.CallbackQuery):
+    parts = _sched_parse(callback.data, "fschx_", 6)
+    try:
+        values = (
+            [_sched_int(parts[1], 0, 23), _sched_int(parts[2], 0, 59), _sched_int(parts[3], 0, 6), _sched_int(parts[4], 1, 31)]
+            if parts
+            else None
+        )
+    except ValueError:
+        values = None
+    if parts is None or values is None or values[0] is None or values[1] is None or parts[5] not in {"tg", "em"}:
+        await callback.answer("Эта кнопка устарела. Открой /feed.", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    period = parts[0]
+    delivery = "email" if parts[5] == "em" else "telegram"
+    if delivery == "email":
+        address, _ = await asyncio.to_thread(get_email_delivery, user_id)
+        if not address or not email_digest.smtp_available():
+            await callback.answer("Почта недоступна: подтверди адрес в /email.", show_alert=True)
+            return
+    await asyncio.to_thread(
+        enable_feed_autodelivery,
+        user_id,
+        period,
+        None,
+        send_hour=values[0],
+        send_minute=values[1],
+        weekday=values[2],
+        month_day=values[3],
+        delivery=delivery,
+    )
+    ad = await asyncio.to_thread(get_feed_autodelivery, user_id, period)
+    await callback.answer("✅ Готово", show_alert=False)
+    text = "✅ <b>Регулярная отправка включена</b>\n\n" + _sched_row_text(user_id, ad) if ad else "✅ Готово"
+    await _sched_edit(callback, text, [[InlineKeyboardButton(text="🔔 Расписание Ленты", callback_data="fsch")], [InlineKeyboardButton(text="🔙 К Ленте", callback_data="feed_main")]])
+
+
 @router.callback_query(F.data.startswith("feed_autodel_prompt_"))
 async def cb_feed_autodel_prompt(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
+    """Старая кнопка «Присылать автоматически» под выпуском: открывает выбор времени для этого периода."""
     period = _parse_autodelivery_period(callback.data, "feed_autodel_prompt_")
     if period is None:
         await callback.answer("Эта кнопка устарела. Открой /feed и выбери выпуск снова.", show_alert=True)
         return
-    if await asyncio.to_thread(get_feed_autodelivery, user_id, period):
-        await callback.answer("Автодоставка уже включена.", show_alert=True)
-        await show_edition_or_feed(callback, user_id, period)
-        return
-
-    p_acc = {"day": "день", "week": "неделю", "month": "месяц"}.get(period, period)
-    digest_p = FEED_TO_DIGEST_PERIOD.get(period, "weekly")
-    settings = _resolve_digest_settings(user_id, digest_p)
-    sched_str = _format_digest_schedule(digest_p, settings)
-    text = (
-        f"Лента за {p_acc} будет приходить {sched_str} — в то же время, "
-        f"что дайджест этого периода (меняется в настройках дайджеста)"
-    )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Включить", callback_data=f"feed_autodel_confirm_{period}"),
-                InlineKeyboardButton(text="Отмена", callback_data=f"feed_autodel_cancel_{period}"),
-            ]
-        ]
-    )
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=kb)
-        except TelegramAPIError:
-            pass
-    await callback.answer()
+    await _sched_hours(callback, period)
 
 
 @router.callback_query(F.data.startswith("feed_autodel_confirm_"))
 async def cb_feed_autodel_confirm(callback: types.CallbackQuery):
+    """Старая кнопка «Включить» (сообщения до появления собственного расписания): включает по времени дайджеста."""
     user_id = callback.from_user.id
     period = _parse_autodelivery_period(callback.data, "feed_autodel_confirm_")
     if period is None:
@@ -1554,8 +1735,7 @@ async def cb_feed_autodel_confirm(callback: types.CallbackQuery):
         return
 
     await asyncio.to_thread(enable_feed_autodelivery, user_id, period)
-    p_acc = {"day": "день", "week": "неделю", "month": "месяц"}.get(period, period)
-    await callback.answer(f"✅ Автодоставка за {p_acc} включена!", show_alert=True)
+    await callback.answer(f"✅ Автодоставка за {_PERIOD_LABELS_ACC.get(period, period)} включена!", show_alert=True)
     await show_edition_or_feed(callback, user_id, period)
 
 
@@ -1583,7 +1763,9 @@ async def cb_feed_autodel_off(callback: types.CallbackQuery):
     p_acc = {"day": "день", "week": "неделю", "month": "месяц"}.get(period, period)
     await callback.answer(f"🔕 Автодоставка за {p_acc} отключена.", show_alert=True)
 
-    if callback.message and "главное из" in (callback.message.text or ""):
+    if callback.message and "Регулярная отправка Ленты" in (callback.message.text or ""):
+        await cb_sched_overview(callback)
+    elif callback.message and "главное из" in (callback.message.text or ""):
         await render_feed_main(callback, user_id, edit=True)
     else:
         kb = build_feed_edition_keyboard(user_id, period)
@@ -1613,6 +1795,31 @@ async def _autodelivery_failed(user_id: int, period: str, now_dt: datetime, reas
     if failures >= AUTODELIVERY_MAX_FAILURES:
         logger.warning("feed_autodelivery skipping to next slot user=%s period=%s", user_id, period)
         await _autodelivery_slot_done(user_id, period, now_dt)
+
+
+_PERIOD_LABELS_ACC = {"day": "день", "week": "неделю", "month": "месяц"}
+
+
+async def _send_feed_email(user_id: int, period: str, record: dict, res: FeedBuildResult) -> bool:
+    """Письмо с выпуском Ленты на подтверждённый адрес; False — адреса/SMTP нет или отправка не удалась (никогда не бросает)."""
+    try:
+        address, _ = await asyncio.to_thread(get_email_delivery, user_id)
+        if not address or not email_digest.smtp_available():
+            return False
+        digest_p = FEED_TO_DIGEST_PERIOD.get(period, "weekly")
+        schedule = _format_digest_schedule(digest_p, autodelivery_schedule_settings(user_id, period, record) or {})
+        subject, html_body, text_body = email_digest.build_feed_email(
+            _PERIOD_LABELS_ACC.get(period, period),
+            res.post_count,
+            res.channel_count,
+            res.telegraph_url,
+            res.headlines,
+            schedule_text=schedule,
+        )
+        return await email_digest.send_email(address, subject, text_body, html_body)
+    except Exception:
+        logger.exception("feed email delivery failed user=%s period=%s", user_id, period)
+        return False
 
 
 async def process_feed_autodeliveries(now: datetime | None = None) -> int:
@@ -1649,8 +1856,17 @@ async def process_feed_autodeliveries(now: datetime | None = None) -> int:
             if res.status != "ok":
                 await _autodelivery_failed(user_id, period, now_dt, res.error_message or res.status)
                 continue
+            if (record.get("delivery") or "telegram") == "email":
+                if await _send_feed_email(user_id, period, record, res):
+                    await _autodelivery_slot_done(user_id, period, now_dt)
+                    sent_count += 1
+                    continue
+                prefix = "📧 Не удалось отправить Ленту на почту — она здесь.\n"  # выпуск не теряем
+            else:
+                prefix = ""
             text = (
-                "🔔 <b>Автодоставка</b>\n"
+                prefix
+                + "🔔 <b>Автодоставка</b>\n"
                 + format_feed_edition_message(
                     period,
                     res.post_count,

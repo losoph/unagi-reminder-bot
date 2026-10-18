@@ -14,6 +14,7 @@ os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN_FOR_UNIT_TESTS")
 
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError  # noqa: E402
 
+import email_digest  # noqa: E402
 import feed  # noqa: E402
 from data import database  # noqa: E402
 
@@ -371,7 +372,7 @@ class ScreenTests(AutodeliveryBase):
             rows = feed.build_feed_edition_keyboard(1, "week").inline_keyboard
             return [b for row in rows for b in row if (b.callback_data or "").startswith("feed_autodel_")]
 
-        self.assertEqual([(b.text, b.callback_data) for b in autodel_buttons()], [("🔔 Присылать автоматически", "feed_autodel_prompt_week")])
+        self.assertEqual([(b.text, b.callback_data) for b in autodel_buttons()], [("🔔 Присылать регулярно", "feed_autodel_prompt_week")])
         self.enable(1, "week", noon())
         self.assertEqual([(b.text, b.callback_data) for b in autodel_buttons()], [("🔕 Не присылать", "feed_autodel_off_week")])
 
@@ -381,11 +382,11 @@ class ScreenTests(AutodeliveryBase):
         with patch.object(feed, "is_session_owner", return_value=False):
             await feed.render_feed_main(target, 1)
         text = target.answer.await_args.args[0]
-        self.assertIn("Автодоставка", text)
-        self.assertIn("неделя", text)
+        self.assertIn("Неделя", text)
+        self.assertIn("💬 Telegram", text)
         markup = target.answer.await_args.kwargs["reply_markup"]
         callbacks = [b.callback_data for row in markup.inline_keyboard for b in row]
-        self.assertIn("feed_autodel_off_week", callbacks)
+        self.assertIn("fsch", callbacks)  # одна кнопка «Регулярная отправка»; выключение — на её экране
         self.assertNotIn("feed_autodel_off_day", callbacks)
 
     async def test_weekly_schedule_text_is_anchored_to_activation_not_to_today(self):
@@ -408,14 +409,59 @@ class ScreenTests(AutodeliveryBase):
             self.enable(1, period, noon())
         self.assertEqual([r["period"] for r in database.list_user_feed_autodeliveries(1)], ["day", "week", "month"])
 
-    async def test_prompt_text_names_the_digest_schedule_and_asks_confirmation(self):
+    async def test_prompt_opens_hour_picker_without_enabling(self):
         callback = CallbackTests.callback(1, "feed_autodel_prompt_day")
         await feed.cb_feed_autodel_prompt(callback)
-        text = callback.message.edit_text.await_args.args[0]
-        self.assertIn("Лента за день будет приходить", text)
-        buttons = [b.callback_data for row in callback.message.edit_text.await_args.kwargs["reply_markup"].inline_keyboard for b in row]
-        self.assertEqual(buttons, ["feed_autodel_confirm_day", "feed_autodel_cancel_day"])
-        self.assertIsNone(self.row(1, "day"))  # включение — только после подтверждения
+        markup = callback.message.edit_text.await_args.kwargs["reply_markup"]
+        buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertIn("fschh_day_7", buttons)
+        self.assertIsNone(self.row(1, "day"))  # включение — только после выбора времени и доставки
+
+
+class ScheduleWizardTests(AutodeliveryBase):
+    @staticmethod
+    def callback(data):
+        return CallbackTests.callback(1, data)
+
+    async def test_save_stores_own_schedule_and_delivery(self):
+        with patch.object(feed, "get_email_delivery", return_value=("a@b.ru", set())), patch.object(email_digest, "smtp_available", return_value=True):
+            await feed.cb_sched_save(self.callback("fschx_week_8_30_2_n_em"))
+        row = self.row(1, "week")
+        self.assertEqual((row["send_hour"], row["send_minute"], row["weekday"], row["delivery"]), (8, 30, 2, "email"))
+        self.assertEqual(feed.autodelivery_schedule_settings(1, "week", row)["weekday"], 2)
+
+    async def test_email_choice_is_refused_without_address(self):
+        cb = self.callback("fschx_day_8_0_n_n_em")
+        with patch.object(feed, "get_email_delivery", return_value=(None, set())):
+            await feed.cb_sched_save(cb)
+        self.assertIsNone(self.row(1, "day"))
+
+    async def test_garbage_callback_is_rejected(self):
+        cb = self.callback("fschx_day_99_0_n_n_tg")
+        await feed.cb_sched_save(cb)
+        self.assertIsNone(self.row(1, "day"))
+
+    async def test_own_time_overrides_digest_time(self):
+        self.enable(1, "day", noon())
+        database.enable_feed_autodelivery(1, "day", utc(noon()), send_hour=20, send_minute=15)
+        due = feed.get_autodelivery_due_time(1, "day", self.row(1, "day"), now=utc(noon()))
+        self.assertEqual((due.hour, due.minute), (20, 15))
+
+    async def test_email_delivery_sends_mail_instead_of_telegram_message(self):
+        database.enable_feed_autodelivery(1, "day", utc(noon()), send_hour=7, send_minute=0, delivery="email")
+        send = AsyncMock(return_value=True)
+        with patch.object(feed, "get_email_delivery", return_value=("a@b.ru", set())), patch.object(email_digest, "smtp_available", return_value=True), patch.object(email_digest, "send_email", send):
+            sent, bot = await self.run_cycle(after_slot(), AsyncMock(return_value=result()))
+        self.assertEqual(sent, 1)
+        send.assert_awaited_once()
+        bot.send_message.assert_not_awaited()
+
+    async def test_failed_email_falls_back_to_telegram(self):
+        database.enable_feed_autodelivery(1, "day", utc(noon()), send_hour=7, send_minute=0, delivery="email")
+        with patch.object(feed, "get_email_delivery", return_value=("a@b.ru", set())), patch.object(email_digest, "smtp_available", return_value=True), patch.object(email_digest, "send_email", AsyncMock(return_value=False)):
+            sent, bot = await self.run_cycle(after_slot(), AsyncMock(return_value=result()))
+        self.assertEqual(sent, 1)
+        self.assertIn("Не удалось отправить", bot.send_message.await_args.args[1])
 
 
 if __name__ == "__main__":

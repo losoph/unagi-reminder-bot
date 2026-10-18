@@ -772,6 +772,11 @@ def init_db():
         for statement in (
             "ALTER TABLE feed_subscriptions ADD COLUMN tag TEXT",
             "ALTER TABLE feed_subscriptions ADD COLUMN is_paused INTEGER DEFAULT 0",
+            "ALTER TABLE feed_autodelivery ADD COLUMN send_hour INTEGER",
+            "ALTER TABLE feed_autodelivery ADD COLUMN send_minute INTEGER",
+            "ALTER TABLE feed_autodelivery ADD COLUMN weekday INTEGER",
+            "ALTER TABLE feed_autodelivery ADD COLUMN month_day INTEGER",
+            "ALTER TABLE feed_autodelivery ADD COLUMN delivery TEXT DEFAULT 'telegram'",
         ):
             try:
                 cursor.execute(statement)
@@ -3691,20 +3696,45 @@ def get_latest_feed_edition(user_id: int, period: str) -> dict | None:
         return dict(row) if row else None
 
 
-def enable_feed_autodelivery(user_id: int, period: str, now: datetime | None = None) -> None:
-    """Включить автодоставку Ленты для периода."""
+FEED_DELIVERY_CHANNELS = ("telegram", "email")
+
+
+def enable_feed_autodelivery(
+    user_id: int,
+    period: str,
+    now: datetime | None = None,
+    *,
+    send_hour: int | None = None,
+    send_minute: int | None = None,
+    weekday: int | None = None,
+    month_day: int | None = None,
+    delivery: str = "telegram",
+) -> None:
+    """Включить регулярную отправку Ленты для периода.
+
+    Без своего времени (send_hour is None) расписание берётся из настроек дайджеста — так работали записи до появления
+    собственного расписания Ленты. Повторный вызов с временем обновляет расписание и канал доставки (отсчёт срока идёт заново), без времени — ничего не меняет.
+    """
     if period not in {"day", "week", "month"}:
         raise ValueError(f"Unsupported feed period: {period}")
+    if delivery not in FEED_DELIVERY_CHANNELS:
+        raise ValueError(f"Unsupported feed delivery: {delivery}")
     now_dt = now or utc_now()
     now_str = serialize_datetime(now_dt)
+    conflict = (
+        "DO UPDATE SET send_hour = excluded.send_hour, send_minute = excluded.send_minute, weekday = excluded.weekday, "
+        "month_day = excluded.month_day, delivery = excluded.delivery, last_run_at = excluded.created_at"
+        if send_hour is not None
+        else "DO NOTHING"  # повторное «включить» без своего времени ничего не сбрасывает
+    )
     with get_connection() as conn:
         conn.execute(
-            '''
-            INSERT INTO feed_autodelivery (user_id, period, created_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id, period) DO NOTHING
+            f'''
+            INSERT INTO feed_autodelivery (user_id, period, created_at, send_hour, send_minute, weekday, month_day, delivery)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, period) {conflict}
             ''',
-            (user_id, period, now_str),
+            (user_id, period, now_str, send_hour, send_minute, weekday, month_day, delivery),
         )
         conn.commit()
 
@@ -3728,7 +3758,7 @@ def get_feed_autodelivery(user_id: int, period: str) -> dict | None:
     with get_connection() as conn:
         row = conn.execute(
             '''
-            SELECT id, user_id, period, last_run_at, created_at
+            SELECT id, user_id, period, last_run_at, created_at, send_hour, send_minute, weekday, month_day, COALESCE(delivery, 'telegram') AS delivery
             FROM feed_autodelivery
             WHERE user_id = ? AND period = ?
             ''',
@@ -3742,7 +3772,7 @@ def list_user_feed_autodeliveries(user_id: int) -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute(
             '''
-            SELECT id, user_id, period, last_run_at, created_at
+            SELECT id, user_id, period, last_run_at, created_at, send_hour, send_minute, weekday, month_day, COALESCE(delivery, 'telegram') AS delivery
             FROM feed_autodelivery
             WHERE user_id = ?
             ORDER BY CASE period WHEN 'day' THEN 1 WHEN 'week' THEN 2 ELSE 3 END
@@ -3757,7 +3787,7 @@ def list_all_feed_autodeliveries() -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute(
             '''
-            SELECT id, user_id, period, last_run_at, created_at
+            SELECT id, user_id, period, last_run_at, created_at, send_hour, send_minute, weekday, month_day, COALESCE(delivery, 'telegram') AS delivery
             FROM feed_autodelivery
             ORDER BY id
             '''

@@ -106,6 +106,11 @@ def is_enabled() -> bool:
     return _CONFIG is not None
 
 
+def smtp_available() -> bool:
+    """Прямая отправка по SMTP (Лента на почту) возможна только при настроенном SMTP — в режиме ghsub её недостаточно."""
+    return _CONFIG is not None
+
+
 def normalize_email(text: str | None) -> str | None:
     value = (text or "").strip()
     if len(value) > 254 or not EMAIL_RE.match(value):
@@ -231,6 +236,48 @@ def build_digest_email(
     if manage_url:
         lines.append(f"Получать в Telegram вместо почты: {manage_url}")
     return html_body, "\n".join(lines)
+
+
+def build_feed_email(
+    period_label: str,
+    post_count: int,
+    channel_count: int,
+    telegraph_url: str,
+    headlines: list[str] | None = None,
+    *,
+    schedule_text: str | None = None,
+) -> tuple[str, str, str]:
+    """Письмо с выпуском Ленты: (тема, html, текст). Сама лента — на странице Telegraph, в письме — главное и ссылка."""
+    title = f"Лента за {period_label} · {post_count} пост. из {channel_count} кан."
+    items = "".join(f'<li style="{_TAG_STYLES["li"]}">{escape(h)}</li>' for h in headlines or [])
+    heads = (
+        f'<p style="{_TAG_STYLES["p"]}"><b>Главное:</b></p><ul style="{_TAG_STYLES["ul"]}">{items}</ul>' if items else ""
+    )
+    footer = "Лента из Telegram-бота Unagi."
+    if schedule_text:
+        footer += f" Расписание: {escape(schedule_text)}. Изменить или отключить — /feed в боте."
+    html_body = (
+        "<!doctype html>"
+        '<html lang="ru"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f"<title>{escape(title)}</title></head>"
+        '<body style="margin:0;padding:0;background:#f3f4f6;">'
+        '<div style="padding:24px 12px;">'
+        '<div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:12px;padding:28px 24px;'
+        f'font-family:{_FONT};font-size:16px;color:#1f2937;">'
+        f'<h1 style="margin:0 0 16px;font-size:24px;line-height:1.25;color:#111827;">📰 {escape(title)}</h1>'
+        f"{heads}"
+        f'<p style="{_TAG_STYLES["p"]}">📖 {_link(telegraph_url, "Открыть Ленту")}</p>'
+        f'<p style="margin:24px 0 0;font-size:13px;line-height:1.5;color:#6b7280;">{footer}</p>'
+        "</div></div></body></html>"
+    )
+    lines = [title, ""]
+    if headlines:
+        lines += ["Главное:", *[f"- {h}" for h in headlines], ""]
+    lines += [f"Открыть Ленту: {telegraph_url}", ""]
+    if schedule_text:
+        lines.append(f"Расписание: {schedule_text}. Изменить или отключить — /feed в боте.")
+    return title, html_body, "\n".join(lines)
 
 
 # ---------------------------------------------------------------- sending

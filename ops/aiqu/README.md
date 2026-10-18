@@ -357,7 +357,7 @@ ssh aiqu 'sshd -T | grep -E "^(port|passwordauthentication|permitrootlogin) "; u
 
 Разовые письма (итоги спринта, вехи, чек-листы) отправляет **один механизм — `ghsub-roadmap-alert.sh` из репозитория ghsub** (см. `docs/alerts.md` в ghsub). Расписание (cron-строки), отправку и защиту от повтора хостит ghsub; **unagi только отдаёт содержимое** — файлы `docs/ALERT-*.md` в этом репозитории. Новое письмо = файл здесь + cron-строка с `--app unagi --file docs/ALERT-….md` в `install.sh` ghsub. Планировщиков и флагов отправки в unagi для новых алертов не заводить.
 
-Расписание: 24.10 11:00 МСК — `docs/ALERT-LENTA-2026-10-24.md`; 31.10 11:00 МСК — `docs/ALERT-MOVE-2026-10-31.md`. Письмо на 18.10 19:00 (`docs/ALERT-SPRINT-2026-10-18.md`) идёт старым путём (`ops/aiqu/unagi-status-alert.sh` + `ops/aiqu/cron.d/unagi-status-alert`, уже установлено): после отправки оба файла удалить, механизм считать устаревшим.
+Расписание: 24.10 11:00 МСК — `docs/ALERT-LENTA-2026-10-24.md`; 31.10 11:00 МСК — `docs/ALERT-MOVE-2026-10-31.md`. Старый механизм (`unagi-status-alert.sh`, cron-файл, `telegram-watch.sh` — мониторинг выхода официальной ленты Telegram) удалён 18.10 после отправки итогового письма; на сервере cron-файл уберёт деплой (очистка устаревших `unagi-*`).
 
 ## Доступ из России
 
