@@ -32,13 +32,8 @@ remote() {
   echo "log_errors=$(printf '%s\n' "$logs" | grep -cE ' - (ERROR|CRITICAL) - |Traceback')"
   echo "last_error=$(printf '%s\n' "$logs" | grep -E ' - (ERROR|CRITICAL) - ' | tail -n 1 | cut -c1-200)"
   echo "last_digest_cycle=$(printf '%s\n' "$logs" | grep 'digest_cycle' | tail -n 1 | cut -c1-24)"
-  sql_ro() {
-    if command -v setpriv >/dev/null 2>&1; then
-      setpriv --reuid=10001 --regid=10001 --clear-groups sqlite3 -readonly "$@"
-    else
-      sqlite3 -readonly "$@"
-    fi
-  }
+  # От root, только чтение. Через setpriv под uid 10001 нельзя: репозиторий в /root, uid 10001 туда не войти.
+  sql_ro() { sqlite3 -readonly "$@"; }
   echo "db_check=$(sql_ro storage/bot_data.db 'pragma quick_check;' 2>&1 | head -n 1)"
   echo "db_tables=$(sql_ro storage/bot_data.db "select count(*) from sqlite_master where type='table';" 2>&1)"
   # OPS1: цифры для решений владельца. Пустой результат или ошибка не ломают prod_check.
