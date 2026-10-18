@@ -525,7 +525,8 @@ class MigrateSchedulesDryrunTests(unittest.TestCase):
         with patch("sys.stdout", stdout_buf):
             exit_code = main([str(self.db_path)])
 
-        self.assertEqual(exit_code, 3)
+        # Отсутствие записи в digest_settings — не конфликт: применяется дефолт из кода
+        self.assertEqual(exit_code, 0)
         output = stdout_buf.getvalue()
         self.assertIn("ПАПКИ БЕЗ ЯВНОГО ВРЕМЕНИ В DIGEST_SETTINGS (ПОДСТАВЛЯЕТСЯ ДЕФОЛТ 07:00):", output)
         self.assertIn("user=102 папка='notime_tag' period=daily -> дефолт 07:00", output)

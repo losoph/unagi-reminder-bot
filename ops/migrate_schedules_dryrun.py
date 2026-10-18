@@ -287,6 +287,7 @@ def analyze_migration(conn: sqlite3.Connection, split_by_period: bool = False) -
             "time_discrepancy_in_folder": [],
             "empty_folders": [],
             "schedule_without_time": [],
+            "schedule_default_time": [],
             "invalid_schedule_params": [],
             "unconfirmed_email": [],
             "folder_name_case_collision": [],
@@ -479,7 +480,8 @@ def analyze_migration(conn: sqlite3.Connection, split_by_period: bool = False) -
 
                 # Проверка наличия явных настроек в digest_settings (если period валидный)
                 if raw_period in VALID_PERIODS and (uid, raw_period) not in digest_settings_map:
-                    report["conflicts"]["schedule_without_time"].append(
+                    # Не конфликт: дефолт из кода применяется штатно (информация для владельца)
+                    report["conflicts"]["schedule_default_time"].append(
                         {
                             "user_id": uid,
                             "period": raw_period,
@@ -855,6 +857,9 @@ def format_report(report: dict[str, Any]) -> str:
             f"       - user={item['user_id']} period={item['period']} "
             f"({item['reason']}) -> {item['resolution']}"
         )
+
+    c3d = conflicts["schedule_default_time"]
+    lines.append(f"   [3a] Подписки без явной записи в digest_settings (не конфликт, применится дефолт 07:00): {len(c3d)}")
 
     c4 = conflicts["unconfirmed_email"]
     lines.append(f"   [4] Почта без подтверждения: {len(c4)}")
