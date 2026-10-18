@@ -23,6 +23,38 @@ import urllib.parse
 
 VALID_PERIODS = {"daily", "weekly", "monthly"}
 VALID_MONTHLY_MODES = {"date", "weekday", "last_day"}
+SYSTEM_FOLDER_NAMES_CASEFOLD = {"основное", "основной"}
+DEFAULT_FOLDER_NAME = "Основное"
+
+PERIOD_ORDER = {"daily": 1, "weekly": 2, "monthly": 3}
+PERIOD_SUFFIX = {
+    "daily": "день",
+    "weekly": "неделя",
+    "monthly": "месяц",
+}
+
+
+def normalize_tag(tag: str | None) -> tuple[str, int]:
+    """Единая нормализация тега подписки в имя целевой папки и флаг is_default.
+
+    Правила:
+    - clean = (tag or "").strip()
+    - пустой, а также совпадающий по casefold() с именем системной папки
+      («Основное»/«Основной») -> в системную папку 'Основное', is_default=1.
+    - иначе -> (clean, is_default=0).
+    """
+    clean = (tag or "").strip()
+    if not clean or clean.casefold() in SYSTEM_FOLDER_NAMES_CASEFOLD:
+        return (DEFAULT_FOLDER_NAME, 1)
+    return (clean, 0)
+
+
+def normalize_channel_username(channel_username: str | None) -> str:
+    """Нормализует username канала (убирает @, пробелы и переводит в нижний регистр)."""
+    if isinstance(channel_username, str):
+        return channel_username.strip().lstrip("@").lower()
+    return ""
+
 
 
 def open_readonly_db(db_path: Path) -> sqlite3.Connection:
@@ -48,7 +80,187 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return bool(row)
 
 
-def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
+def plan_user_folders(
+    conn: sqlite3.Connection,
+    uid: int,
+    split_by_period: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Планирует целевые папки для пользователя uid.
+
+    Возвращает:
+        (target_folders, split_records, collisions)
+    где:
+        target_folders: список dict целевых папок:
+            - folder_name: str
+            - is_default: int (0 или 1)
+            - period: str
+            - subs: list[sqlite3.Row]
+            - is_split: bool
+            - source_tag: str
+            - all_periods: list[str] (если не разбивалось)
+        split_records: список dict с информацией о разбиении тегов (было -> стало)
+        collisions: список обнаруженных casefold-коллизий
+    """
+    sub_rows = conn.execute(
+        """
+        SELECT id, channel_username, period, tag, last_post_id, next_send_at, is_paused
+        FROM subscriptions
+        WHERE user_id = ? AND is_disabled = 0
+        ORDER BY id
+        """,
+        (uid,),
+    ).fetchall()
+
+    if not sub_rows:
+        return [], [], []
+
+    # Все исходные теги пользователя в subscriptions (для поиска коллизий со сгенерированными именами)
+    existing_tags_rows = conn.execute(
+        """
+        SELECT DISTINCT tag FROM subscriptions
+        WHERE user_id = ? AND tag IS NOT NULL AND TRIM(tag) != ''
+        """,
+        (uid,),
+    ).fetchall()
+    user_existing_tags_clean = {r["tag"].strip() for r in existing_tags_rows if r["tag"] and r["tag"].strip()}
+
+    tag_groups: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    tag_defaults: dict[str, int] = {}
+    for s in sub_rows:
+        base_name, is_def = normalize_tag(s["tag"])
+        tag_groups[base_name].append(s)
+        tag_defaults[base_name] = is_def
+
+    collisions: list[dict[str, Any]] = []
+    target_folders: list[dict[str, Any]] = []
+    split_records: list[dict[str, Any]] = []
+
+    for base_name, group_subs in tag_groups.items():
+        base_is_default = tag_defaults[base_name]
+        periods_in_group = [s["period"] for s in group_subs]
+        distinct_periods = sorted(set(periods_in_group))
+
+        if split_by_period and len(distinct_periods) > 1:
+            # Режим разбиения по period
+            period_counts = {p: periods_in_group.count(p) for p in distinct_periods}
+
+            if base_is_default == 1:
+                # Системная папка («Основное»): daily если есть, иначе самый частый
+                if "daily" in period_counts:
+                    main_p = "daily"
+                else:
+                    main_p = min(distinct_periods, key=lambda p: (-period_counts[p], PERIOD_ORDER.get(p, 99)))
+                main_name = base_name
+                main_def = 1
+            else:
+                # Именованный тег: самый частый, при равенстве более короткий
+                main_p = min(distinct_periods, key=lambda p: (-period_counts[p], PERIOD_ORDER.get(p, 99)))
+                main_name = base_name
+                main_def = 0
+
+            became_list: list[dict[str, Any]] = []
+            for p in distinct_periods:
+                p_subs = [s for s in group_subs if s["period"] == p]
+                if p == main_p:
+                    fname = main_name
+                    fdef = main_def
+                else:
+                    suffix = PERIOD_SUFFIX.get(p, p)
+                    fname = f"{base_name} — {suffix}"
+                    fdef = 0
+
+                    # Имена проверять на casefold-коллизию с существующими тегами пользователя; коллизия — конфликт, код 3.
+                    for et in user_existing_tags_clean:
+                        if fname.casefold() == et.casefold():
+                            collisions.append({
+                                "user_id": uid,
+                                "names": sorted([fname, et]),
+                                "statuses": sorted({s["is_paused"] and "paused" or "active" for s in p_subs}),
+                                "reason": f"Сгенерированное имя папки '{fname}' совпадает с существующим тегом пользователя '{et}'",
+                                "resolution": "Коллизия имени папки по casefold() — конфликт (код 3), запись не делается",
+                            })
+
+                became_list.append({
+                    "folder_name": fname,
+                    "period": p,
+                    "is_default": fdef,
+                    "channels_count": len({s["channel_username"] for s in p_subs}),
+                })
+
+                target_folders.append({
+                    "folder_name": fname,
+                    "is_default": fdef,
+                    "period": p,
+                    "subs": p_subs,
+                    "is_split": True,
+                    "source_tag": base_name,
+                })
+
+            split_records.append({
+                "user_id": uid,
+                "tag": base_name,
+                "periods": distinct_periods,
+                "total_channels": len({s["channel_username"] for s in group_subs}),
+                "became": became_list,
+            })
+        else:
+            # Без разбиения (один период либо флаг не передан)
+            if len(distinct_periods) > 1 or None in distinct_periods:
+                valid_candidates = [p for p in distinct_periods if p in VALID_PERIODS]
+                folder_period = sorted(valid_candidates)[0] if valid_candidates else "daily"
+            else:
+                folder_period = distinct_periods[0] if distinct_periods else "daily"
+
+            target_folders.append({
+                "folder_name": base_name,
+                "is_default": base_is_default,
+                "period": folder_period,
+                "subs": group_subs,
+                "is_split": False,
+                "source_tag": base_name,
+                "all_periods": distinct_periods,
+            })
+
+    # Проверка casefold-коллизий среди целевых папок пользователя
+    tf_cf: dict[str, list[str]] = defaultdict(list)
+    for tf in target_folders:
+        tf_cf[tf["folder_name"].casefold()].append(tf["folder_name"])
+    for cf_k, names in tf_cf.items():
+        if len(names) > 1:
+            all_statuses = set()
+            for tf in target_folders:
+                if tf["folder_name"] in names:
+                    all_statuses.update(s["is_paused"] and "paused" or "active" for s in tf["subs"])
+            collisions.append({
+                "user_id": uid,
+                "names": sorted(names),
+                "statuses": sorted(all_statuses),
+                "reason": f"Папки пользователя после разбиения совпадают по casefold: {sorted(names)}",
+                "resolution": "Коллизия имён папок по casefold() — конфликт (код 3), запись не делается",
+            })
+
+    # Проверка casefold-коллизий с существующими папками в БД (таблица folders)
+    if _table_exists(conn, "folders"):
+        existing_rows = conn.execute(
+            "SELECT name FROM folders WHERE user_id = ?", (uid,)
+        ).fetchall()
+        for er in existing_rows:
+            ex_name = er["name"]
+            for tf in target_folders:
+                f_name = tf["folder_name"]
+                if ex_name != f_name and ex_name.casefold() == f_name.casefold():
+                    collisions.append({
+                        "user_id": uid,
+                        "names": sorted([ex_name, f_name]),
+                        "statuses": sorted({s["is_paused"] and "paused" or "active" for s in tf["subs"]}),
+                        "reason": f"Имя папки '{f_name}' конфликтует с существующей папкой '{ex_name}' по регистру",
+                        "resolution": "Коллизия имён папок по casefold() — конфликт (код 3), запись не делается",
+                    })
+
+    return target_folders, split_records, collisions
+
+
+def analyze_migration(conn: sqlite3.Connection, split_by_period: bool = False) -> dict[str, Any]:
     """Анализирует текущее состояние данных и прогнозирует результат миграции."""
     report: dict[str, Any] = {
         "summary": {
@@ -64,15 +276,21 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
             "zero_cursors": 0,
         },
         "folders_detail": [],
+        "split_folders": [],
+        "cutover_warnings": [],
+        "time_discrepancies": [],
         "conflicts": {
             "channel_in_multiple_tags": [],
             "channel_in_multiple_periods": [],
+            "channel_duplicate_in_folder": [],
             "heterogeneous_period_in_folder": [],
             "time_discrepancy_in_folder": [],
             "empty_folders": [],
             "schedule_without_time": [],
+            "schedule_default_time": [],
             "invalid_schedule_params": [],
             "unconfirmed_email": [],
+            "folder_name_case_collision": [],
         },
         "warnings": {
             "null_cursors": [],
@@ -218,122 +436,92 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
     total_folders = 0
     total_schedules = 0
 
-    # Структуры для выявления конфликтов каналов и папок
-    # (user_id, channel_username) -> список записей
-    user_channel_subs: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    # Структура для выявления конфликтов каналов: (user_id, channel_username) -> список назначений (folder_name, period, sub_row)
+    user_channel_assignments: dict[tuple[int, str], list[tuple[str, str, sqlite3.Row]]] = defaultdict(list)
 
     for u_row in users_with_subs:
         uid = u_row["user_id"]
-        sub_rows = conn.execute(
-            """
-            SELECT id, channel_username, period, tag, last_post_id, next_send_at
-            FROM subscriptions
-            WHERE user_id = ? AND is_disabled = 0
-            ORDER BY id
-            """,
-            (uid,),
-        ).fetchall()
+        target_folders, split_records, collisions = plan_user_folders(
+            conn, uid, split_by_period=split_by_period
+        )
 
-        folders_for_user: dict[str, dict[str, Any]] = {}
+        report["split_folders"].extend(split_records)
+        report["conflicts"]["folder_name_case_collision"].extend(collisions)
 
-        for s in sub_rows:
-            tag_raw = s["tag"]
-            tag_clean = tag_raw.strip() if isinstance(tag_raw, str) else ""
-            folder_name = tag_clean if tag_clean else "Основное"
-            is_default = (folder_name == "Основное")
+        for tf in target_folders:
+            f_name = tf["folder_name"]
+            f_is_def = tf["is_default"]
+            folder_period = tf["period"]
+            subs = tf["subs"]
+            subs_in_folder = len({s["channel_username"] for s in subs})
 
-            raw_period = s["period"]
-            channel_username = s["channel_username"]
-            sub_id = s["id"]
-            next_send_at = s["next_send_at"]
+            # Проверка параметров расписания и digest_settings для каждой подписки
+            for s in subs:
+                raw_period = s["period"]
+                ch_user = s["channel_username"]
+                ch_user_norm = normalize_channel_username(ch_user)
+                sub_id = s["id"]
+                sub_status = "paused" if s["is_paused"] else "active"
 
-            user_channel_subs[(uid, channel_username)].append(
-                {
-                    "sub_id": sub_id,
-                    "folder_name": folder_name,
-                    "period": raw_period,
-                    "next_send_at": next_send_at,
-                    "last_post_id": s["last_post_id"],
+                user_channel_assignments[(uid, ch_user_norm)].append((f_name, raw_period, s))
+
+                # Валидация period подписки
+                if raw_period is None or raw_period not in VALID_PERIODS:
+                    report["conflicts"]["invalid_schedule_params"].append(
+                        {
+                            "user_id": uid,
+                            "sub_id": sub_id,
+                            "channel_username": ch_user,
+                            "period": raw_period,
+                            "status": sub_status,
+                            "reason": f"Подписка имеет недопустимый period={repr(raw_period)} (ожидается daily, weekly, monthly)",
+                        }
+                    )
+
+                # Проверка наличия явных настроек в digest_settings (если period валидный)
+                if raw_period in VALID_PERIODS and (uid, raw_period) not in digest_settings_map:
+                    # Не конфликт: дефолт из кода применяется штатно (информация для владельца)
+                    report["conflicts"]["schedule_default_time"].append(
+                        {
+                            "user_id": uid,
+                            "period": raw_period,
+                            "send_hour": None,
+                            "send_minute": None,
+                            "reason": f"Нет явной записи в digest_settings для активной подписки '{raw_period}'",
+                            "resolution": "Будет применён дефолт из кода (07:00, текущий день недели/месяца, monthly_mode='date')",
+                        }
+                    )
+
+            # Проверка однородности period в папке (если не разбивалось)
+            if not split_by_period and tf.get("all_periods"):
+                all_p = tf["all_periods"]
+                if len(all_p) > 1 or None in all_p:
+                    report["conflicts"]["heterogeneous_period_in_folder"].append(
+                        {
+                            "user_id": uid,
+                            "folder_name": f_name,
+                            "periods": sorted([str(p) for p in all_p]),
+                            "statuses": sorted({s["is_paused"] and "paused" or "active" for s in subs}),
+                            "channels_count": subs_in_folder,
+                            "resolution": "Папка содержит неоднородный period (включая NULL) — требуется один period на папку (код 3)",
+                        }
+                    )
+
+            # Проверка расхождения времени внутри папки (информация, не конфликт)
+            next_send_at_set = {s["next_send_at"] for s in subs if s["next_send_at"] is not None}
+            if len(next_send_at_set) > 1:
+                td_info = {
+                    "user_id": uid,
+                    "folder_name": f_name,
+                    "period": folder_period,
+                    "statuses": sorted({s["is_paused"] and "paused" or "active" for s in subs}),
+                    "channels_count": subs_in_folder,
+                    "distinct_times": sorted(str(t) for t in next_send_at_set),
+                    "resolution": "Информация: next_send_at папки пересчитает T21 (не блокирует миграцию)",
                 }
-            )
+                report["time_discrepancies"].append(td_info)
 
-            # Валидация period подписки
-            if raw_period is None or raw_period not in VALID_PERIODS:
-                report["conflicts"]["invalid_schedule_params"].append(
-                    {
-                        "user_id": uid,
-                        "sub_id": sub_id,
-                        "channel_username": channel_username,
-                        "period": raw_period,
-                        "reason": f"Подписка имеет недопустимый period={repr(raw_period)} (ожидается daily, weekly, monthly)",
-                    }
-                )
-
-            if folder_name not in folders_for_user:
-                folders_for_user[folder_name] = {
-                    "name": folder_name,
-                    "is_default": is_default,
-                    "periods": set(),
-                    "channel_count": 0,
-                    "channels": set(),
-                    "next_send_at_set": set(),
-                }
-            folders_for_user[folder_name]["periods"].add(raw_period)
-            folders_for_user[folder_name]["channel_count"] += 1
-            folders_for_user[folder_name]["channels"].add(channel_username)
-            if next_send_at is not None:
-                folders_for_user[folder_name]["next_send_at_set"].add(next_send_at)
-
-            # Проверка наличия явных настроек в digest_settings (если period валидный)
-            if raw_period in VALID_PERIODS and (uid, raw_period) not in digest_settings_map:
-                report["conflicts"]["schedule_without_time"].append(
-                    {
-                        "user_id": uid,
-                        "period": raw_period,
-                        "send_hour": None,
-                        "send_minute": None,
-                        "reason": f"Нет явной записи в digest_settings для активной подписки '{raw_period}'",
-                        "resolution": "Будет применён дефолт из кода (07:00, текущий день недели/месяца, monthly_mode='date')",
-                    }
-                )
-
-        for f_name, f_info in folders_for_user.items():
-            periods_set = f_info["periods"]
-            subs_in_folder = len(f_info["channels"])
-
-            # 1. Проверка однородности period в папке (включая папку "Основное", где tag IS NULL)
-            # Разные периоды внутри одной папки или NULL — жесткий конфликт (код 3)
-            has_hetero = (len(periods_set) > 1) or (None in periods_set)
-            if has_hetero:
-                report["conflicts"]["heterogeneous_period_in_folder"].append(
-                    {
-                        "user_id": uid,
-                        "folder_name": f_name,
-                        "periods": sorted([str(p) for p in periods_set]),
-                        "channels_count": subs_in_folder,
-                        "resolution": "Папка содержит неоднородный period (включая NULL) — требуется один period на папку (код 3)",
-                    }
-                )
-                valid_candidates = [p for p in periods_set if p in VALID_PERIODS]
-                folder_period = sorted(valid_candidates)[0] if valid_candidates else "daily"
-            else:
-                folder_period = list(periods_set)[0] if periods_set else "daily"
-
-            # 2. Проверка расхождения времени внутри папки
-            if len(f_info["next_send_at_set"]) > 1:
-                report["conflicts"]["time_discrepancy_in_folder"].append(
-                    {
-                        "user_id": uid,
-                        "folder_name": f_name,
-                        "period": folder_period,
-                        "channels_count": subs_in_folder,
-                        "distinct_times": sorted(str(t) for t in f_info["next_send_at_set"]),
-                        "resolution": "Подписки одной папки имеют разные next_send_at — расхождение времени (код 3)",
-                    }
-                )
-
-            # 3. Определение доставки (Telegram или Email)
-            # В модели Q4S email-подписки мигрируют в папки с delivery='email'
+            # Определение доставки (Telegram или Email)
             user_email_info = user_emails_map.get(uid)
             if (
                 user_email_info
@@ -349,14 +537,28 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
             total_folders += 1
             total_schedules += 1  # Папка = одна рассылка
 
+            # Определение времени в digest_settings для отчёта
+            ds_entry = digest_settings_map.get((uid, folder_period))
+            if ds_entry and ds_entry.get("send_hour") is not None and ds_entry.get("send_minute") is not None:
+                sh = ds_entry["send_hour"]
+                sm = ds_entry["send_minute"]
+                time_str = f"{sh:02d}:{sm:02d}"
+                has_time = True
+            else:
+                time_str = "нет (дефолт 07:00)"
+                has_time = False
+
             report["folders_detail"].append(
                 {
                     "user_id": uid,
                     "folder_name": f_name,
-                    "is_default": f_info["is_default"],
+                    "is_default": f_is_def,
                     "channels_count": subs_in_folder,
                     "period": folder_period,
+                    "time": time_str,
+                    "has_explicit_time": has_time,
                     "delivery": delivery,
+                    "statuses": sorted({s["is_paused"] and "paused" or "active" for s in subs}),
                 }
             )
 
@@ -399,30 +601,75 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
                 }
             )
 
-    # 6. Конфликты каналов: один канал в нескольких папках (тегах)
-    for (uid, channel_username), subs in user_channel_subs.items():
-        unique_folders = sorted({s["folder_name"] for s in subs})
-        if len(unique_folders) > 1:
-            report["conflicts"]["channel_in_multiple_tags"].append(
-                {
-                    "user_id": uid,
-                    "channel_username": channel_username,
-                    "tags": unique_folders,
-                    "resolution": "Канал принадлежит более чем одной папке — требуется выбор владельца",
-                }
-            )
+    # 6. Конфликты каналов
+    for (uid, channel_username), assignments in user_channel_assignments.items():
+        unique_folders = sorted({item[0] for item in assignments})
+        periods_list = [item[1] for item in assignments]
+        unique_periods = sorted(set(periods_list))
+        statuses = sorted({item[2]["is_paused"] and "paused" or "active" for item in assignments})
 
-        # Конфликт: дубли периодов одного канала (один канал в нескольких периодах)
-        if len(subs) > 1:
-            periods = [s["period"] for s in subs]
-            report["conflicts"]["channel_in_multiple_periods"].append(
-                {
-                    "user_id": uid,
-                    "channel_username": channel_username,
-                    "periods": periods,
-                    "resolution": "Один канал в нескольких периодах/подписках — конфликт уникальности (код 3)",
-                }
-            )
+        if len(assignments) > 1:
+            # 1. Дубль канала В ОДНОЙ папке с одним period остаётся строгим конфликтом (код 3)
+            for fname in unique_folders:
+                folder_assignments = [item for item in assignments if item[0] == fname]
+                period_counts_in_folder = {p: [item[1] for item in folder_assignments].count(p) for p in set(item[1] for item in folder_assignments)}
+                for dup_period, p_cnt in period_counts_in_folder.items():
+                    if p_cnt > 1:
+                        report["conflicts"]["channel_duplicate_in_folder"].append(
+                            {
+                                "user_id": uid,
+                                "channel_username": channel_username,
+                                "folder_name": fname,
+                                "period": dup_period,
+                                "statuses": statuses,
+                                "resolution": "Канал дважды в одной папке с одним period — конфликт (код 3)",
+                            }
+                        )
+
+            # 2. Канал в нескольких папках
+            if len(unique_folders) > 1:
+                if split_by_period and len(unique_periods) > 1:
+                    # В режиме split-by-period разные папки с разными периодами -> предупреждение!
+                    report["cutover_warnings"].append(
+                        {
+                            "user_id": uid,
+                            "channel_username": channel_username,
+                            "folders": unique_folders,
+                            "periods": periods_list,
+                            "statuses": statuses,
+                            "message": "канал в нескольких папках — решить до cutover v2 (T21)",
+                        }
+                    )
+                else:
+                    report["conflicts"]["channel_in_multiple_tags"].append(
+                        {
+                            "user_id": uid,
+                            "channel_username": channel_username,
+                            "tags": unique_folders,
+                            "statuses": statuses,
+                            "resolution": "Канал принадлежит более чем одной папке — требуется выбор владельца",
+                        }
+                    )
+                    report["conflicts"]["channel_in_multiple_periods"].append(
+                        {
+                            "user_id": uid,
+                            "channel_username": channel_username,
+                            "periods": periods_list,
+                            "statuses": statuses,
+                            "resolution": "Один канал в нескольких периодах/подписках — конфликт уникальности (код 3)",
+                        }
+                    )
+            elif not split_by_period and len(unique_periods) > 1:
+                # В одной неразбитой папке несколько периодов у канала
+                report["conflicts"]["channel_in_multiple_periods"].append(
+                    {
+                        "user_id": uid,
+                        "channel_username": channel_username,
+                        "periods": periods_list,
+                        "statuses": statuses,
+                        "resolution": "Один канал в нескольких периодах/подписках — конфликт уникальности (код 3)",
+                    }
+                )
 
     # 7. Конфликт: пустые папки (теги только у отключённых подписок)
     disabled_tags_query = """
@@ -442,6 +689,11 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
           )
     """
     for r in conn.execute(disabled_tags_query).fetchall():
+        tag_norm, is_def = normalize_tag(r["tag"])
+        if is_def:
+            # Если тег нормализуется в системную папку 'Основное', и у пользователя уже есть активные подписки в 'Основное'
+            if any(fd["user_id"] == r["user_id"] and fd["is_default"] == 1 for fd in report["folders_detail"]):
+                continue
         tag_clean = r["tag"].strip() if r["tag"] else ""
         report["conflicts"]["empty_folders"].append(
             {
@@ -449,6 +701,7 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
                 "tag": tag_clean,
                 "reason": "Тег присутствует только у неактивных/отключённых подписок",
                 "resolution": "Папка не будет создана при автоматической миграции",
+                "status": "disabled",
             }
         )
 
@@ -464,17 +717,17 @@ def analyze_migration(conn: sqlite3.Connection) -> dict[str, Any]:
     report["legacy"]["legacy_subscriptions_period_count"] = report["summary"]["active_subscriptions"]
 
     # Определение общего статуса конфликтов
-    # Модель Q4S: неоднородный period внутри папки (в т.ч. tag IS NULL), дубли периодов,
-    # расхождения времени, невалидные параметры, канал в нескольких папках — всё это конфликты (код 3).
+    # Примечание: time_discrepancy_in_folder исключён из блокирующих конфликтов (пересчитает T21).
     has_conflicts = bool(
         report["conflicts"]["channel_in_multiple_tags"]
         or report["conflicts"]["channel_in_multiple_periods"]
+        or report["conflicts"]["channel_duplicate_in_folder"]
         or report["conflicts"]["heterogeneous_period_in_folder"]
-        or report["conflicts"]["time_discrepancy_in_folder"]
         or report["conflicts"]["empty_folders"]
         or report["conflicts"]["schedule_without_time"]
         or report["conflicts"]["invalid_schedule_params"]
         or report["conflicts"]["unconfirmed_email"]
+        or report["conflicts"]["folder_name_case_collision"]
     )
     report["has_conflicts"] = has_conflicts
 
@@ -503,15 +756,90 @@ def format_report(report: dict[str, Any]) -> str:
         f"(NULL: {summary['null_cursors']}, 0: {summary['zero_cursors']})"
     )
 
-    lines.append("\n2. ОБНАРУЖЕННЫЕ КОНФЛИКТЫ ДАННЫХ:")
+    # 2. Таблица целевых папок (G1)
+    lines.append("\n2. ЦЕЛЕВЫЕ ПАПКИ И РАСПИСАНИЯ:")
+    folders_detail = report.get("folders_detail", [])
+    if folders_detail:
+        header = f"| {'user_id':<8} | {'папка':<15} | {'is_default':<10} | {'period':<8} | {'время (digest_settings)':<23} | {'delivery':<8} | {'число каналов':<13} |"
+        sep = f"|{'-' * 10}|{'-' * 17}|{'-' * 12}|{'-' * 10}|{'-' * 25}|{'-' * 10}|{'-' * 15}|"
+        lines.append(header)
+        lines.append(sep)
+        for fd in folders_detail:
+            row_str = (
+                f"| {fd['user_id']:<8} "
+                f"| {fd['folder_name']:<15} "
+                f"| {fd['is_default']:<10} "
+                f"| {fd['period']:<8} "
+                f"| {fd['time']:<23} "
+                f"| {fd['delivery']:<8} "
+                f"| {fd['channels_count']:<13} |"
+            )
+            lines.append(row_str)
+    else:
+        lines.append("   (нет активных папок для миграции)")
+
+    # 3. Отдельно список папок, где в digest_settings нет времени, с подставляемым дефолтом
+    no_time_folders = [fd for fd in folders_detail if not fd.get("has_explicit_time")]
+    lines.append("\n3. ПАПКИ БЕЗ ЯВНОГО ВРЕМЕНИ В DIGEST_SETTINGS (ПОДСТАВЛЯЕТСЯ ДЕФОЛТ 07:00):")
+    if no_time_folders:
+        for fd in no_time_folders:
+            lines.append(
+                f"   • user={fd['user_id']} папка='{fd['folder_name']}' period={fd['period']} -> дефолт 07:00"
+            )
+    else:
+        lines.append("   • (нет таких папок, у всех задано явное время в digest_settings)")
+
+    # 4. Блок разбитых папок (было -> стало)
+    split_folders = report.get("split_folders", [])
+    lines.append("\n4. РАЗБИТЫЕ ПАПКИ (БЫЛО → СТАЛО):")
+    if split_folders:
+        for sf in split_folders:
+            periods_str = ", ".join(sf["periods"])
+            lines.append(
+                f"   • user={sf['user_id']} тег='{sf['tag']}' (периоды: [{periods_str}], каналов: {sf['total_channels']}) ->"
+            )
+            for b in sf["became"]:
+                lines.append(
+                    f"       - '{b['folder_name']}' ({b['period']}, is_default={b['is_default']}, каналов: {b['channels_count']})"
+                )
+    else:
+        lines.append("   • (нет разбитых папок)")
+
+    # 5. Предупреждения до cutover
+    cutover_warnings = report.get("cutover_warnings", [])
+    time_discrepancies = report.get("time_discrepancies", [])
+    lines.append("\n5. ПРЕДУПРЕЖДЕНИЯ ДО CUTOVER (T21):")
+    has_cutover_items = False
+    if cutover_warnings:
+        has_cutover_items = True
+        for cw in cutover_warnings:
+            folders_str = ", ".join(repr(f) for f in cw["folders"])
+            periods_str = ", ".join(repr(p) for p in cw["periods"])
+            lines.append(
+                f"   • [канал] user={cw['user_id']} channel=@{cw['channel_username']} "
+                f"(папки: [{folders_str}], периоды: [{periods_str}]) -> {cw['message']}"
+            )
+    if time_discrepancies:
+        has_cutover_items = True
+        for td in time_discrepancies:
+            times_str = ", ".join(repr(t) for t in td["distinct_times"])
+            lines.append(
+                f"   • [время] user={td['user_id']} папка='{td['folder_name']}' period={td['period']} "
+                f"next_send_at=[{times_str}] -> next_send_at папки пересчитает T21"
+            )
+    if not has_cutover_items:
+        lines.append("   • (нет предупреждений до cutover)")
+
+    lines.append("\n6. ОБНАРУЖЕННЫЕ КОНФЛИКТЫ ДАННЫХ:")
     conflicts = report["conflicts"]
 
     c1 = conflicts["channel_in_multiple_tags"]
     lines.append(f"   [1] Канал в нескольких тегах: {len(c1)}")
     for item in c1:
+        statuses_str = ", ".join(item.get("statuses", ["active"]))
         lines.append(
             f"       - user={item['user_id']} channel=@{item['channel_username']} "
-            f"теги={item['tags']} -> {item['resolution']}"
+            f"теги={item['tags']} (статусы: {statuses_str}) -> {item['resolution']}"
         )
 
     c2 = conflicts["empty_folders"]
@@ -519,7 +847,7 @@ def format_report(report: dict[str, Any]) -> str:
     for item in c2:
         lines.append(
             f"       - user={item['user_id']} тег='{item['tag']}' "
-            f"({item['reason']}) -> {item['resolution']}"
+            f"({item['reason']}, статус: disabled) -> {item['resolution']}"
         )
 
     c3 = conflicts["schedule_without_time"]
@@ -529,6 +857,9 @@ def format_report(report: dict[str, Any]) -> str:
             f"       - user={item['user_id']} period={item['period']} "
             f"({item['reason']}) -> {item['resolution']}"
         )
+
+    c3d = conflicts["schedule_default_time"]
+    lines.append(f"   [3a] Подписки без явной записи в digest_settings (не конфликт, применится дефолт 07:00): {len(c3d)}")
 
     c4 = conflicts["unconfirmed_email"]
     lines.append(f"   [4] Почта без подтверждения: {len(c4)}")
@@ -541,17 +872,20 @@ def format_report(report: dict[str, Any]) -> str:
     c5 = conflicts["channel_in_multiple_periods"]
     lines.append(f"   [5] Дублирование каналов в разных периодах (конфликт уникальности): {len(c5)}")
     for item in c5:
+        statuses_str = ", ".join(item.get("statuses", ["active"]))
         lines.append(
             f"       - user={item['user_id']} channel=@{item['channel_username']} "
-            f"periods={item['periods']} -> {item['resolution']}"
+            f"periods={item['periods']} (статусы: {statuses_str}) -> {item['resolution']}"
         )
 
-    c6 = conflicts.get("time_discrepancy_in_folder", [])
-    lines.append(f"   [6] Расхождения времени у подписок одной папки: {len(c6)}")
+    c6 = conflicts.get("channel_duplicate_in_folder", [])
+    lines.append(f"   [6] Канал дублируется внутри одной папки: {len(c6)}")
     for item in c6:
+        statuses_str = ", ".join(item.get("statuses", ["active"]))
         lines.append(
-            f"       - user={item['user_id']} папка='{item['folder_name']}' period={item['period']} "
-            f"next_send_at={item['distinct_times']} -> {item['resolution']}"
+            f"       - user={item['user_id']} channel=@{item['channel_username']} "
+            f"папка='{item['folder_name']}' period={item['period']} "
+            f"(статусы: {statuses_str}) -> {item['resolution']}"
         )
 
     c7 = conflicts.get("invalid_schedule_params", [])
@@ -564,9 +898,20 @@ def format_report(report: dict[str, Any]) -> str:
     c8 = conflicts.get("heterogeneous_period_in_folder", [])
     lines.append(f"   [8] Неоднородные периоды внутри папки (включая папку без тега): {len(c8)}")
     for item in c8:
+        statuses_str = ", ".join(item.get("statuses", ["active"]))
         lines.append(
             f"       - user={item['user_id']} папка='{item['folder_name']}' "
-            f"периоды={item['periods']} каналы={item['channels_count']} -> {item['resolution']}"
+            f"периоды={item['periods']} (статусы: {statuses_str}) "
+            f"каналы={item['channels_count']} -> {item['resolution']}"
+        )
+
+    c9 = conflicts.get("folder_name_case_collision", [])
+    lines.append(f"   [9] Коллизии имён папок по регистру (casefold): {len(c9)}")
+    for item in c9:
+        statuses_str = ", ".join(item.get("statuses", ["active"]))
+        lines.append(
+            f"       - user={item['user_id']} папки={item['names']} "
+            f"(статусы: {statuses_str}) -> {item['resolution']}"
         )
 
     warnings = report.get("warnings", {})
@@ -579,7 +924,7 @@ def format_report(report: dict[str, Any]) -> str:
             )
 
     legacy = report["legacy"]
-    lines.append("\n3. ЧТО ОСТАНЕТСЯ КАК LEGACY:")
+    lines.append("\n7. ЧТО ОСТАНЕТСЯ КАК LEGACY:")
     lines.append(f"   • Записей digest_executions (история сбоев/успехов): {legacy['digest_executions_count']}")
     lines.append(f"   • Записей digest_alerts (технические алерты):       {legacy['digest_alerts_count']}")
     lines.append(f"   • Строк digest_settings (сохраняются для отката):   {legacy['digest_settings_rows']}")
@@ -602,6 +947,11 @@ def main(argv: list[str] | None = None) -> int:
         description="Dry-run отчёт миграции расписаний дайджеста (Очередь 4, strictly read-only)"
     )
     parser.add_argument("db_path", help="Путь к файлу копии базы данных SQLite")
+    parser.add_argument(
+        "--split-by-period",
+        action="store_true",
+        help="Разбивать папки/теги с неоднородными period на отдельные папки по period",
+    )
     args = parser.parse_args(argv)
 
     db_path = Path(args.db_path)
@@ -616,7 +966,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        report = analyze_migration(conn)
+        report = analyze_migration(conn, split_by_period=args.split_by_period)
     except Exception as exc:
         print(f"Ошибка анализа схемы и данных базы: {exc}", file=sys.stderr)
         return 1

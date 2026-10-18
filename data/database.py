@@ -788,6 +788,120 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # колонка уже есть
 
+        # Q4 T20 (§3.1): целевая схема данных для модели «папка = одна рассылка»
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                period TEXT NOT NULL,
+                times TEXT NOT NULL DEFAULT '["07:00"]',
+                send_hour INTEGER NOT NULL DEFAULT 7,
+                send_minute INTEGER NOT NULL DEFAULT 0,
+                weekdays TEXT,
+                month_day INTEGER,
+                monthly_mode TEXT DEFAULT 'date',
+                delivery TEXT NOT NULL DEFAULT 'telegram',
+                is_enabled INTEGER NOT NULL DEFAULT 1,
+                next_send_at DATETIME,
+                last_edition_id INTEGER,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                UNIQUE(user_id, name),
+                CHECK (period IN ('daily', 'weekly', 'monthly')),
+                CHECK (send_hour BETWEEN 0 AND 23),
+                CHECK (send_minute BETWEEN 0 AND 59),
+                CHECK (monthly_mode IN ('date', 'weekday', 'last_day')),
+                CHECK (delivery IN ('telegram', 'email'))
+            )
+            '''
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_folders_due ON folders(is_enabled, next_send_at) WHERE next_send_at IS NOT NULL"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_folders_user ON folders(user_id, is_enabled)"
+        )
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS digest_editions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL,
+                scheduled_at DATETIME NOT NULL,
+                status TEXT NOT NULL,
+                delivery TEXT NOT NULL DEFAULT 'telegram',
+                delivery_target TEXT,
+                posts_count INTEGER DEFAULT 0,
+                channels_count INTEGER DEFAULT 0,
+                channels_failed INTEGER DEFAULT 0,
+                channels_partial INTEGER DEFAULT 0,
+                error_message TEXT,
+                retry_count INTEGER DEFAULT 0,
+                telegraph_url TEXT,
+                created_at DATETIME NOT NULL,
+                started_at DATETIME,
+                delivered_at DATETIME,
+                UNIQUE(folder_id, scheduled_at)
+            )
+            '''
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_digest_editions_user_status ON digest_editions(user_id, status)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_digest_editions_sched_status ON digest_editions(scheduled_at, status)"
+        )
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS digest_edition_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                edition_id INTEGER NOT NULL REFERENCES digest_editions(id) ON DELETE CASCADE,
+                subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+                channel_username TEXT NOT NULL,
+                post_id INTEGER NOT NULL,
+                post_time DATETIME NOT NULL,
+                post_title TEXT,
+                post_text TEXT,
+                post_link TEXT NOT NULL,
+                score REAL DEFAULT 0.0,
+                rank INTEGER,
+                created_at DATETIME NOT NULL,
+                UNIQUE(edition_id, channel_username, post_id)
+            )
+            '''
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edition_items_edition ON digest_edition_items(edition_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edition_items_sub ON digest_edition_items(subscription_id)"
+        )
+
+        # Q4 T20 (§3.2): модификация существующих таблиц
+        for statement in (
+            "ALTER TABLE user_prefs ADD COLUMN digest_scheduler_version TEXT DEFAULT 'v1'",
+            "ALTER TABLE subscriptions ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE RESTRICT",
+            "ALTER TABLE digest_executions ADD COLUMN folder_id INTEGER REFERENCES folders(id)",
+            "ALTER TABLE digest_alerts ADD COLUMN folder_id INTEGER REFERENCES folders(id)",
+        ):
+            try:
+                cursor.execute(statement)
+            except sqlite3.OperationalError:
+                pass
+
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subscriptions_folder ON subscriptions(folder_id, is_disabled)"
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_digest_executions_folder_slot ON digest_executions(folder_id, scheduled_at) WHERE folder_id IS NOT NULL"
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_digest_alerts_folder_slot ON digest_alerts(folder_id, scheduled_at, alert_type) WHERE folder_id IS NOT NULL"
+        )
+
         _migrate_legacy_local_timestamps_to_utc(cursor)
         cursor.execute(
             """

@@ -267,8 +267,8 @@ class MigrateSchedulesDryrunTests(unittest.TestCase):
         self.assertIn("[7] Некорректные параметры расписания", output)
         self.assertIn("hourly", output)
 
-    def test_conflict_time_discrepancy_in_folder_detected_exit_3(self):
-        """Конфликт: расхождения времени у подписок одной папки (разные next_send_at)."""
+    def test_time_discrepancy_in_folder_is_info_exit_0(self):
+        """Расхождения времени у подписок одной папки больше не конфликт, а информация (код 0)."""
         self._seed_clean_data()
         # В папке 'news' подписки tech_news и world_news имеют '2026-10-18 08:30:00'.
         # Меняем одной из них время на 19:00:00
@@ -285,9 +285,10 @@ class MigrateSchedulesDryrunTests(unittest.TestCase):
             exit_code = main([str(self.db_path)])
 
         output = stdout_buf.getvalue()
-        self.assertEqual(exit_code, 3)
-        self.assertIn("[6] Расхождения времени у подписок одной папки: 1", output)
+        self.assertEqual(exit_code, 0)
+        self.assertIn("ВЕРДИКТ: ЧИСТО, КОНФЛИКТОВ НЕ ОБНАРУЖЕНО (КОД ВЫХОДА 0)", output)
         self.assertIn("папка='news'", output)
+        self.assertIn("next_send_at папки пересчитает T21", output)
 
     def test_conflict_empty_or_inactive_folders_detected(self):
         """Конфликт: тег существует только у отключённых подписок."""
@@ -486,6 +487,49 @@ class MigrateSchedulesDryrunTests(unittest.TestCase):
         hash_after = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
         self.assertEqual(hash_before, hash_after, "Хеш базы данных изменился!")
         self.assertEqual(mtime_before, mtime_after, "mtime базы данных изменился!")
+
+    def test_casefold_tag_collision_detected_exit_3(self):
+        """Конфликт: теги одного пользователя различаются только регистром (casefold)."""
+        self._seed_clean_data()
+        self._execute_write(
+            """
+            INSERT INTO subscriptions (user_id, channel_username, channel_title, period, tag, is_disabled)
+            VALUES (101, 'chan_case1', 'Case 1', 'daily', 'Новости', 0),
+                   (101, 'chan_case2', 'Case 2', 'daily', 'новости', 0)
+            """
+        )
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            exit_code = main([str(self.db_path)])
+
+        output = stdout_buf.getvalue()
+        self.assertEqual(exit_code, 3)
+        self.assertIn("ВЕРДИКТ: ОБНАРУЖЕНЫ КОНФЛИКТЫ (КОД ВЫХОДА 3)", output)
+        self.assertIn("[9] Коллизии имён папок по регистру (casefold): 1", output)
+        self.assertIn("новости", output)
+        self.assertIn("Новости", output)
+
+    def test_missing_time_folder_listed_separately(self):
+        """Папка без времени в digest_settings выводится в отдельном списке с подставляемым дефолтом."""
+        self._seed_clean_data()
+        # Добавляем подписку с новым тегом, для которого нет записи в digest_settings
+        self._execute_write(
+            """
+            INSERT INTO subscriptions (user_id, channel_username, channel_title, period, tag, is_disabled)
+            VALUES (102, 'notime_chan', 'No Time', 'daily', 'notime_tag', 0)
+            """
+        )
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            exit_code = main([str(self.db_path)])
+
+        # Отсутствие записи в digest_settings — не конфликт: применяется дефолт из кода
+        self.assertEqual(exit_code, 0)
+        output = stdout_buf.getvalue()
+        self.assertIn("ПАПКИ БЕЗ ЯВНОГО ВРЕМЕНИ В DIGEST_SETTINGS (ПОДСТАВЛЯЕТСЯ ДЕФОЛТ 07:00):", output)
+        self.assertIn("user=102 папка='notime_tag' period=daily -> дефолт 07:00", output)
 
 
 if __name__ == "__main__":
