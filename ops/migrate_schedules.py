@@ -29,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
 from ops.migrate_schedules_dryrun import (
     analyze_migration,
     format_report,
+    normalize_tag,
     open_readonly_db,
 )
 
@@ -182,10 +183,7 @@ def apply_migration(conn: sqlite3.Connection, email_folders: bool = False) -> di
 
         folders_for_user: dict[str, dict[str, Any]] = {}
         for s in sub_rows:
-            tag_raw = s["tag"]
-            tag_clean = tag_raw.strip() if isinstance(tag_raw, str) else ""
-            folder_name = tag_clean if tag_clean else "Основное"
-            is_default = 1 if folder_name == "Основное" else 0
+            folder_name, is_default = normalize_tag(s["tag"])
             raw_period = s["period"]
 
             if folder_name not in folders_for_user:
@@ -197,6 +195,20 @@ def apply_migration(conn: sqlite3.Connection, email_folders: bool = False) -> di
                     "sub_ids": [],
                 }
             folders_for_user[folder_name]["sub_ids"].append(s["id"])
+
+        # Проверка коллизий имён папок одного пользователя по casefold()
+        cf_seen: dict[str, str] = {}
+        for er in conn.execute("SELECT name FROM folders WHERE user_id = ?", (uid,)):
+            cf_seen[er["name"].casefold()] = er["name"]
+
+        for f_name in folders_for_user:
+            cf = f_name.casefold()
+            if cf in cf_seen and cf_seen[cf] != f_name:
+                raise ValueError(
+                    f"Коллизия имён папок по регистру (casefold) для user_id={uid}: "
+                    f"'{f_name}' и '{cf_seen[cf]}'. Миграция заблокирована."
+                )
+            cf_seen[cf] = f_name
 
         for f_name, f_data in folders_for_user.items():
             folder_period = f_data["period"]
@@ -255,46 +267,55 @@ def apply_migration(conn: sqlite3.Connection, email_folders: bool = False) -> di
 
             now_iso = now_utc.strftime("%Y-%m-%d %H:%M:%S")
 
-            cursor_folder = conn.execute(
-                """
-                INSERT INTO folders (
-                    user_id, name, is_default, period, times, send_hour, send_minute,
-                    weekdays, month_day, monthly_mode, delivery, is_enabled, next_send_at,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-                ON CONFLICT(user_id, name) DO NOTHING
-                """,
-                (
-                    uid,
-                    f_data["name"],
-                    f_data["is_default"],
-                    folder_period,
-                    times,
-                    send_hour,
-                    send_minute,
-                    weekdays_val,
-                    month_day_val,
-                    monthly_mode_val,
-                    delivery,
-                    f_data["next_send_at"],
-                    now_iso,
-                    now_iso,
-                ),
-            )
-            if cursor_folder.rowcount > 0:
-                folders_created += cursor_folder.rowcount
-
-            # Получаем id папки (для новых и для ранее созданных)
-            row_folder = conn.execute(
-                "SELECT id FROM folders WHERE user_id = ? AND name = ?",
-                (uid, f_data["name"]),
+            # Идемпотентность без слепого ON CONFLICT DO NOTHING:
+            # если папка (user_id, name) уже есть, сверяем period и is_default.
+            row_existing = conn.execute(
+                "SELECT id, period, is_default FROM folders WHERE user_id = ? AND name = ?",
+                (uid, f_name),
             ).fetchone()
-            folder_id = row_folder["id"]
+
+            if row_existing is not None:
+                if row_existing["period"] != folder_period or row_existing["is_default"] != f_data["is_default"]:
+                    raise ValueError(
+                        f"Конфликт существующей папки id={row_existing['id']} (user_id={uid}, name='{f_name}'): "
+                        f"в БД (period='{row_existing['period']}', is_default={row_existing['is_default']}), "
+                        f"но миграция ожидает (period='{folder_period}', is_default={f_data['is_default']}). "
+                        f"Транзакция отменена."
+                    )
+                folder_id = row_existing["id"]
+            else:
+                cursor_folder = conn.execute(
+                    """
+                    INSERT INTO folders (
+                        user_id, name, is_default, period, times, send_hour, send_minute,
+                        weekdays, month_day, monthly_mode, delivery, is_enabled, next_send_at,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    """,
+                    (
+                        uid,
+                        f_data["name"],
+                        f_data["is_default"],
+                        folder_period,
+                        times,
+                        send_hour,
+                        send_minute,
+                        weekdays_val,
+                        month_day_val,
+                        monthly_mode_val,
+                        delivery,
+                        f_data["next_send_at"],
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+                folder_id = cursor_folder.lastrowid
+                folders_created += 1
 
             for sub_id in f_data["sub_ids"]:
                 cursor_sub = conn.execute(
-                    "UPDATE subscriptions SET folder_id = ? WHERE id = ?",
-                    (folder_id, sub_id),
+                    "UPDATE subscriptions SET folder_id = ? WHERE id = ? AND (folder_id IS NULL OR folder_id != ?)",
+                    (folder_id, sub_id, folder_id),
                 )
                 subscriptions_linked += cursor_sub.rowcount
 
@@ -302,6 +323,17 @@ def apply_migration(conn: sqlite3.Connection, email_folders: bool = False) -> di
     conn.execute(
         "UPDATE user_prefs SET digest_scheduler_version = 'v1' WHERE digest_scheduler_version IS NULL"
     )
+
+    # Инвариант перед COMMIT: число активных подписок с folder_id IS NULL должно быть равно 0
+    row_unlinked = conn.execute(
+        "SELECT COUNT(*) FROM subscriptions WHERE is_disabled = 0 AND folder_id IS NULL"
+    ).fetchone()
+    unlinked_active = int(row_unlinked[0] or 0)
+    if unlinked_active > 0:
+        raise RuntimeError(
+            f"Нарушение инварианта перед COMMIT: обнаружено {unlinked_active} активных подписок без folder_id. "
+            "Транзакция откатывается."
+        )
 
     return {
         "folders_created": folders_created,

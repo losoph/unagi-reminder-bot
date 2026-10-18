@@ -487,6 +487,48 @@ class MigrateSchedulesDryrunTests(unittest.TestCase):
         self.assertEqual(hash_before, hash_after, "Хеш базы данных изменился!")
         self.assertEqual(mtime_before, mtime_after, "mtime базы данных изменился!")
 
+    def test_casefold_tag_collision_detected_exit_3(self):
+        """Конфликт: теги одного пользователя различаются только регистром (casefold)."""
+        self._seed_clean_data()
+        self._execute_write(
+            """
+            INSERT INTO subscriptions (user_id, channel_username, channel_title, period, tag, is_disabled)
+            VALUES (101, 'chan_case1', 'Case 1', 'daily', 'Новости', 0),
+                   (101, 'chan_case2', 'Case 2', 'daily', 'новости', 0)
+            """
+        )
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            exit_code = main([str(self.db_path)])
+
+        output = stdout_buf.getvalue()
+        self.assertEqual(exit_code, 3)
+        self.assertIn("ВЕРДИКТ: ОБНАРУЖЕНЫ КОНФЛИКТЫ (КОД ВЫХОДА 3)", output)
+        self.assertIn("[9] Коллизии имён папок по регистру (casefold): 1", output)
+        self.assertIn("новости", output)
+        self.assertIn("Новости", output)
+
+    def test_missing_time_folder_listed_separately(self):
+        """Папка без времени в digest_settings выводится в отдельном списке с подставляемым дефолтом."""
+        self._seed_clean_data()
+        # Добавляем подписку с новым тегом, для которого нет записи в digest_settings
+        self._execute_write(
+            """
+            INSERT INTO subscriptions (user_id, channel_username, channel_title, period, tag, is_disabled)
+            VALUES (102, 'notime_chan', 'No Time', 'daily', 'notime_tag', 0)
+            """
+        )
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            exit_code = main([str(self.db_path)])
+
+        self.assertEqual(exit_code, 3)
+        output = stdout_buf.getvalue()
+        self.assertIn("ПАПКИ БЕЗ ЯВНОГО ВРЕМЕНИ В DIGEST_SETTINGS (ПОДСТАВЛЯЕТСЯ ДЕФОЛТ 07:00):", output)
+        self.assertIn("user=102 папка='notime_tag' period=daily -> дефолт 07:00", output)
+
 
 if __name__ == "__main__":
     unittest.main()
