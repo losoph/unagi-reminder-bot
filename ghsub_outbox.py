@@ -184,6 +184,13 @@ def compute_window(to_iso: str, period: str, tz_name: str | None = None) -> dict
     }
 
 
+def clean_recipient_email(address: str | None) -> str | None:
+    """Адрес для поля recipient_email: одна строка вида a@b.c без пробелов, иначе None."""
+    if address and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", address) and len(address) <= 254 and address.isprintable():
+        return address
+    return None
+
+
 def build_ghsub_edition(
     sections: list[dict],
     title_plain: str | None = None,
@@ -331,8 +338,9 @@ def build_ghsub_edition(
 
     # Решение 18.10 (консенсус Claude + Argon + Jev): источник правды об адресе — unagi (подтверждение кодом); ghsub берёт адрес из выпуска.
     # Только одна строка вида a@b.c без пробелов и переводов строк; иначе поле не пишется и ghsub отклонит выпуск (рядом нет адреса — нет письма).
-    if address and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", address) and len(address) <= 254 and address.isprintable():
-        payload["recipient_email"] = address
+    email = clean_recipient_email(address)
+    if email:
+        payload["recipient_email"] = email
     bot_username = get_bot_username()
     if bot_username:
         payload["manage_url"] = f"https://t.me/{bot_username}?start=email"
@@ -365,6 +373,11 @@ def write_ghsub_outbox(
         telegraph_url=telegraph_url,
     )
 
+    return write_edition_atomically(payload, outbox_dir)
+
+
+def write_edition_atomically(payload: dict, outbox_dir: str) -> str:
+    """Записать выпуск в ящик ghsub: .tmp в том же каталоге, затем os.replace в <edition_id>.json."""
     edition_id = payload["edition_id"]
     os.makedirs(outbox_dir, exist_ok=True)
     target_path = os.path.join(outbox_dir, f"{edition_id}.json")
