@@ -19,7 +19,6 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
-from typing import Any
 
 # SEC1 / Q4D: Разрешаем импорты независимо от текущей директории запуска
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -29,8 +28,8 @@ if str(REPO_ROOT) not in sys.path:
 from ops.migrate_schedules_dryrun import (
     analyze_migration,
     format_report,
-    normalize_tag,
     open_readonly_db,
+    plan_user_folders,
 )
 
 
@@ -152,12 +151,16 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def apply_migration(conn: sqlite3.Connection, email_folders: bool = False) -> dict[str, int]:
+def apply_migration(
+    conn: sqlite3.Connection,
+    email_folders: bool = False,
+    split_by_period: bool = False,
+) -> dict[str, int]:
     """Выполняет шаги §4.1 п.4–6 миграции данных в существующей транзакции.
 
     Гарантии:
-    - Все вставки защищены ON CONFLICT DO NOTHING.
     - subscriptions.last_post_id не изменяется.
+    - subscriptions.period не изменяется.
     - digest_scheduler_version остаётся 'v1'.
     - Повторный запуск идемпотентен и ничего не меняет.
     """
@@ -172,47 +175,24 @@ def apply_migration(conn: sqlite3.Connection, email_folders: bool = False) -> di
 
     for u_row in users_with_subs:
         uid = u_row["user_id"]
-        sub_rows = conn.execute(
-            """
-            SELECT id, channel_username, period, tag, last_post_id, next_send_at
-            FROM subscriptions
-            WHERE user_id = ? AND is_disabled = 0
-            ORDER BY id
-            """,
-            (uid,),
-        ).fetchall()
+        target_folders, split_records, collisions = plan_user_folders(
+            conn, uid, split_by_period=split_by_period
+        )
 
-        folders_for_user: dict[str, dict[str, Any]] = {}
-        for s in sub_rows:
-            folder_name, is_default = normalize_tag(s["tag"])
-            raw_period = s["period"]
+        if collisions:
+            c = collisions[0]
+            raise ValueError(
+                f"Коллизия имён папок по регистру (casefold) для user_id={uid}: "
+                f"'{c['names']}'. Миграция заблокирована."
+            )
 
-            if folder_name not in folders_for_user:
-                folders_for_user[folder_name] = {
-                    "name": folder_name,
-                    "is_default": is_default,
-                    "period": raw_period,
-                    "next_send_at": s["next_send_at"],
-                    "sub_ids": [],
-                }
-            folders_for_user[folder_name]["sub_ids"].append(s["id"])
-
-        # Проверка коллизий имён папок одного пользователя по casefold()
-        cf_seen: dict[str, str] = {}
-        for er in conn.execute("SELECT name FROM folders WHERE user_id = ?", (uid,)):
-            cf_seen[er["name"].casefold()] = er["name"]
-
-        for f_name in folders_for_user:
-            cf = f_name.casefold()
-            if cf in cf_seen and cf_seen[cf] != f_name:
-                raise ValueError(
-                    f"Коллизия имён папок по регистру (casefold) для user_id={uid}: "
-                    f"'{f_name}' и '{cf_seen[cf]}'. Миграция заблокирована."
-                )
-            cf_seen[cf] = f_name
-
-        for f_name, f_data in folders_for_user.items():
-            folder_period = f_data["period"]
+        for tf in target_folders:
+            f_name = tf["folder_name"]
+            f_is_default = tf["is_default"]
+            folder_period = tf["period"]
+            sub_ids = [s["id"] for s in tf["subs"]]
+            times_sub = [s["next_send_at"] for s in tf["subs"] if s["next_send_at"] is not None]
+            folder_next_send_at = min(times_sub) if times_sub else None
 
             row_settings = conn.execute(
                 """
@@ -276,11 +256,11 @@ def apply_migration(conn: sqlite3.Connection, email_folders: bool = False) -> di
             ).fetchone()
 
             if row_existing is not None:
-                if row_existing["period"] != folder_period or row_existing["is_default"] != f_data["is_default"]:
+                if row_existing["period"] != folder_period or row_existing["is_default"] != f_is_default:
                     raise ValueError(
                         f"Конфликт существующей папки id={row_existing['id']} (user_id={uid}, name='{f_name}'): "
                         f"в БД (period='{row_existing['period']}', is_default={row_existing['is_default']}), "
-                        f"но миграция ожидает (period='{folder_period}', is_default={f_data['is_default']}). "
+                        f"но миграция ожидает (period='{folder_period}', is_default={f_is_default}). "
                         f"Транзакция отменена."
                     )
                 folder_id = row_existing["id"]
@@ -295,8 +275,8 @@ def apply_migration(conn: sqlite3.Connection, email_folders: bool = False) -> di
                     """,
                     (
                         uid,
-                        f_data["name"],
-                        f_data["is_default"],
+                        f_name,
+                        f_is_default,
                         folder_period,
                         times,
                         send_hour,
@@ -305,7 +285,7 @@ def apply_migration(conn: sqlite3.Connection, email_folders: bool = False) -> di
                         month_day_val,
                         monthly_mode_val,
                         delivery,
-                        f_data["next_send_at"],
+                        folder_next_send_at,
                         now_iso,
                         now_iso,
                     ),
@@ -313,7 +293,7 @@ def apply_migration(conn: sqlite3.Connection, email_folders: bool = False) -> di
                 folder_id = cursor_folder.lastrowid
                 folders_created += 1
 
-            for sub_id in f_data["sub_ids"]:
+            for sub_id in sub_ids:
                 cursor_sub = conn.execute(
                     "UPDATE subscriptions SET folder_id = ? WHERE id = ? AND (folder_id IS NULL OR folder_id != ?)",
                     (folder_id, sub_id, folder_id),
@@ -357,6 +337,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Переводить папки email-пользователей в delivery='email' (по умолчанию delivery='telegram')",
     )
+    parser.add_argument(
+        "--split-by-period",
+        action="store_true",
+        help="Разбивать папки/теги с неоднородными period на отдельные папки по period",
+    )
     args = parser.parse_args(argv)
 
     db_path = Path(args.db_path)
@@ -372,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        report = analyze_migration(ro_conn)
+        report = analyze_migration(ro_conn, split_by_period=args.split_by_period)
     except Exception as exc:
         print(f"Ошибка анализа базы данных: {exc}", file=sys.stderr)
         return 1
@@ -406,7 +391,11 @@ def main(argv: list[str] | None = None) -> int:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("BEGIN IMMEDIATE")
 
-        stats = apply_migration(conn, email_folders=args.email_folders)
+        stats = apply_migration(
+            conn,
+            email_folders=args.email_folders,
+            split_by_period=args.split_by_period,
+        )
 
         conn.commit()
     except Exception as exc:

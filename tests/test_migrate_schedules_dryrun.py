@@ -267,8 +267,8 @@ class MigrateSchedulesDryrunTests(unittest.TestCase):
         self.assertIn("[7] Некорректные параметры расписания", output)
         self.assertIn("hourly", output)
 
-    def test_conflict_time_discrepancy_in_folder_detected_exit_3(self):
-        """Конфликт: расхождения времени у подписок одной папки (разные next_send_at)."""
+    def test_time_discrepancy_in_folder_is_info_exit_0(self):
+        """Расхождения времени у подписок одной папки больше не конфликт, а информация (код 0)."""
         self._seed_clean_data()
         # В папке 'news' подписки tech_news и world_news имеют '2026-10-18 08:30:00'.
         # Меняем одной из них время на 19:00:00
@@ -285,9 +285,10 @@ class MigrateSchedulesDryrunTests(unittest.TestCase):
             exit_code = main([str(self.db_path)])
 
         output = stdout_buf.getvalue()
-        self.assertEqual(exit_code, 3)
-        self.assertIn("[6] Расхождения времени у подписок одной папки: 1", output)
+        self.assertEqual(exit_code, 0)
+        self.assertIn("ВЕРДИКТ: ЧИСТО, КОНФЛИКТОВ НЕ ОБНАРУЖЕНО (КОД ВЫХОДА 0)", output)
         self.assertIn("папка='news'", output)
+        self.assertIn("next_send_at папки пересчитает T21", output)
 
     def test_conflict_empty_or_inactive_folders_detected(self):
         """Конфликт: тег существует только у отключённых подписок."""

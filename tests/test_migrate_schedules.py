@@ -426,8 +426,8 @@ class MigrateSchedulesTests(unittest.TestCase):
         # Симулируем сценарий, когда в процессе apply_migration активная подписка не получила folder_id
         real_apply = apply_migration
 
-        def flawed_apply(conn, email_folders=False):
-            res = real_apply(conn, email_folders)
+        def flawed_apply(conn, email_folders=False, split_by_period=False):
+            res = real_apply(conn, email_folders=email_folders, split_by_period=split_by_period)
             # Принудительно сбрасываем folder_id у одной активной подписки
             conn.execute("UPDATE subscriptions SET folder_id = NULL WHERE id = 1")
             # Проверяем инвариант вручную так же, как это делает реальный код
@@ -509,6 +509,264 @@ class MigrateSchedulesTests(unittest.TestCase):
         self.assertIn("delivery", output)
         self.assertIn("число каналов", output)
         self.assertIn("ПАПКИ БЕЗ ЯВНОГО ВРЕМЕНИ В DIGEST_SETTINGS", output)
+
+
+class MigrateSchedulesSplitByPeriodTests(unittest.TestCase):
+    """Тесты режима --split-by-period: моделирование прод-случаев G1."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "test_split.db"
+        self.original_db_path = db.DB_PATH
+        db.DB_PATH = str(self.db_path)
+        db.init_db()
+
+    def tearDown(self):
+        db.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+
+    def _execute_write(self, sql: str, params: tuple = ()) -> None:
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(sql, params)
+            conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+
+    def _seed_prod_cases(self) -> None:
+        """Моделирует прод-случаи G1:
+        1. Основное: daily + weekly + monthly
+        2. Partners: daily + weekly
+        3. Канал дважды: @cross_chan в Digital (daily) и в Partners (weekly)
+        4. News: daily (активная) + weekly (paused)
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            # Подписки пользователя 101
+            conn.execute(
+                """
+                INSERT INTO subscriptions (id, user_id, channel_username, channel_title, period, tag, last_post_id, is_disabled, is_paused, next_send_at)
+                VALUES
+                    -- Основное (tagless): daily + weekly + monthly
+                    (1, 101, 'main_d', 'Main Daily', 'daily', NULL, 110, 0, 0, '2026-10-18 08:30:00'),
+                    (2, 101, 'main_w', 'Main Weekly', 'weekly', NULL, 120, 0, 0, '2026-10-18 09:00:00'),
+                    (3, 101, 'main_m', 'Main Monthly', 'monthly', NULL, 130, 0, 0, '2026-10-18 10:00:00'),
+                    -- Partners: daily + weekly (дубль канала @cross_chan в Partners weekly)
+                    (4, 101, 'part_d', 'Partners Daily', 'daily', 'Partners', 210, 0, 0, '2026-10-18 08:30:00'),
+                    (5, 101, 'cross_chan', 'Cross Chan', 'weekly', 'Partners', 220, 0, 0, '2026-10-18 09:00:00'),
+                    -- Digital: daily (дубль канала @cross_chan в Digital daily)
+                    (6, 101, 'cross_chan', 'Cross Chan', 'daily', 'Digital', 310, 0, 0, '2026-10-18 08:30:00'),
+                    -- News: daily (active) + weekly (paused)
+                    (7, 101, 'news_active', 'News Active', 'daily', 'News', 410, 0, 0, '2026-10-18 08:30:00'),
+                    (8, 101, 'news_paused', 'News Paused', 'weekly', 'News', 420, 0, 1, '2026-10-18 09:00:00')
+                """
+            )
+            # Настройки digest_settings
+            conn.execute(
+                """
+                INSERT INTO digest_settings (user_id, period, send_hour, send_minute, weekday, month_day, monthly_mode)
+                VALUES
+                    (101, 'daily', 8, 30, 0, 1, 'date'),
+                    (101, 'weekly', 9, 0, 6, 1, 'date'),
+                    (101, 'monthly', 10, 0, 1, 1, 'date')
+                """
+            )
+            # Настройки user_prefs
+            conn.execute(
+                """
+                INSERT INTO user_prefs (user_id, timezone, digest_scheduler_version)
+                VALUES (101, 'Europe/Moscow', 'v1')
+                """
+            )
+            conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+
+    def test_prod_cases_without_split_flag_exit_3_and_db_untouched(self):
+        """Без флага --split-by-period: код 3 и БД неизменна по хэшу (и в dry-run, и с --apply)."""
+        self._seed_prod_cases()
+        hash_before = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+
+        # 1. Без флага в dry-run
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf):
+            code_dry = main([str(self.db_path)])
+        self.assertEqual(code_dry, 3)
+        self.assertIn("ВЕРДИКТ: ОБНАРУЖЕНЫ КОНФЛИКТЫ (КОД ВЫХОДА 3)", stdout_buf.getvalue())
+
+        hash_after_dry = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+        self.assertEqual(hash_before, hash_after_dry)
+
+        # 2. Без флага с --apply
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf):
+            code_apply = main([str(self.db_path), "--apply"])
+        self.assertEqual(code_apply, 3)
+        self.assertIn("Миграция заблокирована (код возврата 3)", stderr_buf.getvalue())
+
+        hash_after_apply = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+        self.assertEqual(hash_before, hash_after_apply, "Хеш БД изменился при блокировке!")
+
+    def test_prod_cases_dryrun_with_split_by_period_flag_exit_0(self):
+        """С флагом --split-by-period: dry-run успешен (код 0), отчёт показывает разбитые папки и предупреждения."""
+        self._seed_prod_cases()
+        hash_before = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            code = main([str(self.db_path), "--split-by-period"])
+
+        self.assertEqual(code, 0)
+        output = stdout_buf.getvalue()
+        self.assertIn("ВЕРДИКТ: ЧИСТО, КОНФЛИКТОВ НЕ ОБНАРУЖЕНО (КОД ВЫХОДА 0)", output)
+        self.assertIn("РАЗБИТЫЕ ПАПКИ (БЫЛО → СТАЛО):", output)
+        self.assertIn("Основное", output)
+        self.assertIn("Основное — неделя", output)
+        self.assertIn("Основное — месяц", output)
+        self.assertIn("Partners — неделя", output)
+        self.assertIn("News — неделя", output)
+        self.assertIn("ПРЕДУПРЕЖДЕНИЯ ДО CUTOVER (T21):", output)
+        self.assertIn("cross_chan", output)
+        self.assertIn("решить до cutover v2 (T21)", output)
+
+        hash_after = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+        self.assertEqual(hash_before, hash_after)
+
+    def test_prod_cases_apply_with_split_by_period_success(self):
+        """С флагом --split-by-period --apply: папки созданы, подписки привязаны, last_post_id и period неизменны, повторный запуск идемпотентен."""
+        self._seed_prod_cases()
+
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            exit_code = main([str(self.db_path), "--split-by-period", "--apply"])
+
+        self.assertEqual(exit_code, 0)
+        output = stdout_buf.getvalue()
+        self.assertIn("[УСПЕХ] Миграция успешно завершена", output)
+        self.assertIn("Создано новых папок:         8", output)
+        self.assertIn("Привязано подписок к папкам: 8", output)
+
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            # 1. Проверяем созданные папки
+            folders = conn.execute("SELECT * FROM folders WHERE user_id = 101 ORDER BY name").fetchall()
+            self.assertEqual(len(folders), 8)
+            f_map = {f["name"]: dict(f) for f in folders}
+
+            # Имена и периоды
+            expected_folders = {
+                "Digital": ("daily", 0, 8, 30),
+                "News": ("daily", 0, 8, 30),
+                "News — неделя": ("weekly", 0, 9, 0),
+                "Partners": ("daily", 0, 8, 30),
+                "Partners — неделя": ("weekly", 0, 9, 0),
+                "Основное": ("daily", 1, 8, 30),
+                "Основное — месяц": ("monthly", 0, 10, 0),
+                "Основное — неделя": ("weekly", 0, 9, 0),
+            }
+            for name, (exp_period, exp_is_default, exp_h, exp_m) in expected_folders.items():
+                self.assertIn(name, f_map, f"Папка {name} должна быть создана")
+                f = f_map[name]
+                self.assertEqual(f["period"], exp_period, f"Неверный period у папки {name}")
+                self.assertEqual(f["is_default"], exp_is_default, f"Неверный is_default у папки {name}")
+                self.assertEqual(f["send_hour"], exp_h, f"Неверный send_hour у папки {name}")
+                self.assertEqual(f["send_minute"], exp_m, f"Неверный send_minute у папки {name}")
+
+            # 2. Инвариант: активных подписок с folder_id IS NULL строго 0
+            row_null = conn.execute(
+                "SELECT COUNT(*) FROM subscriptions WHERE is_disabled = 0 AND folder_id IS NULL"
+            ).fetchone()
+            self.assertEqual(row_null[0], 0, "Все активные подписки должны иметь folder_id!")
+
+            # 3. subscriptions.last_post_id и period не изменились
+            subs = conn.execute("SELECT * FROM subscriptions WHERE user_id = 101 ORDER BY id").fetchall()
+            expected_subs = [
+                (1, "main_d", "daily", 110, "Основное", 0),
+                (2, "main_w", "weekly", 120, "Основное — неделя", 0),
+                (3, "main_m", "monthly", 130, "Основное — месяц", 0),
+                (4, "part_d", "daily", 210, "Partners", 0),
+                (5, "cross_chan", "weekly", 220, "Partners — неделя", 0),
+                (6, "cross_chan", "daily", 310, "Digital", 0),
+                (7, "news_active", "daily", 410, "News", 0),
+                (8, "news_paused", "weekly", 420, "News — неделя", 1),
+            ]
+            for s, (exp_id, exp_chan, exp_p, exp_lpid, exp_folder_name, exp_paused) in zip(subs, expected_subs, strict=True):
+                self.assertEqual(s["id"], exp_id)
+                self.assertEqual(s["channel_username"], exp_chan)
+                self.assertEqual(s["period"], exp_p, "Период подписки не должен меняться!")
+                self.assertEqual(s["last_post_id"], exp_lpid, "last_post_id не должен меняться!")
+                self.assertEqual(s["is_paused"], exp_paused)
+                # Проверяем правильность привязанной папки
+                self.assertEqual(s["folder_id"], f_map[exp_folder_name]["id"])
+
+            # 4. user_prefs.digest_scheduler_version остаётся 'v1'
+            pref = conn.execute("SELECT digest_scheduler_version FROM user_prefs WHERE user_id = 101").fetchone()
+            self.assertEqual(pref[0], "v1")
+        finally:
+            conn.close()
+
+        # 5. Повторный запуск безопасен и ничего не меняет
+        stdout_buf2 = io.StringIO()
+        with patch("sys.stdout", stdout_buf2):
+            code_repeat = main([str(self.db_path), "--split-by-period", "--apply"])
+        self.assertEqual(code_repeat, 0)
+        out_repeat = stdout_buf2.getvalue()
+        self.assertIn("Создано новых папок:         0", out_repeat)
+        self.assertIn("Привязано подписок к папкам: 0", out_repeat)
+
+    def test_duplicate_channel_in_same_folder_with_same_period_remains_conflict_exit_3(self):
+        """Дубль канала В ОДНОЙ папке с одним period остаётся строгим конфликтом (код 3) даже с флагом."""
+        self._seed_prod_cases()
+        # Добавляем дубль канала @news_active в папку News с периодом daily
+        self._execute_write(
+            """
+            INSERT INTO subscriptions (id, user_id, channel_username, channel_title, period, tag, last_post_id, is_disabled, is_paused)
+            VALUES (9, 101, '@news_active', 'News Active Duplicate', 'daily', 'News', 999, 0, 0)
+            """
+        )
+        hash_before = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf):
+            exit_code = main([str(self.db_path), "--split-by-period", "--apply"])
+
+        self.assertEqual(exit_code, 3)
+        self.assertIn("Канал дублируется внутри одной папки", stdout_buf.getvalue())
+        self.assertIn("news_active", stdout_buf.getvalue())
+        self.assertIn("Миграция заблокирована (код возврата 3)", stderr_buf.getvalue())
+
+        hash_after = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+        self.assertEqual(hash_before, hash_after, "БД не должна изменяться при конфликте дублирования в папке")
+
+    def test_casefold_collision_with_existing_tag_remains_conflict_exit_3(self):
+        """Коллизия сгенерированного имени папки с существующим тегом пользователя даёт код 3 и блокирует миграцию."""
+        self._seed_prod_cases()
+        # Пользователь уже имеет существующий тег 'Partners — неделя'
+        self._execute_write(
+            """
+            INSERT INTO subscriptions (id, user_id, channel_username, channel_title, period, tag, last_post_id, is_disabled, is_paused)
+            VALUES (9, 101, 'another_chan', 'Another', 'weekly', 'Partners — неделя', 888, 0, 0)
+            """
+        )
+        hash_before = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf), patch("sys.stderr", stderr_buf):
+            exit_code = main([str(self.db_path), "--split-by-period", "--apply"])
+
+        self.assertEqual(exit_code, 3)
+        self.assertIn("Коллизии имён папок по регистру (casefold)", stdout_buf.getvalue())
+        self.assertIn("Миграция заблокирована (код возврата 3)", stderr_buf.getvalue())
+
+        hash_after = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+        self.assertEqual(hash_before, hash_after)
 
 
 if __name__ == "__main__":
