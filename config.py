@@ -174,6 +174,8 @@ class EmailConfig:
     smtp_from: str = ""
     daily_limit_per_user: int = 5
     daily_limit_per_address: int = 5
+    delivery: str = "unagi"
+    outbox_dir: str = "storage/ghsub-outbox"
 
 
 @dataclass(frozen=True)
@@ -368,6 +370,8 @@ def _build_email_config(env: Mapping[str, str]) -> EmailConfig:
         smtp_from=env.get("SMTP_FROM", ""),
         daily_limit_per_user=_parse_int(env.get("EMAIL_DAILY_LIMIT_PER_USER"), 5),
         daily_limit_per_address=_parse_int(env.get("EMAIL_DAILY_LIMIT_PER_ADDRESS"), 5),
+        delivery=env.get("EMAIL_DELIVERY", "unagi").strip().lower() or "unagi",
+        outbox_dir=env.get("EMAIL_OUTBOX_DIR", "storage/ghsub-outbox").strip() or "storage/ghsub-outbox",
     )
 
 

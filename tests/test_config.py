@@ -125,6 +125,8 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
         self.assertEqual(em.smtp_from, "")
         self.assertEqual(em.daily_limit_per_user, 5)
         self.assertEqual(em.daily_limit_per_address, 5)
+        self.assertEqual(em.delivery, "unagi")
+        self.assertEqual(em.outbox_dir, "storage/ghsub-outbox")
 
         # 4. Telegraph domain
         tg = cfg.telegraph
@@ -255,6 +257,8 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
             "SMTP_FROM": "sender@example.com",
             "EMAIL_DAILY_LIMIT_PER_USER": "10",
             "EMAIL_DAILY_LIMIT_PER_ADDRESS": "15",
+            "EMAIL_DELIVERY": "GHSUB",
+            "EMAIL_OUTBOX_DIR": "/var/custom/outbox",
             "TELEGRAPH_TOKEN": "tg_token_xyz",
             "TELEGRAPH_POST_CHARS": "2000",
             "WATCHDOG_CHECK_INTERVAL_SECONDS": "600",
@@ -331,6 +335,8 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
             self.assertEqual(em.smtp_from, "sender@example.com")
             self.assertEqual(em.daily_limit_per_user, 10)
             self.assertEqual(em.daily_limit_per_address, 15)
+            self.assertEqual(em.delivery, "ghsub")
+            self.assertEqual(em.outbox_dir, "/var/custom/outbox")
 
             tg = cfg.telegraph
             self.assertEqual(tg.token, "tg_token_xyz")

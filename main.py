@@ -748,6 +748,7 @@ async def deliver_digest(
     sections: list[dict],
     *,
     group_by_period: bool = True,
+    scheduled_at: datetime | str | None = None,
 ) -> bool:
     """Send a digest: each period goes either to email or to Telegram, never both.
 
@@ -769,7 +770,12 @@ async def deliver_digest(
     email_sections = [s for s in sections if s.get("period") in email_periods]
     telegram_sections = [s for s in sections if s.get("period") not in email_periods]
     note = ""
-    if email_sections and not await send_digest_email(address, *prepare(email_sections)):
+    if email_sections and not await send_digest_email(
+        address,
+        *prepare(email_sections),
+        user_id=user_id,
+        scheduled_at=scheduled_at,
+    ):
         telegram_sections += email_sections
         note = "📧 Не удалось отправить дайджест на почту — присылаю сюда."
     if telegram_sections:
@@ -826,9 +832,31 @@ def build_section_actions(section: dict) -> dict | None:
     return {"unsubscribe": unsubscribe_url, "move": moves}
 
 
-async def send_digest_email(address: str, title_plain: str, sections: list[dict]) -> bool:
+async def send_digest_email(
+    address: str,
+    title_plain: str,
+    sections: list[dict],
+    *,
+    user_id: int | str | None = None,
+    scheduled_at: datetime | str | None = None,
+) -> bool:
     """Email delivery of a digest; never raises."""
     try:
+        from config import settings
+
+        if settings().email.delivery == "ghsub":
+            from ghsub_outbox import write_ghsub_outbox
+
+            outbox_path = await asyncio.to_thread(
+                write_ghsub_outbox,
+                sections=sections,
+                title_plain=title_plain,
+                user_id=user_id,
+                address=address,
+                scheduled_at=scheduled_at,
+            )
+            return bool(outbox_path)
+
         title = f"{title_plain} — {local_now().strftime('%d.%m.%Y')}"
         manage_url = build_bot_deep_link("em_off")
         email_sections = [{**section, "actions": build_section_actions(section)} for section in sections]
@@ -3708,6 +3736,8 @@ async def process_user_edition(
                         "username": result["username"],
                         "posts": result["posts"],
                         "omitted_count": result.get("omitted_count", 0),
+                        "user_id": user_id,
+                        "scheduled_at": sub[8] if len(sub) > 8 else None,
                     }
                 )
                 try:
@@ -3722,8 +3752,12 @@ async def process_user_edition(
         )
         delivery_error: TelegramAPIError | None = None
         if edition_sections:
+            edition_scheduled_at = min(
+                (sub[8] for period in periods for sub in by_period[period] if len(sub) > 8 and sub[8]),
+                default=now_str,
+            )
             try:
-                await deliver_digest(user_id, None, edition_sections)
+                await deliver_digest(user_id, None, edition_sections, scheduled_at=edition_scheduled_at)
                 reset_user_alert_consecutive_failures(user_id)
                 stats["delivered_users"] += 1
                 stats["delivered_posts"] += sum(len(section["posts"]) for section in edition_sections)
