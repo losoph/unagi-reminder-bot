@@ -1,4 +1,0 @@
-# Разовое письмо: официальная лента Telegram — решения по нашей Ленте (2026-10-24, 11:00 МСК). Флаг отправки — /var/lib/tldw/unagi. Ставится деплоем.
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-0 11 24 10 * root /root/projects/unagi-reminder-bot/ops/aiqu/unagi-status-alert.sh --once 2026-10-24 --file docs/ALERT-LENTA-2026-10-24.md --subject "[aiqu] unagi: официальная лента Telegram — решения по нашей Ленте" >> /var/log/unagi-status-alert.log 2>&1

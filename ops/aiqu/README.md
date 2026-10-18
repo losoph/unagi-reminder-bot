@@ -353,6 +353,12 @@ ssh aiqu 'sshd -T | grep -E "^(port|passwordauthentication|permitrootlogin) "; u
 
 Откат SSH: `cp /root/sshd_config.bak-20261011 /etc/ssh/sshd_config && rm /etc/ssh/sshd_config.d/00-hardening.conf && sshd -t && systemctl reload ssh`.
 
+## Алерты владельцу: единый механизм (решение 18.10.2026)
+
+Разовые письма (итоги спринта, вехи, чек-листы) отправляет **один механизм — `ghsub-roadmap-alert.sh` из репозитория ghsub** (см. `docs/alerts.md` в ghsub). Расписание (cron-строки), отправку и защиту от повтора хостит ghsub; **unagi только отдаёт содержимое** — файлы `docs/ALERT-*.md` в этом репозитории. Новое письмо = файл здесь + cron-строка с `--app unagi --file docs/ALERT-….md` в `install.sh` ghsub. Планировщиков и флагов отправки в unagi для новых алертов не заводить.
+
+Расписание: 24.10 11:00 МСК — `docs/ALERT-LENTA-2026-10-24.md`; 31.10 11:00 МСК — `docs/ALERT-MOVE-2026-10-31.md`. Письмо на 18.10 19:00 (`docs/ALERT-SPRINT-2026-10-18.md`) идёт старым путём (`ops/aiqu/unagi-status-alert.sh` + `ops/aiqu/cron.d/unagi-status-alert`, уже установлено): после отправки оба файла удалить, механизм считать устаревшим.
+
 ## Доступ из России
 
 Без VPN сервер с российских сетей не отвечает. Вероятная причина — на IP работает MTProto-прокси
