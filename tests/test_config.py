@@ -8,9 +8,16 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from config import (
+    BASE_DIR,
+    AppConfig,
+    BotConfig,
     ChannelSourceConfig,
+    DatabaseConfig,
+    DbConfig,
+    DigestConfig,
     EmailConfig,
     FeedRankingConfig,
+    MainConfig,
     Settings,
     TelegraphConfig,
     TimeConfig,
@@ -39,6 +46,9 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
         self.assertIsInstance(cfg.telegraph, TelegraphConfig)
         self.assertIsInstance(cfg.watchdog, WatchdogConfig)
         self.assertIsInstance(cfg.time, TimeConfig)
+        self.assertIsInstance(cfg.database, DatabaseConfig)
+        self.assertIsInstance(cfg.bot, BotConfig)
+        self.assertIsInstance(cfg.digest, DigestConfig)
 
         # 1. Feed / Ranking domain
         fr = cfg.feed_ranking
@@ -113,6 +123,8 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
         self.assertEqual(em.smtp_user, "")
         self.assertEqual(em.smtp_password, "")
         self.assertEqual(em.smtp_from, "")
+        self.assertEqual(em.daily_limit_per_user, 5)
+        self.assertEqual(em.daily_limit_per_address, 5)
 
         # 4. Telegraph domain
         tg = cfg.telegraph
@@ -134,6 +146,36 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
         self.assertEqual(tm.reschedule_followup_window_minutes, 10)
         self.assertEqual(tm.tz, ZoneInfo("Europe/Moscow"))
 
+        # 7. Database domain
+        db = cfg.database
+        self.assertEqual(db.db_path, str(BASE_DIR / "bot_data.db"))
+        self.assertEqual(db.message_retention_days, 30)
+        self.assertEqual(db.subscription_failure_retention_days, 90)
+        self.assertEqual(db.digest_post_retention_days, 30)
+        self.assertEqual(db.max_error_text_length, 800)
+        self.assertEqual(db.channel_backlog_max, 500)
+        self.assertEqual(db.channel_delivery_batch_size, 50)
+        self.assertEqual(db.max_feed_channels, 100)
+        self.assertEqual(db.max_digest_subscriptions, 300)
+        self.assertEqual(db.max_user_reminders, 1000)
+        self.assertEqual(db.max_user_saved_messages, 2000)
+
+        # 8. Bot domain
+        bot = cfg.bot
+        self.assertIsNone(bot.token)
+        self.assertEqual(bot.username, "")
+        self.assertIsNone(bot.proxy)
+        self.assertEqual(bot.ready_file_path, "/run/unagi/ready")
+        self.assertEqual(bot.expensive_command_cooldown_seconds, 60)
+        self.assertEqual(bot.telegram_preview_chars, 300)
+
+        # 9. Digest domain
+        dg = cfg.digest
+        self.assertEqual(dg.due_batch_size, 100)
+        self.assertEqual(dg.backlog_retry_seconds, 5)
+        self.assertEqual(dg.check_interval_seconds, 1800)
+        self.assertEqual(dg.telegraph_threshold, 4)
+
     def test_property_aliases(self):
         """Verify section property aliases on Settings."""
         cfg = settings(env={})
@@ -141,6 +183,13 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
         self.assertIs(cfg.ranking, cfg.feed_ranking)
         self.assertIs(cfg.scraper, cfg.channel_source)
         self.assertIs(cfg.reminders, cfg.time)
+        self.assertIs(cfg.db, cfg.database)
+        self.assertIs(cfg.database_cfg, cfg.database)
+        self.assertIs(cfg.main, cfg.bot)
+        self.assertIs(cfg.bot_cfg, cfg.bot)
+        self.assertIs(DbConfig, DatabaseConfig)
+        self.assertIs(MainConfig, BotConfig)
+        self.assertIs(AppConfig, BotConfig)
 
     def test_frozen_immutability(self):
         """Verify that configuration dataclasses are frozen."""
@@ -151,6 +200,12 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
             cfg.channel_source.mode = "web"  # type: ignore[misc]
         with self.assertRaises(FrozenInstanceError):
             cfg.email.smtp_host = "test"  # type: ignore[misc]
+        with self.assertRaises(FrozenInstanceError):
+            cfg.database.message_retention_days = 999  # type: ignore[misc]
+        with self.assertRaises(FrozenInstanceError):
+            cfg.bot.expensive_command_cooldown_seconds = 10  # type: ignore[misc]
+        with self.assertRaises(FrozenInstanceError):
+            cfg.digest.due_batch_size = 50  # type: ignore[misc]
 
     def test_custom_env_parsing(self):
         """Verify parsing of custom values from environment."""
@@ -198,6 +253,8 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
             "SMTP_USER": "testuser",
             "SMTP_PASSWORD": "secretpassword",
             "SMTP_FROM": "sender@example.com",
+            "EMAIL_DAILY_LIMIT_PER_USER": "10",
+            "EMAIL_DAILY_LIMIT_PER_ADDRESS": "15",
             "TELEGRAPH_TOKEN": "tg_token_xyz",
             "TELEGRAPH_POST_CHARS": "2000",
             "WATCHDOG_CHECK_INTERVAL_SECONDS": "600",
@@ -207,6 +264,27 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
             "ADMIN_CHAT_ID": "201",
             "APP_TIMEZONE": "UTC",
             "RESCHEDULE_FOLLOWUP_WINDOW_MINUTES": "15",
+            "DB_PATH": "/custom/path/custom_data.db",
+            "MESSAGE_RETENTION_DAYS": "60",
+            "SUBSCRIPTION_FAILURE_RETENTION_DAYS": "180",
+            "DIGEST_POST_RETENTION_DAYS": "45",
+            "MAX_ERROR_TEXT_LENGTH": "1200",
+            "CHANNEL_BACKLOG_MAX": "800",
+            "CHANNEL_DELIVERY_BATCH_SIZE": "100",
+            "MAX_FEED_CHANNELS": "150",
+            "MAX_DIGEST_SUBSCRIPTIONS": "400",
+            "MAX_USER_REMINDERS": "1500",
+            "MAX_USER_SAVED_MESSAGES": "3000",
+            "BOT_TOKEN": "custom_token_123",
+            "BOT_USERNAME": "@unagi_test_bot",
+            "TELEGRAM_PROXY": "socks5://127.0.0.1:9050",
+            "READY_FILE_PATH": "/tmp/custom_ready",
+            "EXPENSIVE_COMMAND_COOLDOWN_SECONDS": "120",
+            "TELEGRAM_PREVIEW_CHARS": "450",
+            "DIGEST_DUE_BATCH_SIZE": "250",
+            "DIGEST_BACKLOG_RETRY_SECONDS": "15",
+            "DIGEST_CHECK_INTERVAL_SECONDS": "900",
+            "DIGEST_TELEGRAPH_THRESHOLD": "8",
         }
 
         with patch.dict(os.environ, custom_env, clear=True):
@@ -251,6 +329,8 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
             self.assertEqual(em.smtp_user, "testuser")
             self.assertEqual(em.smtp_password, "secretpassword")
             self.assertEqual(em.smtp_from, "sender@example.com")
+            self.assertEqual(em.daily_limit_per_user, 10)
+            self.assertEqual(em.daily_limit_per_address, 15)
 
             tg = cfg.telegraph
             self.assertEqual(tg.token, "tg_token_xyz")
@@ -268,6 +348,33 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
             self.assertEqual(tm.reschedule_followup_window_minutes, 15)
             self.assertEqual(tm.tz, ZoneInfo("UTC"))
 
+            db = cfg.database
+            self.assertEqual(db.db_path, "/custom/path/custom_data.db")
+            self.assertEqual(db.message_retention_days, 60)
+            self.assertEqual(db.subscription_failure_retention_days, 180)
+            self.assertEqual(db.digest_post_retention_days, 45)
+            self.assertEqual(db.max_error_text_length, 1200)
+            self.assertEqual(db.channel_backlog_max, 800)
+            self.assertEqual(db.channel_delivery_batch_size, 100)
+            self.assertEqual(db.max_feed_channels, 150)
+            self.assertEqual(db.max_digest_subscriptions, 400)
+            self.assertEqual(db.max_user_reminders, 1500)
+            self.assertEqual(db.max_user_saved_messages, 3000)
+
+            bot = cfg.bot
+            self.assertEqual(bot.token, "custom_token_123")
+            self.assertEqual(bot.username, "unagi_test_bot")
+            self.assertEqual(bot.proxy, "socks5://127.0.0.1:9050")
+            self.assertEqual(bot.ready_file_path, "/tmp/custom_ready")
+            self.assertEqual(bot.expensive_command_cooldown_seconds, 120)
+            self.assertEqual(bot.telegram_preview_chars, 450)
+
+            dg = cfg.digest
+            self.assertEqual(dg.due_batch_size, 250)
+            self.assertEqual(dg.backlog_retry_seconds, 15)
+            self.assertEqual(dg.check_interval_seconds, 900)
+            self.assertEqual(dg.telegraph_threshold, 8)
+
     def test_clamping_and_bounds(self):
         """Verify that min values and clamping are preserved as in original modules."""
         env_with_low_values = {
@@ -280,6 +387,8 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
             "WATCHDOG_CHECK_INTERVAL_SECONDS": "2",
             "WATCHDOG_CYCLE_STALL_SECONDS": "10",
             "WATCHDOG_BACKLOG_GROWTH_CYCLES": "1",
+            "DIGEST_DUE_BATCH_SIZE": "-5",
+            "DIGEST_BACKLOG_RETRY_SECONDS": "0",
         }
         cfg = settings(env=env_with_low_values)
         self.assertEqual(cfg.feed_ranking.ai_timeout_seconds, 0.1)
@@ -291,6 +400,21 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
         self.assertEqual(cfg.watchdog.check_interval_seconds, 10)
         self.assertEqual(cfg.watchdog.cycle_stall_seconds, 60)
         self.assertEqual(cfg.watchdog.backlog_growth_cycles, 2)
+        self.assertEqual(cfg.digest.due_batch_size, 1)
+        self.assertEqual(cfg.digest.backlog_retry_seconds, 1)
+
+    def test_telegram_proxy_fallback(self):
+        """PROXY_URL is used when TELEGRAM_PROXY is not set; TELEGRAM_PROXY takes precedence."""
+        cfg1 = settings(env={"PROXY_URL": "http://proxy.fallback:8080"})
+        self.assertEqual(cfg1.bot.proxy, "http://proxy.fallback:8080")
+
+        cfg2 = settings(
+            env={
+                "TELEGRAM_PROXY": "http://telegram.proxy:9000",
+                "PROXY_URL": "http://proxy.fallback:8080",
+            }
+        )
+        self.assertEqual(cfg2.bot.proxy, "http://telegram.proxy:9000")
 
     def test_invalid_channel_source_raises(self):
         """CHANNEL_SOURCE outside of {auto, mtproto, web} must raise ValueError."""

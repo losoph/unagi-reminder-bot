@@ -1,7 +1,6 @@
 import asyncio
 import html
 import logging
-import os
 import re
 import secrets
 import time
@@ -28,6 +27,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from aiohttp_socks import ProxyConnector # type: ignore
 from dotenv import load_dotenv
 
+from config import settings
 from data.database import (
     add_digest_posts,
     add_message,
@@ -119,9 +119,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
-TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY") or os.getenv("PROXY_URL")
+BOT_TOKEN = settings().bot.token
+BOT_USERNAME = settings().bot.username
+TELEGRAM_PROXY = settings().bot.proxy
 channel_source = HybridChannelSource()
 
 if not BOT_TOKEN:
@@ -278,24 +278,24 @@ fallback_router = Router(name="fallback")
 MAX_MESSAGE_RETRIES = 5
 MAX_DIGEST_RETRIES = 5
 DIGEST_FETCH_CONCURRENCY = 5
-DIGEST_DUE_BATCH_SIZE = max(1, int(os.getenv("DIGEST_DUE_BATCH_SIZE", "100")))
-DIGEST_BACKLOG_RETRY_SECONDS = max(1, int(os.getenv("DIGEST_BACKLOG_RETRY_SECONDS", "5")))
-DIGEST_CHECK_INTERVAL_SECONDS = int(os.getenv("DIGEST_CHECK_INTERVAL_SECONDS", 30 * 60))  # Можно переопределить через .env
-RESCHEDULE_FOLLOWUP_WINDOW_MINUTES = int(os.getenv("RESCHEDULE_FOLLOWUP_WINDOW_MINUTES", "10"))
+DIGEST_DUE_BATCH_SIZE = settings().digest.due_batch_size
+DIGEST_BACKLOG_RETRY_SECONDS = settings().digest.backlog_retry_seconds
+DIGEST_CHECK_INTERVAL_SECONDS = settings().digest.check_interval_seconds  # Можно переопределить через .env
+RESCHEDULE_FOLLOWUP_WINDOW_MINUTES = settings().time.reschedule_followup_window_minutes
 CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 # Дайджесты с таким числом постов и более публикуются в Telegraph одной ссылкой.
-DIGEST_TELEGRAPH_THRESHOLD = int(os.getenv("DIGEST_TELEGRAPH_THRESHOLD", "4"))
+DIGEST_TELEGRAPH_THRESHOLD = settings().digest.telegraph_threshold
 # Максимальная длина превью поста в Telegram-сообщении дайджеста.
-TELEGRAM_PREVIEW_CHARS = int(os.getenv("TELEGRAM_PREVIEW_CHARS", "300"))
+TELEGRAM_PREVIEW_CHARS = settings().bot.telegram_preview_chars
 AI_DAILY_LIMIT = ai_assistant.AI_DAILY_LIMIT
 # Средняя скорость чтения для оценки времени прочтения постов канала.
 READING_WORDS_PER_MINUTE = 180
 
 # SEC1 (п.3): общий per-user кулдаун для дорогих сетевых операций.
-EXPENSIVE_COMMAND_COOLDOWN_SECONDS = int(os.getenv("EXPENSIVE_COMMAND_COOLDOWN_SECONDS", "60"))
+EXPENSIVE_COMMAND_COOLDOWN_SECONDS = settings().bot.expensive_command_cooldown_seconds
 # SEC1 (п.4): суточные лимиты писем с подтверждением.
-EMAIL_DAILY_LIMIT_PER_USER = int(os.getenv("EMAIL_DAILY_LIMIT_PER_USER", "5"))
-EMAIL_DAILY_LIMIT_PER_ADDRESS = int(os.getenv("EMAIL_DAILY_LIMIT_PER_ADDRESS", "5"))
+EMAIL_DAILY_LIMIT_PER_USER = settings().email.daily_limit_per_user
+EMAIL_DAILY_LIMIT_PER_ADDRESS = settings().email.daily_limit_per_address
 
 _expensive_command_last: dict[int, float] = {}
 
@@ -3904,7 +3904,7 @@ async def cleanup_database():
         await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
 
 
-READY_FILE_PATH = os.getenv("READY_FILE_PATH", "/run/unagi/ready")
+READY_FILE_PATH = settings().bot.ready_file_path
 
 
 def write_ready_marker(path: str | None = None) -> bool:

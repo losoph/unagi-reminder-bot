@@ -7,6 +7,9 @@ Provides frozen dataclasses grouping application configuration by domain:
 - Telegraph (TelegraphConfig)
 - Watchdog (WatchdogConfig)
 - Time & Timezone (TimeConfig)
+- Database (DatabaseConfig)
+- Telegram Bot & Core (BotConfig)
+- Digest Scheduling & Dispatch (DigestConfig)
 
 Settings are parsed from environment variables upon calling `settings()`.
 Results are cached via LRU cache and invalidated when environment variables change
@@ -19,10 +22,13 @@ from dataclasses import dataclass
 from functools import lru_cache
 import logging
 import os
+from pathlib import Path
 from typing import Mapping
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+BASE_DIR = Path(__file__).resolve().parent
 
 
 def _parse_int(val: str | None, default: int, min_val: int | None = None) -> int:
@@ -166,6 +172,8 @@ class EmailConfig:
     smtp_user: str = ""
     smtp_password: str = ""
     smtp_from: str = ""
+    daily_limit_per_user: int = 5
+    daily_limit_per_address: int = 5
 
 
 @dataclass(frozen=True)
@@ -204,6 +212,52 @@ RemindersConfig = TimeConfig
 
 
 @dataclass(frozen=True)
+class DatabaseConfig:
+    """Settings for SQLite database storage and data retention quotas."""
+
+    db_path: str = str(BASE_DIR / "bot_data.db")
+    message_retention_days: int = 30
+    subscription_failure_retention_days: int = 90
+    digest_post_retention_days: int = 30
+    max_error_text_length: int = 800
+    channel_backlog_max: int = 500
+    channel_delivery_batch_size: int = 50
+    max_feed_channels: int = 100
+    max_digest_subscriptions: int = 300
+    max_user_reminders: int = 1000
+    max_user_saved_messages: int = 2000
+
+
+DbConfig = DatabaseConfig
+
+
+@dataclass(frozen=True)
+class BotConfig:
+    """Settings for Telegram bot core and operational handlers."""
+
+    token: str | None = None
+    username: str = ""
+    proxy: str | None = None
+    ready_file_path: str = "/run/unagi/ready"
+    expensive_command_cooldown_seconds: int = 60
+    telegram_preview_chars: int = 300
+
+
+MainConfig = BotConfig
+AppConfig = BotConfig
+
+
+@dataclass(frozen=True)
+class DigestConfig:
+    """Settings for digest scheduling loop and dispatch."""
+
+    due_batch_size: int = 100
+    backlog_retry_seconds: int = 5
+    check_interval_seconds: int = 1800
+    telegraph_threshold: int = 4
+
+
+@dataclass(frozen=True)
 class Settings:
     """Composite settings containing all configuration sections."""
 
@@ -213,6 +267,9 @@ class Settings:
     telegraph: TelegraphConfig
     watchdog: WatchdogConfig
     time: TimeConfig
+    database: DatabaseConfig
+    bot: BotConfig
+    digest: DigestConfig
 
     @property
     def feed(self) -> FeedRankingConfig:
@@ -229,6 +286,22 @@ class Settings:
     @property
     def reminders(self) -> TimeConfig:
         return self.time
+
+    @property
+    def db(self) -> DatabaseConfig:
+        return self.database
+
+    @property
+    def database_cfg(self) -> DatabaseConfig:
+        return self.database
+
+    @property
+    def main(self) -> BotConfig:
+        return self.bot
+
+    @property
+    def bot_cfg(self) -> BotConfig:
+        return self.bot
 
 
 def _build_feed_ranking_config(env: Mapping[str, str]) -> FeedRankingConfig:
@@ -293,6 +366,8 @@ def _build_email_config(env: Mapping[str, str]) -> EmailConfig:
         smtp_user=env.get("SMTP_USER", ""),
         smtp_password=env.get("SMTP_PASSWORD", ""),
         smtp_from=env.get("SMTP_FROM", ""),
+        daily_limit_per_user=_parse_int(env.get("EMAIL_DAILY_LIMIT_PER_USER"), 5),
+        daily_limit_per_address=_parse_int(env.get("EMAIL_DAILY_LIMIT_PER_ADDRESS"), 5),
     )
 
 
@@ -324,6 +399,46 @@ def _build_time_config(env: Mapping[str, str]) -> TimeConfig:
     )
 
 
+def _build_database_config(env: Mapping[str, str]) -> DatabaseConfig:
+    db_path = env.get("DB_PATH") or str(BASE_DIR / "bot_data.db")
+    return DatabaseConfig(
+        db_path=db_path,
+        message_retention_days=_parse_int(env.get("MESSAGE_RETENTION_DAYS"), 30),
+        subscription_failure_retention_days=_parse_int(env.get("SUBSCRIPTION_FAILURE_RETENTION_DAYS"), 90),
+        digest_post_retention_days=_parse_int(env.get("DIGEST_POST_RETENTION_DAYS"), 30),
+        max_error_text_length=_parse_int(env.get("MAX_ERROR_TEXT_LENGTH"), 800),
+        channel_backlog_max=_parse_int(env.get("CHANNEL_BACKLOG_MAX"), 500),
+        channel_delivery_batch_size=_parse_int(env.get("CHANNEL_DELIVERY_BATCH_SIZE"), 50),
+        max_feed_channels=_parse_int(env.get("MAX_FEED_CHANNELS"), 100),
+        max_digest_subscriptions=_parse_int(env.get("MAX_DIGEST_SUBSCRIPTIONS"), 300),
+        max_user_reminders=_parse_int(env.get("MAX_USER_REMINDERS"), 1000),
+        max_user_saved_messages=_parse_int(env.get("MAX_USER_SAVED_MESSAGES"), 2000),
+    )
+
+
+def _build_bot_config(env: Mapping[str, str]) -> BotConfig:
+    proxy = env.get("TELEGRAM_PROXY") or env.get("PROXY_URL") or None
+    raw_username = env.get("BOT_USERNAME", "")
+    username = raw_username.lstrip("@") if raw_username else ""
+    return BotConfig(
+        token=env.get("BOT_TOKEN") or None,
+        username=username,
+        proxy=proxy,
+        ready_file_path=env.get("READY_FILE_PATH") or "/run/unagi/ready",
+        expensive_command_cooldown_seconds=_parse_int(env.get("EXPENSIVE_COMMAND_COOLDOWN_SECONDS"), 60),
+        telegram_preview_chars=_parse_int(env.get("TELEGRAM_PREVIEW_CHARS"), 300),
+    )
+
+
+def _build_digest_config(env: Mapping[str, str]) -> DigestConfig:
+    return DigestConfig(
+        due_batch_size=_parse_int(env.get("DIGEST_DUE_BATCH_SIZE"), 100, min_val=1),
+        backlog_retry_seconds=_parse_int(env.get("DIGEST_BACKLOG_RETRY_SECONDS"), 5, min_val=1),
+        check_interval_seconds=_parse_int(env.get("DIGEST_CHECK_INTERVAL_SECONDS"), 1800),
+        telegraph_threshold=_parse_int(env.get("DIGEST_TELEGRAPH_THRESHOLD"), 4),
+    )
+
+
 @lru_cache(maxsize=128)
 def _build_settings_cached(env_items: tuple[tuple[str, str], ...]) -> Settings:
     env = dict(env_items)
@@ -334,6 +449,9 @@ def _build_settings_cached(env_items: tuple[tuple[str, str], ...]) -> Settings:
         telegraph=_build_telegraph_config(env),
         watchdog=_build_watchdog_config(env),
         time=_build_time_config(env),
+        database=_build_database_config(env),
+        bot=_build_bot_config(env),
+        digest=_build_digest_config(env),
     )
 
 

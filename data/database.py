@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from config import settings
+
 # SEC1 (п.6): файлы БД содержат токен Telegraph, почту и коды подтверждения —
 # закрываем их от других локальных пользователей на уровне процесса и файла.
 os.umask(0o077)
@@ -13,18 +15,18 @@ os.umask(0o077)
 UTC = timezone.utc
 DB_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LEGACY_STORAGE_OFFSET_HOURS = 3
-MESSAGE_RETENTION_DAYS = int(os.getenv("MESSAGE_RETENTION_DAYS", "30"))
-SUBSCRIPTION_FAILURE_RETENTION_DAYS = int(os.getenv("SUBSCRIPTION_FAILURE_RETENTION_DAYS", "90"))
-DIGEST_POST_RETENTION_DAYS = int(os.getenv("DIGEST_POST_RETENTION_DAYS", "30"))
-MAX_ERROR_TEXT_LENGTH = int(os.getenv("MAX_ERROR_TEXT_LENGTH", "800"))
-CHANNEL_BACKLOG_MAX = int(os.getenv("CHANNEL_BACKLOG_MAX", "500"))
-CHANNEL_DELIVERY_BATCH_SIZE = int(os.getenv("CHANNEL_DELIVERY_BATCH_SIZE", "50"))
-MAX_FEED_CHANNELS = int(os.getenv("MAX_FEED_CHANNELS", "100"))
+MESSAGE_RETENTION_DAYS = settings().database.message_retention_days
+SUBSCRIPTION_FAILURE_RETENTION_DAYS = settings().database.subscription_failure_retention_days
+DIGEST_POST_RETENTION_DAYS = settings().database.digest_post_retention_days
+MAX_ERROR_TEXT_LENGTH = settings().database.max_error_text_length
+CHANNEL_BACKLOG_MAX = settings().database.channel_backlog_max
+CHANNEL_DELIVERY_BATCH_SIZE = settings().database.channel_delivery_batch_size
+MAX_FEED_CHANNELS = settings().database.max_feed_channels
 CLEANUP_BATCH_SIZE = 500
 # SEC1 (п.2/п.9): квоты на пользователя, чтобы один аккаунт не выел память.
-MAX_DIGEST_SUBSCRIPTIONS = int(os.getenv("MAX_DIGEST_SUBSCRIPTIONS", "300"))
-MAX_USER_REMINDERS = int(os.getenv("MAX_USER_REMINDERS", "1000"))
-MAX_USER_SAVED_MESSAGES = int(os.getenv("MAX_USER_SAVED_MESSAGES", "2000"))
+MAX_DIGEST_SUBSCRIPTIONS = settings().database.max_digest_subscriptions
+MAX_USER_REMINDERS = settings().database.max_user_reminders
+MAX_USER_SAVED_MESSAGES = settings().database.max_user_saved_messages
 
 CHANNEL_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{4,32}$")
 
@@ -37,7 +39,7 @@ def is_valid_channel_username(username: str | None) -> bool:
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "bot_data.db"))
+DB_PATH = settings().database.db_path
 
 
 _SECURED_DB_PATHS: set[str] = set()
