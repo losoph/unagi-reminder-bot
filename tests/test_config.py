@@ -464,3 +464,13 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SecretsHiddenInReprTests(unittest.TestCase):
+    """Секреты не должны попадать в логи через repr/str dataclass-ов настроек."""
+
+    def test_tokens_and_password_not_in_repr(self):
+        env = {"BOT_TOKEN": "bot-secret-123", "TELEGRAPH_TOKEN": "tg-secret-456", "SMTP_PASSWORD": "smtp-secret-789"}
+        text = repr(settings(env))
+        for secret in env.values():
+            self.assertNotIn(secret, text)

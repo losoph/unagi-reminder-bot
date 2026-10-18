@@ -18,7 +18,7 @@ or when `reset_settings()` / `reset()` is called.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 import logging
 import os
@@ -170,7 +170,7 @@ class EmailConfig:
     smtp_port: int | None = None
     smtp_security: str = ""
     smtp_user: str = ""
-    smtp_password: str = ""
+    smtp_password: str = field(default="", repr=False)
     smtp_from: str = ""
     daily_limit_per_user: int = 5
     daily_limit_per_address: int = 5
@@ -180,7 +180,7 @@ class EmailConfig:
 class TelegraphConfig:
     """Settings for publishing to Telegraph."""
 
-    token: str | None = None
+    token: str | None = field(default=None, repr=False)
     post_chars: int = 1500
 
 
@@ -235,7 +235,7 @@ DbConfig = DatabaseConfig
 class BotConfig:
     """Settings for Telegram bot core and operational handlers."""
 
-    token: str | None = None
+    token: str | None = field(default=None, repr=False)
     username: str = ""
     proxy: str | None = None
     ready_file_path: str = "/run/unagi/ready"
