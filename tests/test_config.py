@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo
 
 from config import (
     BASE_DIR,
+    AiConfig,
+    AlertsConfig,
     AppConfig,
     BotConfig,
     ChannelSourceConfig,
@@ -468,6 +470,102 @@ class ConfigDefaultsAndParsingTests(unittest.TestCase):
             self.assertEqual(s6.feed_ranking.cache_minutes, 15)
 
 
+class AiAndAlertsConfigTests(unittest.TestCase):
+    """Секции AiConfig и AlertsConfig повторяют прежний разбор os.getenv в ai_assistant и digest_alerts."""
+
+    def setUp(self):
+        reset_settings()
+
+    def tearDown(self):
+        reset_settings()
+
+    def test_defaults(self):
+        cfg = settings(env={})
+        self.assertIsInstance(cfg.ai, AiConfig)
+        self.assertIsInstance(cfg.alerts, AlertsConfig)
+        self.assertIsNone(cfg.ai.api_key)
+        self.assertEqual(cfg.ai.base_url, "https://api.deepseek.com")
+        self.assertEqual(cfg.ai.model, "deepseek-chat")
+        self.assertEqual(cfg.ai.daily_limit, 10)
+        self.assertEqual(cfg.ai.key_check_interval_seconds, 3600)
+        self.assertEqual(cfg.alerts.grace_period_seconds, 3600)
+        self.assertEqual(cfg.alerts.max_digest_retries, 5)
+        self.assertEqual(cfg.alerts.base_cooldown_seconds, 14400)
+        self.assertEqual(cfg.alerts.max_cooldown_seconds, 86400)
+
+    def test_custom_values(self):
+        cfg = settings(
+            env={
+                "DEEPSEEK_API_KEY": "k",
+                "DEEPSEEK_BASE_URL": "https://example.test/v1///",
+                "DEEPSEEK_MODEL": "deepseek-reasoner",
+                "AI_DAILY_LIMIT": "0",
+                "DEEPSEEK_CHECK_INTERVAL_SECONDS": "120",
+                "DIGEST_ALERT_GRACE_PERIOD_SECONDS": "600",
+                "MAX_DIGEST_RETRIES": "7",
+                "ALERT_BASE_COOLDOWN_SECONDS": "300",
+                "ALERT_MAX_COOLDOWN_SECONDS": "7200",
+            }
+        )
+        self.assertEqual(cfg.ai.api_key, "k")
+        self.assertEqual(cfg.ai.base_url, "https://example.test/v1")
+        self.assertEqual(cfg.ai.model, "deepseek-reasoner")
+        self.assertEqual(cfg.ai.daily_limit, 0)
+        self.assertEqual(cfg.ai.key_check_interval_seconds, 120)
+        self.assertEqual(cfg.alerts.grace_period_seconds, 600)
+        self.assertEqual(cfg.alerts.max_digest_retries, 7)
+        self.assertEqual(cfg.alerts.base_cooldown_seconds, 300)
+        self.assertEqual(cfg.alerts.max_cooldown_seconds, 7200)
+
+    def test_clamping(self):
+        cfg = settings(
+            env={
+                "DEEPSEEK_CHECK_INTERVAL_SECONDS": "5",
+                "DIGEST_ALERT_GRACE_PERIOD_SECONDS": "1",
+                "MAX_DIGEST_RETRIES": "0",
+                "ALERT_BASE_COOLDOWN_SECONDS": "-1",
+                "ALERT_MAX_COOLDOWN_SECONDS": "10",
+            }
+        )
+        self.assertEqual(cfg.ai.key_check_interval_seconds, 60)
+        self.assertEqual(cfg.alerts.grace_period_seconds, 60)
+        self.assertEqual(cfg.alerts.max_digest_retries, 1)
+        self.assertEqual(cfg.alerts.base_cooldown_seconds, 60)
+        self.assertEqual(cfg.alerts.max_cooldown_seconds, 60)
+
+    def test_empty_values_fall_back_to_defaults(self):
+        cfg = settings(
+            env={
+                "DEEPSEEK_API_KEY": "",
+                "DEEPSEEK_BASE_URL": "",
+                "DEEPSEEK_MODEL": "",
+                "AI_DAILY_LIMIT": "",
+                "MAX_DIGEST_RETRIES": "",
+            }
+        )
+        self.assertIsNone(cfg.ai.api_key)
+        self.assertEqual(cfg.ai.base_url, "https://api.deepseek.com")
+        self.assertEqual(cfg.ai.model, "deepseek-chat")
+        self.assertEqual(cfg.ai.daily_limit, 10)
+        self.assertEqual(cfg.alerts.max_digest_retries, 5)
+
+    def test_modules_take_values_from_config(self):
+        import ai_assistant
+        import digest_alerts
+
+        ai_cfg = settings().ai
+        alerts_cfg = settings().alerts
+        self.assertEqual(ai_assistant.DEEPSEEK_API_KEY, ai_cfg.api_key)
+        self.assertEqual(ai_assistant.DEEPSEEK_BASE_URL, ai_cfg.base_url)
+        self.assertEqual(ai_assistant.DEEPSEEK_MODEL, ai_cfg.model)
+        self.assertEqual(ai_assistant.AI_DAILY_LIMIT, ai_cfg.daily_limit)
+        self.assertEqual(ai_assistant.KEY_CHECK_INTERVAL_SECONDS, ai_cfg.key_check_interval_seconds)
+        self.assertEqual(digest_alerts.DIGEST_ALERT_GRACE_PERIOD_SECONDS, alerts_cfg.grace_period_seconds)
+        self.assertEqual(digest_alerts.MAX_DIGEST_RETRIES, alerts_cfg.max_digest_retries)
+        self.assertEqual(digest_alerts.ALERT_BASE_COOLDOWN_SECONDS, alerts_cfg.base_cooldown_seconds)
+        self.assertEqual(digest_alerts.ALERT_MAX_COOLDOWN_SECONDS, alerts_cfg.max_cooldown_seconds)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -476,7 +574,12 @@ class SecretsHiddenInReprTests(unittest.TestCase):
     """Секреты не должны попадать в логи через repr/str dataclass-ов настроек."""
 
     def test_tokens_and_password_not_in_repr(self):
-        env = {"BOT_TOKEN": "bot-secret-123", "TELEGRAPH_TOKEN": "tg-secret-456", "SMTP_PASSWORD": "smtp-secret-789"}
+        env = {
+            "BOT_TOKEN": "bot-secret-123",
+            "TELEGRAPH_TOKEN": "tg-secret-456",
+            "SMTP_PASSWORD": "smtp-secret-789",
+            "DEEPSEEK_API_KEY": "ds-secret-000",
+        }
         text = repr(settings(env))
         for secret in env.values():
             self.assertNotIn(secret, text)
