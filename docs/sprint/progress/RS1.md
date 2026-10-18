@@ -1,0 +1,10 @@
+## RS1 Реестр экранов вместо цепочки if/elif в render_screen
+
+- **Решение**: Монолитная цепочка `if/elif` (11 экранов + fallback) в `render_screen` заменена на расширяемый реестр экранов на базе модуля `screen_registry.py` с классом `ScreenRegistry`. Модуль поддерживает регистрацию экранов как прямым вызовом (`register`, `register_screen`), так и через декораторы (`@register`), проверку наличия экрана (`has`, `in`), получение обработчика (`get`), интроспекцию зарегистрированных экранов (`screens`) и адаптивную диспетчеризацию аргументов под сигнатуру конкретного обработчика (3/4 позиционных аргумента, `**kwargs`, именованный параметр `screen`).
+- **Изоляция и обратная совместимость**: `screen_registry.py` полностью автономен, зависит только от стандартной библиотеки и типов aiogram и не импортирует `main.py` (проверено архитектурным тестом `test_guard_no_main_imports_in_screen_registry`). В `main.py` реэкспортированы ключевые символы (`ScreenRegistry`, `default_registry`, `get_screen_handler`, `has_screen`, `register_screen`, `unregister_screen`, `render_screen`). Функция `main.render_screen` сохранила сигнатуру и делегирует рендеринг в `screen_registry.render_screen`, обеспечивая полную совместимость с `bookmarks.configure(render_screen=...)`, внутренними вызовами и моками в тестах (`test_review_t15b`).
+- **Зарегистрированные экраны**:
+  - `kb_tags`, `kb_list`, `kb_detail`, `kb_move` (экраны базы знаний и закладок);
+  - `rem_tags`, `rem_list`, `rem_detail`, `rem_move` (экраны напоминаний);
+  - `manual_date`, `manual_hour`, `manual_minute` (экраны пошагового планировщика даты и времени);
+  - fallback по умолчанию (`_render_screen_fallback`: сброс FSM, отправка главного меню `WELCOME_TEXT`).
+- **Тесты**: Добавлен набор тестов `tests/test_screen_registry.py` (33 теста): архитектурная изоляция, проверка реэкспортов на `main`, регистрация функций и декораторов, отмена регистрации и очистка, адаптация сигнатур вызова, корректный вызов fallback при неизвестных/пустых спецификациях экрана, точечная диспетчеризация всех 11 экранов для `Message` и `CallbackQuery`.
