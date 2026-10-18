@@ -10,6 +10,8 @@ Provides frozen dataclasses grouping application configuration by domain:
 - Database (DatabaseConfig)
 - Telegram Bot & Core (BotConfig)
 - Digest Scheduling & Dispatch (DigestConfig)
+- AI assistant / DeepSeek (AiConfig)
+- Digest delivery alerts (AlertsConfig)
 
 Settings are parsed from environment variables upon calling `settings()`.
 Results are cached via LRU cache and invalidated when environment variables change
@@ -260,6 +262,27 @@ class DigestConfig:
 
 
 @dataclass(frozen=True)
+class AiConfig:
+    """Settings for the DeepSeek-backed AI assistant (ai_assistant.py)."""
+
+    api_key: str | None = field(default=None, repr=False)
+    base_url: str = "https://api.deepseek.com"
+    model: str = "deepseek-chat"
+    daily_limit: int = 10
+    key_check_interval_seconds: int = 3600
+
+
+@dataclass(frozen=True)
+class AlertsConfig:
+    """Settings for digest delivery retries and owner/user alerts (digest_alerts.py)."""
+
+    grace_period_seconds: int = 3600
+    max_digest_retries: int = 5
+    base_cooldown_seconds: int = 14400
+    max_cooldown_seconds: int = 86400
+
+
+@dataclass(frozen=True)
 class Settings:
     """Composite settings containing all configuration sections."""
 
@@ -272,6 +295,8 @@ class Settings:
     database: DatabaseConfig
     bot: BotConfig
     digest: DigestConfig
+    ai: AiConfig
+    alerts: AlertsConfig
 
     @property
     def feed(self) -> FeedRankingConfig:
@@ -443,6 +468,35 @@ def _build_digest_config(env: Mapping[str, str]) -> DigestConfig:
     )
 
 
+def _build_ai_config(env: Mapping[str, str]) -> AiConfig:
+    defaults = AiConfig()
+    return AiConfig(
+        api_key=env.get("DEEPSEEK_API_KEY") or None,
+        base_url=(env.get("DEEPSEEK_BASE_URL") or defaults.base_url).rstrip("/"),
+        model=env.get("DEEPSEEK_MODEL") or defaults.model,
+        daily_limit=_parse_int(env.get("AI_DAILY_LIMIT"), defaults.daily_limit),
+        key_check_interval_seconds=_parse_int(
+            env.get("DEEPSEEK_CHECK_INTERVAL_SECONDS"), defaults.key_check_interval_seconds, min_val=60
+        ),
+    )
+
+
+def _build_alerts_config(env: Mapping[str, str]) -> AlertsConfig:
+    defaults = AlertsConfig()
+    return AlertsConfig(
+        grace_period_seconds=_parse_int(
+            env.get("DIGEST_ALERT_GRACE_PERIOD_SECONDS"), defaults.grace_period_seconds, min_val=60
+        ),
+        max_digest_retries=_parse_int(env.get("MAX_DIGEST_RETRIES"), defaults.max_digest_retries, min_val=1),
+        base_cooldown_seconds=_parse_int(
+            env.get("ALERT_BASE_COOLDOWN_SECONDS"), defaults.base_cooldown_seconds, min_val=60
+        ),
+        max_cooldown_seconds=_parse_int(
+            env.get("ALERT_MAX_COOLDOWN_SECONDS"), defaults.max_cooldown_seconds, min_val=60
+        ),
+    )
+
+
 @lru_cache(maxsize=128)
 def _build_settings_cached(env_items: tuple[tuple[str, str], ...]) -> Settings:
     env = dict(env_items)
@@ -456,6 +510,8 @@ def _build_settings_cached(env_items: tuple[tuple[str, str], ...]) -> Settings:
         database=_build_database_config(env),
         bot=_build_bot_config(env),
         digest=_build_digest_config(env),
+        ai=_build_ai_config(env),
+        alerts=_build_alerts_config(env),
     )
 
 

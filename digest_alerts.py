@@ -1,13 +1,13 @@
 import asyncio
 import html
 import logging
-import os
 from datetime import datetime
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from config import settings
 from data.database import (
     get_delivered_executions_pending_recovery_alert,
     get_digest_alert,
@@ -26,10 +26,10 @@ from data.database import (
 
 logger = logging.getLogger(__name__)
 
-DIGEST_ALERT_GRACE_PERIOD_SECONDS = max(60, int(os.getenv("DIGEST_ALERT_GRACE_PERIOD_SECONDS", "3600")))
-MAX_DIGEST_RETRIES = max(1, int(os.getenv("MAX_DIGEST_RETRIES", "5")))
-ALERT_BASE_COOLDOWN_SECONDS = max(60, int(os.getenv("ALERT_BASE_COOLDOWN_SECONDS", "14400")))
-ALERT_MAX_COOLDOWN_SECONDS = max(60, int(os.getenv("ALERT_MAX_COOLDOWN_SECONDS", "86400")))
+DIGEST_ALERT_GRACE_PERIOD_SECONDS = settings().alerts.grace_period_seconds
+MAX_DIGEST_RETRIES = settings().alerts.max_digest_retries
+ALERT_BASE_COOLDOWN_SECONDS = settings().alerts.base_cooldown_seconds
+ALERT_MAX_COOLDOWN_SECONDS = settings().alerts.max_cooldown_seconds
 
 PERIOD_TITLES: dict[str, str] = {
     "daily": "утренний дайджест",

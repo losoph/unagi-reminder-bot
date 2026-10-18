@@ -1,20 +1,20 @@
 import asyncio
 import logging
-import os
 import time
 
 import aiohttp
 
+from config import settings
 from http_session import get_session
 
 logger = logging.getLogger(__name__)
 
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-AI_DAILY_LIMIT = int(os.getenv("AI_DAILY_LIMIT", "10"))
+DEEPSEEK_API_KEY = settings().ai.api_key
+DEEPSEEK_BASE_URL = settings().ai.base_url
+DEEPSEEK_MODEL = settings().ai.model
+AI_DAILY_LIMIT = settings().ai.daily_limit
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=60)
-KEY_CHECK_INTERVAL_SECONDS = max(60, int(os.getenv("DEEPSEEK_CHECK_INTERVAL_SECONDS", "3600")))
+KEY_CHECK_INTERVAL_SECONDS = settings().ai.key_check_interval_seconds
 AUTH_ERROR_COOLDOWN_SECONDS: int = 3600
 
 _last_auth_error_time: float = 0.0
