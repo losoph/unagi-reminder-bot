@@ -416,6 +416,33 @@ class GitCommitDateRealTests(unittest.TestCase):
         self.assertEqual(date, "2026-10-10")
 
 
+@unittest.skipUnless(shutil.which("git"), "в образе CI (python:3.12-slim) нет git: gate по диапазону читает историю")
+class GateRangeTests(unittest.TestCase):
+    """agents.sh gate A..B: дифф локальной интеграционной ветки без брифов и журналов решений (PR пачками, 18.10)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name) / "repo"
+        (self.repo / "docs" / "sprint").mkdir(parents=True)
+        self.env = os.environ | {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "AGENT_ENV_FILE": os.devnull}
+        self.git("init", "-q")
+        (self.repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "init")
+
+    def git(self, *args):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.test", *args], cwd=self.repo, env=self.env, text=True, capture_output=True, check=True)
+
+    def test_range_with_only_briefs_is_refused_without_calling_an_agent(self):
+        (self.repo / "docs" / "sprint" / "agy-brief-x.md").write_text("бриф\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "docs: бриф")
+        proc = subprocess.run([str(TOOLS / "agents.sh"), "gate", "HEAD~1..HEAD"], cwd=self.repo, env=self.env, text=True, capture_output=True, check=False)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("не удалось получить дифф HEAD~1..HEAD", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
 

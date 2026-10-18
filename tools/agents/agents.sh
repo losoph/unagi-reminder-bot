@@ -13,7 +13,7 @@
 #   agents.sh report                                   # что решил Jev, откаты, стоимость решений и качество выдачи агентов
 #   agents.sh rate <agent> <model> <title> <good|partial|bad> [заметка]   # оценка выдачи (журнал .agents/quality.ndjson)
 #   agents.sh orchestra [validate]                     # зафиксированная конфигурация оркестра (tools/agents/orchestra.json): роли, лестницы, лимиты, правила
-#   agents.sh gate <PR> [вопрос]                       # предслиянная сверка: факты среды (orchestra.json) + дифф PR → короткая сверка (agy → dsh → opencode)
+#   agents.sh gate <PR|A..B> [вопрос]                  # предслиянная сверка (A..B — локальный диапазон интеграционной ветки): факты среды (orchestra.json) + дифф PR → короткая сверка (agy → dsh → opencode)
 #   agents.sh launch <agent> <worktree> <brief.md> <метка> [kind] [--exec]
 #                                                       # проверки перед запуском (бриф закоммичен, метка не в истории) и готовые команды для вкладки и монитора
 # kind: executor-complex | executor-ux | review | adversarial-review | docs | merge-audit | short-check | strategy (ручной: Argon + Claude)
@@ -120,12 +120,27 @@ watch_agent() {
 gate_pr() {
   [ $# -ge 1 ] || { usage >&2; return 2; }
   local pr="$1" question="${2:-Найди дефекты, из-за которых слияние этого PR сломает деплой, прод или тесты в среде из «ФАКТЫ СРЕДЫ»: несовместимые значения, зависимость от инструментов, которых нет в CI-образе, пропущенные места использования.}"
-  command -v gh >/dev/null 2>&1 || { echo "gate: нужен gh" >&2; return 2; }
-  local work ctx; work="$(mktemp -d "${TMPDIR:-/tmp}/agents-gate.XXXXXX")"; ctx="$work/context.txt"; trap 'rm -rf "$work"' RETURN
+  # 18.10: на больших PR (#28, #33) дифф обрезался по лимиту, и проверяющий принимал обрезку за «файла нет в PR». Теперь он знает,
+  # что дифф может быть неполным, и обязан дочитать файлы из рабочего дерева, прежде чем заявлять о пропуске.
+  question="$question Дифф ниже может быть обрезан по лимиту: прежде чем утверждать, что файла или места использования нет, прочитай его в рабочем дереве (git show <ветка>:<путь>); обрезка — не дефект."
+  local work ctx title; work="$(mktemp -d "${TMPDIR:-/tmp}/agents-gate.XXXXXX")"; ctx="$work/context.txt"; trap 'rm -rf "$work"' RETURN
   { echo "ФАКТЫ СРЕДЫ:"; "$PY" -c 'import json,sys; [print("- "+f) for f in json.load(open(sys.argv[1])).get("facts", [])]' "$("$PY" "$SCRIPT_DIR/orchestra.py" path)"
-    echo; echo "PR #$pr: $(gh pr view "$pr" --json title --jq .title)"; echo; echo "ДИФФ:"; gh pr diff "$pr"; } > "$ctx" 2>/dev/null
-  [ -s "$ctx" ] || { echo "gate: не удалось получить дифф PR #$pr" >&2; return 1; }
-  "$0" check auto "gate-$pr" "$question" "$ctx" "${GATE_LOG:-.agents/gate.ndjson}"
+    echo
+    if [[ "$pr" == *..* ]]; then
+      # Локальная интеграционная ветка (PR пачками, 18.10): диапазон коммитов; брифы и журналы решений не входят в дифф.
+      title="range-${pr//[^A-Za-z0-9]/_}"
+      echo "ДИАПАЗОН $pr ($(git log --oneline "$pr" | wc -l | tr -d ' ') коммитов):"; git log --oneline "$pr"; echo
+      echo "ФАЙЛЫ:"; git diff --stat "$pr" -- . ':(exclude)docs/sprint/agy-brief*' ':(exclude)docs/sprint/progress*'; echo
+      echo "ДИФФ:"; git diff "$pr" -- . ':(exclude)docs/sprint/agy-brief*' ':(exclude)docs/sprint/progress*'
+    else
+      command -v gh >/dev/null 2>&1 || { echo "gate: нужен gh" >&2; return 2; }
+      title="$pr"
+      echo "PR #$pr: $(gh pr view "$pr" --json title --jq .title)"; echo
+      echo "ФАЙЛЫ:"; gh pr diff "$pr" --name-only; echo
+      echo "ДИФФ:"; gh pr diff "$pr"
+    fi; } > "$ctx" 2>/dev/null
+  grep -q "^ДИФФ:" "$ctx" && [ "$(sed -n '/^ДИФФ:/,$p' "$ctx" | wc -l)" -gt 1 ] || { echo "gate: не удалось получить дифф $pr" >&2; return 1; }
+  "$0" check auto "gate-$title" "$question" "$ctx" "${GATE_LOG:-.agents/gate.ndjson}"
 }
 
 # Проверки перед запуском трека и готовые команды для вкладки терминала и монитора (правила и лимиты — orchestra.json).

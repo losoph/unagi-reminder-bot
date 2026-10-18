@@ -1,21 +1,21 @@
 """Time and timezone helper utilities."""
 
-import os
 import re
 from datetime import datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from config import settings
 from data.database import parse_db_datetime
 
-TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Moscow"))
+TZ = settings().time.tz
 _DAY_PART_HOURS = {"morning": 9, "day": 14, "evening": 20}
 TIME_TEXT_EXAMPLES = "«завтра 11», «24/09 в 9», «через 2 дня»"
 
 
 def get_app_timezone() -> ZoneInfo:
-    return ZoneInfo(os.getenv("APP_TIMEZONE", "Europe/Moscow"))
+    return settings().time.tz
 
 
 def parse_timezone(tz_input: str | None) -> tuple[tzinfo | None, str | None]:

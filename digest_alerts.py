@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 import os
@@ -326,7 +327,8 @@ async def process_pending_digest_alerts(
         grace_period_seconds = DIGEST_ALERT_GRACE_PERIOD_SECONDS
 
     now_str = serialize_datetime(now)
-    pending_list = get_failed_digest_executions_pending_alert(
+    pending_list = await asyncio.to_thread(
+        get_failed_digest_executions_pending_alert,
         older_than_seconds=grace_period_seconds,
         max_retries=MAX_DIGEST_RETRIES,
         now_str=now_str,
@@ -508,7 +510,10 @@ async def process_pending_recovery_alerts(
     if now is None:
         now = utc_now()
     now_str = serialize_datetime(now)
-    pending_list = get_delivered_executions_pending_recovery_alert(now_str=now_str)
+    pending_list = await asyncio.to_thread(
+        get_delivered_executions_pending_recovery_alert,
+        now_str=now_str,
+    )
     sent_count = 0
     for execution in pending_list:
         try:

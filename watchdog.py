@@ -1,12 +1,12 @@
 import asyncio
 import html
 import logging
-import os
 from datetime import datetime
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 
+from config import settings
 from data.database import (
     META_ALERT_BACKLOG_SENT,
     META_ALERT_STALL_SENT,
@@ -21,22 +21,14 @@ from data.database import (
 
 logger = logging.getLogger(__name__)
 
-WATCHDOG_CHECK_INTERVAL_SECONDS = max(10, int(os.getenv("WATCHDOG_CHECK_INTERVAL_SECONDS", "300")))
-WATCHDOG_CYCLE_STALL_SECONDS = max(60, int(os.getenv("WATCHDOG_CYCLE_STALL_SECONDS", "7200")))
-WATCHDOG_BACKLOG_GROWTH_CYCLES = max(2, int(os.getenv("WATCHDOG_BACKLOG_GROWTH_CYCLES", "3")))
+WATCHDOG_CHECK_INTERVAL_SECONDS = settings().watchdog.check_interval_seconds
+WATCHDOG_CYCLE_STALL_SECONDS = settings().watchdog.cycle_stall_seconds
+WATCHDOG_BACKLOG_GROWTH_CYCLES = settings().watchdog.backlog_growth_cycles
 
 
 def get_admin_chat_ids() -> list[int]:
-    raw = os.getenv("ADMIN_USER_ID") or os.getenv("ADMIN_CHAT_ID") or ""
-    ids: list[int] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if part:
-            try:
-                ids.append(int(part))
-            except ValueError:
-                logger.warning("Некорректный ID администратора в конфиге: %s", part)
-    return ids
+    """Возвращает список ID администраторов из ADMIN_USER_ID или ADMIN_CHAT_ID."""
+    return list(settings().watchdog.admin_chat_ids)
 
 
 def format_stall_alert(

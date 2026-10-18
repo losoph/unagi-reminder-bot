@@ -14,7 +14,6 @@ import hashlib
 import html
 import json
 import logging
-import os
 import time
 from typing import Any
 
@@ -60,6 +59,7 @@ from data.database import (
     upsert_channel_posts,
     utc_now,
 )
+from config import settings
 from feed_ai import FEED_AI_TIMEOUT_SECONDS, build_overview
 from feed_ranking import rank_feed
 from feed_render import _first_sentence, _plural_channel, _plural_ru, build_feed_title, render_feed
@@ -72,12 +72,36 @@ logger = logging.getLogger(__name__)
 
 router = Router(name="feed")
 
-FEED_CACHE_MINUTES = int(os.getenv("FEED_CACHE_MINUTES", "15"))
-FEED_MIN_INTERVAL_SECONDS = int(os.getenv("FEED_MIN_INTERVAL_SECONDS", "60"))
-FEED_BUILD_TIMEOUT_SECONDS = int(os.getenv("FEED_BUILD_TIMEOUT_SECONDS", "120"))
-FEED_PUBLISH_TIMEOUT_SECONDS = int(os.getenv("FEED_PUBLISH_TIMEOUT_SECONDS", "30"))
-FEED_AUTODELIVERY_CHECK_SECONDS = int(os.getenv("FEED_AUTODELIVERY_CHECK_SECONDS", "120"))
-FEED_AUTODELIVERY_GRACE_MINUTES = int(os.getenv("FEED_AUTODELIVERY_GRACE_MINUTES", "90"))
+FEED_CACHE_MINUTES = settings().feed_ranking.cache_minutes
+FEED_MIN_INTERVAL_SECONDS = settings().feed_ranking.min_interval_seconds
+FEED_BUILD_TIMEOUT_SECONDS = settings().feed_ranking.build_timeout_seconds
+FEED_PUBLISH_TIMEOUT_SECONDS = settings().feed_ranking.publish_timeout_seconds
+FEED_AUTODELIVERY_CHECK_SECONDS = settings().feed_ranking.autodelivery_check_seconds
+FEED_AUTODELIVERY_GRACE_MINUTES = settings().feed_ranking.autodelivery_grace_minutes
+
+
+def _cache_minutes() -> int:
+    return FEED_CACHE_MINUTES if FEED_CACHE_MINUTES != 15 else settings().feed_ranking.cache_minutes
+
+
+def _min_interval_seconds() -> int:
+    return FEED_MIN_INTERVAL_SECONDS if FEED_MIN_INTERVAL_SECONDS != 60 else settings().feed_ranking.min_interval_seconds
+
+
+def _build_timeout_seconds() -> float:
+    return FEED_BUILD_TIMEOUT_SECONDS if FEED_BUILD_TIMEOUT_SECONDS != 120 else settings().feed_ranking.build_timeout_seconds
+
+
+def _publish_timeout_seconds() -> float:
+    return FEED_PUBLISH_TIMEOUT_SECONDS if FEED_PUBLISH_TIMEOUT_SECONDS != 30 else settings().feed_ranking.publish_timeout_seconds
+
+
+def _autodelivery_check_seconds() -> int:
+    return FEED_AUTODELIVERY_CHECK_SECONDS if FEED_AUTODELIVERY_CHECK_SECONDS != 120 else settings().feed_ranking.autodelivery_check_seconds
+
+
+def _autodelivery_grace_minutes() -> int:
+    return FEED_AUTODELIVERY_GRACE_MINUTES if FEED_AUTODELIVERY_GRACE_MINUTES != 90 else settings().feed_ranking.autodelivery_grace_minutes
 
 FEED_TO_DIGEST_PERIOD = {"day": "daily", "week": "weekly", "month": "monthly"}
 DIGEST_TO_FEED_PERIOD = {"daily": "day", "weekly": "week", "monthly": "month"}
@@ -247,7 +271,7 @@ def get_fetch_semaphore() -> asyncio.Semaphore:
     if _channel_source is not None and hasattr(_channel_source, "fetch_semaphore"):
         _fetch_semaphore = _channel_source.fetch_semaphore
         return _fetch_semaphore
-    concurrency = int(os.getenv("DIGEST_FETCH_CONCURRENCY", "5"))
+    concurrency = settings().channel_source.fetch_concurrency
     _fetch_semaphore = asyncio.Semaphore(concurrency)
     return _fetch_semaphore
 
@@ -756,7 +780,8 @@ async def render_personal_channels(
 
     channels = get_cached_personal_channels(user_id)
     if channels is None or force_refresh:
-        existing = {s["channel_username"].lower() for s in list_feed_subscriptions(user_id, include_paused=True)}
+        raw_subs = await asyncio.to_thread(list_feed_subscriptions, user_id, include_paused=True)
+        existing = {s["channel_username"].lower() for s in raw_subs}
         if _channel_source is not None and hasattr(_channel_source, "list_personal_channels"):
             channels = await _channel_source.list_personal_channels(limit=20, exclude_usernames=existing)
         else:
@@ -963,7 +988,7 @@ async def build_feed_edition(
 
     # 1. Check cache (FEED_CACHE_MINUTES)
     cached = await asyncio.to_thread(
-        get_feed_edition, user_id, period, subs_hash, FEED_CACHE_MINUTES * 60
+        get_feed_edition, user_id, period, subs_hash, _cache_minutes() * 60
     )
     if cached is not None:
         logger.info(
@@ -986,7 +1011,7 @@ async def build_feed_edition(
     # 2. Rate limit (unless ignored)
     now_ts = time.time()
     last_time = _last_build_time.get(user_id, 0.0)
-    if not ignore_rate_limit and (now_ts - last_time < FEED_MIN_INTERVAL_SECONDS):
+    if not ignore_rate_limit and (now_ts - last_time < _min_interval_seconds()):
         return FeedBuildResult(status="rate_limited", error_message="Подожди минуту")
 
     # 3. Concurrency check
@@ -1158,7 +1183,7 @@ async def build_feed_edition(
                 publish_started.set()
                 publish_task = asyncio.create_task(publish_page(title, nodes))
                 telegraph_url = await asyncio.wait_for(
-                    asyncio.shield(publish_task), timeout=FEED_PUBLISH_TIMEOUT_SECONDS
+                    asyncio.shield(publish_task), timeout=_publish_timeout_seconds()
                 )
             except (TimeoutError, asyncio.TimeoutError):
                 logger.warning("Telegraph publish timed out for user=%s period=%s", user_id, period)
@@ -1219,7 +1244,7 @@ async def build_feed_edition(
 
         try:
             pipeline_task = asyncio.create_task(_run_pipeline())
-            deadline = time.monotonic() + FEED_BUILD_TIMEOUT_SECONDS
+            deadline = time.monotonic() + _build_timeout_seconds()
             while not pipeline_task.done():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1333,7 +1358,7 @@ async def cb_feed_period(callback: types.CallbackQuery):
     # 3. Check cache
     subs_hash = compute_subs_hash(subs)
     cached = await asyncio.to_thread(
-        get_feed_edition, user_id, period, subs_hash, FEED_CACHE_MINUTES * 60
+        get_feed_edition, user_id, period, subs_hash, _cache_minutes() * 60
     )
     if cached is not None:
         logger.info(
@@ -1373,7 +1398,7 @@ async def cb_feed_period(callback: types.CallbackQuery):
     # 4. Check rate limit
     now_ts = time.time()
     last_time = _last_build_time.get(user_id, 0.0)
-    if now_ts - last_time < FEED_MIN_INTERVAL_SECONDS:
+    if now_ts - last_time < _min_interval_seconds():
         text = "Подожди минуту"
         await callback.answer(text, show_alert=True)
         if callback.message:
@@ -1608,7 +1633,7 @@ async def process_feed_autodeliveries(now: datetime | None = None) -> int:
         due_time = get_autodelivery_due_time(user_id, period, record, now=now_dt)
         if due_time is None or now_dt.astimezone(TZ) < due_time:
             continue
-        if now_dt.astimezone(TZ) - due_time > timedelta(minutes=FEED_AUTODELIVERY_GRACE_MINUTES):
+        if now_dt.astimezone(TZ) - due_time > timedelta(minutes=_autodelivery_grace_minutes()):
             # Слот давно прошёл (долгий простой или время дайджеста перенесли на «уже прошедшее» сегодня): не шлём
             # внеплановый выпуск и не дублируем настоящий — отсчёт идёт заново от текущего момента.
             logger.info("feed_autodelivery stale slot skipped user=%s period=%s due=%s", user_id, period, due_time.isoformat())
@@ -1659,7 +1684,7 @@ async def run_autodelivery_loop() -> None:
     """Background service checking and delivering feed editions."""
     logger.info(
         "🔔 Фоновый сервис автодоставки Ленты запущен (проверка каждые %d сек)",
-        FEED_AUTODELIVERY_CHECK_SECONDS,
+        _autodelivery_check_seconds(),
     )
     while True:
         try:
@@ -1669,10 +1694,10 @@ async def run_autodelivery_loop() -> None:
         except Exception:
             logger.exception(
                 "Ошибка в цикле автодоставки Ленты, повтор через %d сек",
-                FEED_AUTODELIVERY_CHECK_SECONDS,
+                _autodelivery_check_seconds(),
             )
         try:
-            await asyncio.sleep(FEED_AUTODELIVERY_CHECK_SECONDS)
+            await asyncio.sleep(_autodelivery_check_seconds())
         except asyncio.CancelledError:
             break
 
@@ -1691,7 +1716,7 @@ async def cb_feed_channels(callback: types.CallbackQuery, state: FSMContext):
     except (IndexError, ValueError):
         page = 0
 
-    subs = list_feed_subscriptions(user_id, include_paused=True)
+    subs = await asyncio.to_thread(list_feed_subscriptions, user_id, include_paused=True)
     total = len(subs)
     page_size = 8
     start = page * page_size
@@ -1845,7 +1870,7 @@ async def cb_feed_delete(callback: types.CallbackQuery, state: FSMContext):
     delete_feed_subscription(user_id, sub_id)
     await callback.answer("🗑 Канал убран из Ленты")
 
-    subs = list_feed_subscriptions(user_id, include_paused=True)
+    subs = await asyncio.to_thread(list_feed_subscriptions, user_id, include_paused=True)
     page_size = 8
     total = len(subs)
     if page > 0 and (page * page_size) >= total:
@@ -1876,7 +1901,8 @@ async def cb_feed_tag_menu(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Канал не найден.")
         return
 
-    existing_tags = list_feed_tags(user_id)[:8]
+    raw_tags = await asyncio.to_thread(list_feed_tags, user_id)
+    existing_tags = raw_tags[:8]
     await state.set_state(FeedTagState.waiting_for_tag)
     await state.update_data(tag_sub_id=sub_id, tag_choices=existing_tags, page=page)
 

@@ -6,7 +6,6 @@ The HTML body is rendered from the same node tree as the Telegraph page.
 """
 import asyncio
 import logging
-import os
 import re
 import smtplib
 import ssl
@@ -15,11 +14,12 @@ from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
 from html import escape
 
+from config import settings
 from telegraph_publisher import build_content
 
 logger = logging.getLogger(__name__)
 
-MSMTPRC_PATH = os.getenv("MSMTPRC_PATH", "/run/secrets/msmtprc")
+MSMTPRC_PATH = settings().email.msmtprc_path
 SMTP_TIMEOUT = 30
 SENDER_NAME = "Unagi"
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$")
@@ -72,24 +72,26 @@ def _read_msmtprc(path: str) -> dict[str, str]:
 
 
 def load_config() -> SmtpConfig | None:
-    rc = _read_msmtprc(MSMTPRC_PATH)
-    host = os.getenv("SMTP_HOST") or rc.get("host", "")
-    env_port = os.getenv("SMTP_PORT") or rc.get("port")
+    path = MSMTPRC_PATH or settings().email.msmtprc_path
+    rc = _read_msmtprc(path)
+    cfg = settings().email
+    host = cfg.smtp_host or rc.get("host", "")
+    env_port = (str(cfg.smtp_port) if cfg.smtp_port is not None else "") or rc.get("port")
     if "host" in rc:
         tls = rc.get("tls", "off") == "on"
         starttls = rc.get("tls_starttls", "on") == "on"
         derived = "none" if not tls else "starttls" if starttls else "ssl"
     else:  # never fall back to a plaintext login when configured only through env
         derived = "ssl" if env_port == "465" else "starttls"
-    security = (os.getenv("SMTP_SECURITY") or derived).lower()
+    security = (cfg.smtp_security or derived).lower()
     if security not in {"ssl", "starttls", "none"}:
         logger.warning("Unknown SMTP_SECURITY=%r, using starttls", security)
         security = "starttls"
     default_port = {"ssl": 465, "starttls": 587, "none": 25}[security]
     port = int(env_port or default_port)
-    user = os.getenv("SMTP_USER") or rc.get("user", "")
-    password = os.getenv("SMTP_PASSWORD") or rc.get("password", "")
-    sender = os.getenv("SMTP_FROM") or rc.get("from", "") or user
+    user = cfg.smtp_user or rc.get("user", "")
+    password = cfg.smtp_password or rc.get("password", "")
+    sender = cfg.smtp_from or rc.get("from", "") or user
     if not host or not EMAIL_RE.match(sender):
         return None
     return SmtpConfig(host, port, security, user, password, sender)
@@ -99,6 +101,8 @@ _CONFIG = load_config()
 
 
 def is_enabled() -> bool:
+    if settings().email.delivery == "ghsub":
+        return True
     return _CONFIG is not None
 
 
@@ -123,6 +127,7 @@ _TAG_STYLES = {
     "hr": "border:0;border-top:1px solid #e5e7eb;margin:22px 0;",
     "a": "color:#2481cc;text-decoration:none;font-weight:600;",
     "b": "",
+    "br": "",
 }
 _VOID_TAGS = {"hr", "br"}
 

@@ -1,21 +1,21 @@
 import math
-import os
 import statistics
 from datetime import datetime, timedelta, timezone
 
+from config import settings
 from data.database import get_connection, normalize_channel_username, serialize_datetime, utc_now
 
-PRIORITIZE_THRESHOLD_PER_DAY = int(os.getenv("PRIORITIZE_THRESHOLD_PER_DAY", "20"))
-MAX_POSTS_PER_CHANNEL = int(os.getenv("MAX_POSTS_PER_CHANNEL", "5"))
-FORWARD_STANDOUT_RATIO = float(os.getenv("FORWARD_STANDOUT_RATIO", "1.25"))
-FORWARD_STANDOUT_MAX_EXTRA = int(os.getenv("FORWARD_STANDOUT_MAX_EXTRA", "3"))
+PRIORITIZE_THRESHOLD_PER_DAY = settings().ranking.prioritize_threshold_per_day
+MAX_POSTS_PER_CHANNEL = settings().ranking.max_posts_per_channel
+FORWARD_STANDOUT_RATIO = settings().ranking.forward_standout_ratio
+FORWARD_STANDOUT_MAX_EXTRA = settings().ranking.forward_standout_max_extra
 
 # Configurable score weights
-W_FWD = float(os.getenv("SCORE_W_FWD", "0.40"))
-W_VIEWS = float(os.getenv("SCORE_W_VIEWS", "0.25"))
-W_REACTIONS = float(os.getenv("SCORE_W_REACTIONS", "0.15"))
-W_REPLIES = float(os.getenv("SCORE_W_REPLIES", "0.05"))
-W_FRESHNESS = float(os.getenv("SCORE_W_FRESHNESS", "0.15"))
+W_FWD = settings().ranking.score_w_fwd
+W_VIEWS = settings().ranking.score_w_views
+W_REACTIONS = settings().ranking.score_w_reactions
+W_REPLIES = settings().ranking.score_w_replies
+W_FRESHNESS = settings().ranking.score_w_freshness
 
 
 def get_channel_medians(

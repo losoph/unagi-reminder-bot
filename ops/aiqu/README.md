@@ -106,27 +106,32 @@ ops/aiqu/prod_check.sh --expect <sha>   # проверка конкретной 
   * `WARN "контейнер: метка версии unknown/пустая (первый деплой после внедрения)"` — при значении `unknown`, пустой строке или отсутствии метки;
   * `OK "контейнер: код X (HEAD X)"` — при совпадении.
 
-**Проверка живости при деплое:**
-- В `deploy.yml` сразу после `docker compose up -d` выполняется проверка: пауза до 20 с (`sleep "${DEPLOY_WAIT_SECS:-20}"`), затем проверка через `docker inspect`:
+**Проверка живости и готовности при деплое (OPS3):**
+- В `deploy.yml` сразу после `docker compose up -d` выполняется динамический опрос каждые 2 с (до `${DEPLOY_WAIT_SECS:-60}`):
   - `State.Status == running`
-  - `RestartCount == 0` (корневое поле `{{.RestartCount}}`)
-  - `org.unagi.git_sha == $GIT_SHA` (метка версии совпадает с коммитом деплоя).
-- Если контейнер не запустился, упал в цикличный перезапуск или метка версии не совпала, деплой немедленно выводит последние 30 строк логов (`docker logs --tail 30 unagi-bot`) и завершается с ошибкой (`exit 1`).
+  - `RestartCount` не растёт в течение 10 с (допускается `RestartCount <= 1`, если после старта обеспечено 10 с непрерывной стабильности)
+  - `org.unagi.git_sha == $GIT_SHA` (метка версии совпадает с коммитом деплоя)
+  - Прикладной маркер готовности: `docker exec unagi-bot test -f /run/unagi/ready` (создаётся ботом после инициализации БД и роутеров).
+- Если контейнер не вышел в состояние готовности за таймаут, деплой выводит последние 30 строк логов (`docker logs --tail 30 unagi-bot`), выполняет **автооткат** на образ `:rollback` (если тег существует) и завершается с ошибкой (`exit 1`), оставляя job красным.
+- **Остановка и сброс WAL (OPS3):** в `docker-compose.yml` задан `stop_grace_period: 30s`; при остановке бот корректно отменяет фоновые циклы, закрывает сессии и выполняет `PRAGMA wal_checkpoint(TRUNCATE)`, предотвращая накопление WAL-логов.
 
 **Откатный тег образа и как откатиться:**
-- Перед сборкой нового образа (`up --build`) CI помечает образ текущего работающего контейнера:
+- Перед сборкой нового образа (`up --build`) CI обновляет тег `rollback` **только если текущий контейнер полностью здоров** (`State.Status=running` и `RestartCount=0`):
   ```bash
   current_image="$(docker inspect -f '{{.Image}}' unagi-bot 2>/dev/null || true)"
-  if [ -n "$current_image" ]; then
+  current_status="$(docker inspect -f '{{.State.Status}}' unagi-bot 2>/dev/null || echo missing)"
+  current_restarts="$(docker inspect -f '{{.RestartCount}}' unagi-bot 2>/dev/null || echo -1)"
+  if [ -n "$current_image" ] && [ "$current_status" = "running" ] && [ "$current_restarts" = "0" ]; then
     docker tag "$current_image" unagi-reminder-bot-bot:rollback 2>/dev/null || true
   fi
   ```
-  Это гарантирует, что откатный тег указывает на реально работающий образ контейнера, а не на промежуточный или сбойный последний собранный `:latest`.
+  Это гарантирует, что если деплой упал на liveness, следующий запуск не перезапишет рабочий образ сломанным.
 - Очистка образов `docker image prune -f` удаляет **только dangling (безымянные)** слои без тегов (`<none>:<none>`). Образ с тегом `:rollback` защищён от удаления.
 - **Политика защиты диска 9.8 ГБ (порог ALERT 85%):**
-  - Если после деплоя и prune использование диска составляет 85% или выше, шаг деплоя автоматически удаляет тег `:rollback` (`docker rmi unagi-reminder-bot-bot:rollback`) и повторно запускает `docker image prune -f`, предотвращая переполнение диска.
+  - До сборки (OPS3): если использование диска составляет 85% или выше, перед `up --build` выполняется `docker builder prune -f` и `docker image prune -f`.
+  - После сборки: если после деплоя и prune диск по-прежнему >= 85%, удаляется тег `:rollback` (`docker rmi unagi-reminder-bot-bot:rollback`) и повторно вызываются prune.
 - **База данных и миграции при откате:**
-  - Перед каждым деплоем `backup_db.py` сохраняет преддеплойный снимок `storage/backups/bot_data-<время>-predeploy.db`.
+  - Перед каждым деплоем `backup_db.py` сохраняет преддеплойный снимок `storage/backups/bot_data-<время>-predeploy.db` (запуск под `uid 10001`, чтобы служебные файлы `-wal/-shm` не создавались от root).
   - Если деплой применил миграции схемы БД, откат кода без отката БД оставит старый код на несовместимой новой схеме.
   - Перед запуском откаченного контейнера восстановите преддеплойный снимок БД:
     ```bash
@@ -157,6 +162,63 @@ ops/aiqu/prod_check.sh --expect <sha>   # проверка конкретной 
   docker compose up -d --build
   ops/aiqu/prod_check.sh --expect <sha>
   ```
+
+### Пользователь деплоя (deploy): подготовка и миграция (OPS2)
+
+В настоящее время CI-деплой через GitHub Actions (`.github/workflows/deploy.yml`) подключается по SSH от имени пользователя `root`. Для следования принципу наименьших привилегий подготовлен переход на выделенного непривилегированного пользователя `deploy`.
+
+> [!NOTE]
+> В `.github/workflows/deploy.yml` пользователь пока **НЕ** переключен: выполнена только подготовка серверного окружения, скрипта и инструкций.
+
+#### 1. Подготовка пользователя на сервере (`setup_deploy_user.sh`)
+
+Скрипт [`ops/aiqu/setup_deploy_user.sh`](setup_deploy_user.sh) выполняется владельцем сервера под `root` (или через `sudo`):
+
+```bash
+# Использование: setup_deploy_user.sh <файл_с_публичным_ключом> [каталог_проекта]
+./ops/aiqu/setup_deploy_user.sh /tmp/deploy_id_ed25519.pub /home/deploy/projects/unagi-reminder-bot
+```
+
+Свойства создаваемого пользователя:
+- **Пользователь `deploy`**: системная учётная запись с домашней директорией `/home/deploy` и командной оболочкой `/bin/bash`.
+- **Без пароля**: интерактивный пароль заблокирован (`passwd -l deploy`), вход возможен только по SSH-ключам.
+- **Группа `docker`**: пользователь добавлен в группу `docker` (`usermod -aG docker deploy`), что позволяет выполнять сборку и управление контейнерами через `docker compose` без прав `root`.
+- **Без `sudo`**: скрипт гарантирует отсутствие прав `sudo` (удаляет пользователя из групп `sudo`/`wheel`/`admin` и удаляет конфигурации из `/etc/sudoers.d/`).
+- **Ключи SSH (`~deploy/.ssh/authorized_keys`)**: добавляются из переданного файла публичного ключа (ключ в git не коммитится!). Скрипт идемпотентен: повторные запуски не дублируют уже существующие строки ключей. Права строго `0700` на `.ssh` и `0600` на `authorized_keys`.
+- **Каталог проекта**: создаётся каталог `/home/deploy/projects/unagi-reminder-bot` (или указанный аргументом) и передаётся во владение `deploy:deploy`.
+
+#### 2. Что сменить в секретах GitHub Actions при переключении
+
+Когда владелец решит активировать запуск от пользователя `deploy`, в настройках репозитория GitHub (**Settings → Secrets and variables → Actions**) необходимо:
+1. **`USERNAME`**: изменить со значения `root` на `deploy`.
+2. **`SSH_KEY`**: приватный SSH-ключ должен соответствовать тому публичному ключу, который был передан в `setup_deploy_user.sh` и записан в `/home/deploy/.ssh/authorized_keys`.
+3. Путь к проекту: в `deploy.yml` команда `cd ~/projects/unagi-reminder-bot` при входе под `deploy` автоматически перейдёт в `/home/deploy/projects/unagi-reminder-bot`.
+
+#### 3. Шаги деплоя, требующие root, и варианты решения
+
+В текущем `deploy.yml` (строка 104) выполняется шаг установки cron-файлов:
+```bash
+for f in ops/aiqu/cron.d/*; do [ -f "$f" ] && install -m 0644 -o root -g root "$f" "/etc/cron.d/$(basename "$f")" || true; done
+```
+Поскольку каталог `/etc/cron.d` принадлежит `root:root` с правами `0755`, непривилегированный пользователь `deploy` не имеет прав записи в него.
+
+**Варианты решения:**
+- **Вариант А (рекомендуемый — независимый root-скрипт/таймер):**
+  Установка cron-файлов полностью выносится из шага SSH-деплоя. На сервере настраивается отдельный systemd-таймер (или cron от `root`), который периодически или по inotify синхронизирует файлы из каталога репозитория (`/home/deploy/projects/unagi-reminder-bot/ops/aiqu/cron.d/*`) в `/etc/cron.d/` с правами `0644 root:root`. Это полностью исключает необходимость каких-либо системных привилегий у пользователя деплоя.
+- **Вариант Б (ограниченный sudoers только на install):**
+  Если синхронизацию необходимо оставить в рамках шага деплоя, пользователю `deploy` выдаётся точечное право `sudo` без пароля исключительно на команду `install` файлов в `/etc/cron.d/`. Для этого на сервере создаётся файл `/etc/sudoers.d/deploy-cron`:
+  ```sudoers
+  deploy ALL=(root) NOPASSWD: /usr/bin/install -m 0644 -o root -g root /home/deploy/projects/unagi-reminder-bot/ops/aiqu/cron.d/* /etc/cron.d/*
+  ```
+  В `deploy.yml` команда соответственно заменяется на вызов `sudo install ...`.
+
+#### 4. Как откатиться
+
+Если после переключения на пользователя `deploy` возникнут проблемы с доступом или выполнением шагов:
+1. В Secrets репозитория GitHub вернуть секрет **`USERNAME`** в значение **`root`**.
+2. Убедиться, что приватный ключ `SSH_KEY` совпадает с ключом в `/root/.ssh/authorized_keys` (исходный доступ root не удаляется).
+3. При необходимости синхронизировать код или состояние БД между `/home/deploy/projects/` и `/root/projects/`.
+4. Перезапустить деплой — он снова будет выполнен от имени `root`.
 
 ### Резервные копии БД и восстановление
 
@@ -290,6 +352,12 @@ ssh aiqu 'sshd -T | grep -E "^(port|passwordauthentication|permitrootlogin) "; u
 ```
 
 Откат SSH: `cp /root/sshd_config.bak-20261011 /etc/ssh/sshd_config && rm /etc/ssh/sshd_config.d/00-hardening.conf && sshd -t && systemctl reload ssh`.
+
+## Алерты владельцу: единый механизм (решение 18.10.2026)
+
+Разовые письма (итоги спринта, вехи, чек-листы) отправляет **один механизм — `ghsub-roadmap-alert.sh` из репозитория ghsub** (см. `docs/alerts.md` в ghsub). Расписание (cron-строки), отправку и защиту от повтора хостит ghsub; **unagi только отдаёт содержимое** — файлы `docs/ALERT-*.md` в этом репозитории. Новое письмо = файл здесь + cron-строка с `--app unagi --file docs/ALERT-….md` в `install.sh` ghsub. Планировщиков и флагов отправки в unagi для новых алертов не заводить.
+
+Расписание: 24.10 11:00 МСК — `docs/ALERT-LENTA-2026-10-24.md`; 31.10 11:00 МСК — `docs/ALERT-MOVE-2026-10-31.md`. Письмо на 18.10 19:00 (`docs/ALERT-SPRINT-2026-10-18.md`) идёт старым путём (`ops/aiqu/unagi-status-alert.sh` + `ops/aiqu/cron.d/unagi-status-alert`, уже установлено): после отправки оба файла удалить, механизм считать устаревшим.
 
 ## Доступ из России
 
