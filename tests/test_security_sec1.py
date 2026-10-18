@@ -27,6 +27,11 @@ def _now_str() -> str:
     return db.serialize_datetime(db.utc_now())
 
 
+def _window_start_str() -> str:
+    """Начало окна подсчёта — минута назад: «с текущей секунды» терял только что записанную отправку на границе секунды (флаки 18.10)."""
+    return db.serialize_datetime(db.utc_now() - timedelta(minutes=1))
+
+
 class Sec1TestBase(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
@@ -206,8 +211,8 @@ class TestP4EmailLimits(Sec1TestBase):
         db.record_email_send(1, "a@example.com", now)
         db.record_email_send(1, "b@example.com", now)
         db.record_email_send(2, "a@example.com", now)
-        self.assertEqual(db.count_email_sends_for_user(1, _now_str()), 2)
-        self.assertEqual(db.count_email_sends_for_address("a@example.com", _now_str()), 2)
+        self.assertEqual(db.count_email_sends_for_user(1, _window_start_str()), 2)
+        self.assertEqual(db.count_email_sends_for_address("a@example.com", _window_start_str()), 2)
 
     def test_address_limit_blocks_second_user(self):
         message = MagicMock()
@@ -221,7 +226,7 @@ class TestP4EmailLimits(Sec1TestBase):
             main, "EMAIL_DAILY_LIMIT_PER_ADDRESS", 1
         ), patch.object(main.email_digest, "send_email", AsyncMock(return_value=True)):
             asyncio.run(main.process_email_address(message, state))
-            self.assertTrue(db.count_email_sends_for_address("target@example.com", _now_str()) >= 1)
+            self.assertTrue(db.count_email_sends_for_address("target@example.com", _window_start_str()) >= 1)
 
             message2 = MagicMock()
             message2.from_user.id = 3002
