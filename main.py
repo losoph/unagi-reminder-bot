@@ -244,6 +244,15 @@ from digest_setup import (  # noqa: F401
     save_subscription,
     setup_digest,
 )
+import screen_registry
+from screen_registry import (  # noqa: F401
+    ScreenRegistry,
+    default_registry,
+    get_screen_handler,
+    has_screen,
+    register_screen,
+    unregister_screen,
+)
 dp.include_router(reminders_ux.router)
 dp.include_router(user_prefs.router)
 dp.include_router(feed.router)
@@ -1144,67 +1153,127 @@ async def pop_screen(state: FSMContext) -> dict | None:
     return None
 
 
-async def render_screen(chat_id: int, screen: dict, target: types.Message | types.CallbackQuery, state: FSMContext):
-    name = screen["screen"]
-    args = screen.get("args", {})
-    
-    if name == "kb_tags":
-        await render_kb_tags_screen(chat_id, target, state)
-    elif name == "kb_list":
-        await render_kb_list_screen(chat_id, args.get("tag"), args.get("page", 1), target, state)
-    elif name == "kb_detail":
-        await render_kb_detail_screen(chat_id, args.get("msg_id"), target, state)
-    elif name == "kb_move":
-        await render_kb_move_screen(chat_id, args.get("msg_id"), target, state)
-    elif name == "rem_tags":
-        await render_rem_tags_screen(chat_id, target, state)
-    elif name == "rem_list":
-        await render_rem_list_screen(chat_id, args.get("tag"), args.get("page", 1), target, state)
-    elif name == "rem_detail":
-        await render_rem_detail_screen(chat_id, args.get("msg_id"), target, state)
-    elif name == "rem_move":
-        await render_rem_move_screen(chat_id, args.get("msg_id"), target, state)
-    elif name == "manual_date":
-        markup = build_manual_date_keyboard()
-        if isinstance(target, types.CallbackQuery):
-            if isinstance(target.message, types.Message):
-                await target.message.edit_text("Выбери дату:", reply_markup=markup)
-            else:
-                await bot.send_message(chat_id, "Выбери дату:", reply_markup=markup)
-            await target.answer()
+async def _render_screen_kb_tags(
+    chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext, args: dict
+) -> None:
+    await render_kb_tags_screen(chat_id, target, state)
+
+
+async def _render_screen_kb_list(
+    chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext, args: dict
+) -> None:
+    await render_kb_list_screen(chat_id, args.get("tag"), args.get("page", 1), target, state)
+
+
+async def _render_screen_kb_detail(
+    chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext, args: dict
+) -> None:
+    await render_kb_detail_screen(chat_id, args.get("msg_id"), target, state)
+
+
+async def _render_screen_kb_move(
+    chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext, args: dict
+) -> None:
+    await render_kb_move_screen(chat_id, args.get("msg_id"), target, state)
+
+
+async def _render_screen_rem_tags(
+    chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext, args: dict
+) -> None:
+    await render_rem_tags_screen(chat_id, target, state)
+
+
+async def _render_screen_rem_list(
+    chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext, args: dict
+) -> None:
+    await render_rem_list_screen(chat_id, args.get("tag"), args.get("page", 1), target, state)
+
+
+async def _render_screen_rem_detail(
+    chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext, args: dict
+) -> None:
+    await render_rem_detail_screen(chat_id, args.get("msg_id"), target, state)
+
+
+async def _render_screen_rem_move(
+    chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext, args: dict
+) -> None:
+    await render_rem_move_screen(chat_id, args.get("msg_id"), target, state)
+
+
+async def _render_screen_manual_date(
+    chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext, args: dict
+) -> None:
+    markup = build_manual_date_keyboard()
+    if isinstance(target, types.CallbackQuery):
+        if isinstance(target.message, types.Message):
+            await target.message.edit_text("Выбери дату:", reply_markup=markup)
         else:
-            await target.answer("Выбери дату:", reply_markup=markup)
-    elif name == "manual_hour":
-        markup = build_manual_hour_keyboard()
-        selected_date_str = args.get("selected_date")
-        prompt_text = f"Дата: {selected_date_str}\nВыбери час:"
-        if isinstance(target, types.CallbackQuery):
-            if isinstance(target.message, types.Message):
-                await target.message.edit_text(prompt_text, reply_markup=markup)
-            else:
-                await bot.send_message(chat_id, prompt_text, reply_markup=markup)
-            await target.answer()
-        else:
-            await target.answer(prompt_text, reply_markup=markup)
-    elif name == "manual_minute":
-        markup = build_manual_minute_keyboard()
-        hour = args.get("selected_hour", 0)
-        prompt_text = f"Время: {hour:02d}:00\nВыбери минуты:"
-        if isinstance(target, types.CallbackQuery):
-            if isinstance(target.message, types.Message):
-                await target.message.edit_text(prompt_text, reply_markup=markup)
-            else:
-                await bot.send_message(chat_id, prompt_text, reply_markup=markup)
-            await target.answer()
-        else:
-            await target.answer(prompt_text, reply_markup=markup)
+            await bot.send_message(chat_id, "Выбери дату:", reply_markup=markup)
+        await target.answer()
     else:
-        await state.clear()
-        if isinstance(target, types.CallbackQuery):
-            await target.message.answer(WELCOME_TEXT, reply_markup=build_main_menu_keyboard())
-            await target.answer()
+        await target.answer("Выбери дату:", reply_markup=markup)
+
+
+async def _render_screen_manual_hour(
+    chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext, args: dict
+) -> None:
+    markup = build_manual_hour_keyboard()
+    selected_date_str = args.get("selected_date")
+    prompt_text = f"Дата: {selected_date_str}\nВыбери час:"
+    if isinstance(target, types.CallbackQuery):
+        if isinstance(target.message, types.Message):
+            await target.message.edit_text(prompt_text, reply_markup=markup)
         else:
-            await target.answer(WELCOME_TEXT, reply_markup=build_main_menu_keyboard())
+            await bot.send_message(chat_id, prompt_text, reply_markup=markup)
+        await target.answer()
+    else:
+        await target.answer(prompt_text, reply_markup=markup)
+
+
+async def _render_screen_manual_minute(
+    chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext, args: dict
+) -> None:
+    markup = build_manual_minute_keyboard()
+    hour = args.get("selected_hour", 0)
+    prompt_text = f"Время: {hour:02d}:00\nВыбери минуты:"
+    if isinstance(target, types.CallbackQuery):
+        if isinstance(target.message, types.Message):
+            await target.message.edit_text(prompt_text, reply_markup=markup)
+        else:
+            await bot.send_message(chat_id, prompt_text, reply_markup=markup)
+        await target.answer()
+    else:
+        await target.answer(prompt_text, reply_markup=markup)
+
+
+async def _render_screen_fallback(
+    chat_id: int, target: types.Message | types.CallbackQuery, state: FSMContext, args: dict
+) -> None:
+    await state.clear()
+    if isinstance(target, types.CallbackQuery):
+        await target.message.answer(WELCOME_TEXT, reply_markup=build_main_menu_keyboard())
+        await target.answer()
+    else:
+        await target.answer(WELCOME_TEXT, reply_markup=build_main_menu_keyboard())
+
+
+screen_registry.set_default_screen(_render_screen_fallback)
+screen_registry.register_screen("kb_tags", _render_screen_kb_tags)
+screen_registry.register_screen("kb_list", _render_screen_kb_list)
+screen_registry.register_screen("kb_detail", _render_screen_kb_detail)
+screen_registry.register_screen("kb_move", _render_screen_kb_move)
+screen_registry.register_screen("rem_tags", _render_screen_rem_tags)
+screen_registry.register_screen("rem_list", _render_screen_rem_list)
+screen_registry.register_screen("rem_detail", _render_screen_rem_detail)
+screen_registry.register_screen("rem_move", _render_screen_rem_move)
+screen_registry.register_screen("manual_date", _render_screen_manual_date)
+screen_registry.register_screen("manual_hour", _render_screen_manual_hour)
+screen_registry.register_screen("manual_minute", _render_screen_manual_minute)
+
+
+async def render_screen(chat_id: int, screen: dict, target: types.Message | types.CallbackQuery, state: FSMContext):
+    await screen_registry.render_screen(chat_id, screen, target, state)
 
 
 bookmarks.configure(render_screen=render_screen)
