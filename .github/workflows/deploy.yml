@@ -70,10 +70,12 @@ jobs:
             git pull --ff-only origin main
             test -z "$(git ls-files -u)" || { echo "конфликт слияния в рабочем дереве сервера — деплой остановлен"; git status --short; exit 1; }
             # --- end sync
-            # Снимок БД до пересборки не от root (миграции только добавляют, но откат данных должен быть возможен).
-            # Каталог storage/backups принадлежит uid 10001, чтобы файлы -wal/-shm не блокировали запись боту.
-            mkdir -p storage/backups && chown -R 10001:10001 storage
-            setpriv --reuid=10001 --regid=10001 --clear-groups python3 ops/aiqu/backup_db.py --db storage/bot_data.db || { echo "резервная копия не создана — деплой остановлен"; exit 1; }
+            # Снимок БД до пересборки (миграции только добавляют, но откат данных должен быть возможен). Нет снимка — нет деплоя.
+            # Идёт от root: репозиторий лежит в /root (uid 10001 туда не войти — 18.10 деплой упал с Permission denied).
+            # Файлы, которые root мог создать при открытии БД (-wal/-shm, снимки), возвращаем боту сразу после снимка.
+            mkdir -p storage/backups
+            python3 ops/aiqu/backup_db.py --db storage/bot_data.db || { chown -R 10001:10001 storage; echo "резервная копия не создана — деплой остановлен"; exit 1; }
+            chown -R 10001:10001 storage
             # Откатный тег: обновляем rollback только если текущий контейнер здоров (State.Status=running и RestartCount=0).
             # Сценарий: деплой упал на liveness, следующий деплой не должен затереть рабочий образ сломанным.
             current_image="$(docker inspect -f '{{.Image}}' unagi-bot 2>/dev/null || true)"

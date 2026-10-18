@@ -143,14 +143,19 @@ class Dep2ConfigTests(unittest.TestCase):
         self.assertIn("docker builder prune -f", content[:compose_up_pos])
         self.assertIn("docker image prune -f", content[:compose_up_pos])
 
-    def test_deploy_runs_backup_as_non_root(self):
+    def test_deploy_runs_backup_as_root_and_returns_ownership_to_the_bot(self):
+        # 18.10: под uid 10001 backup_db.py не открывается — репозиторий в /root. Снимок от root, затем chown storage боту.
         content = DEPLOY_YML.read_text(encoding="utf-8")
-        self.assertIn("setpriv --reuid=10001 --regid=10001 --clear-groups python3 ops/aiqu/backup_db.py", content)
-        self.assertIn("chown -R 10001:10001 storage", content)
+        self.assertNotIn("setpriv --reuid=10001 --regid=10001 --clear-groups python3 ops/aiqu/backup_db.py", content)
+        backup_pos = content.find("python3 ops/aiqu/backup_db.py")
+        self.assertNotEqual(backup_pos, -1)
+        self.assertIn("chown -R 10001:10001 storage", content[backup_pos:backup_pos + 400])
+        self.assertLess(backup_pos, content.find("docker compose up -d --build"))
 
-    def test_prod_check_sqlite_runs_as_non_root(self):
+    def test_prod_check_sqlite_is_readonly_and_runs_from_the_repo_dir(self):
         content = PROD_CHECK.read_text(encoding="utf-8")
-        self.assertIn("setpriv --reuid=10001 --regid=10001 --clear-groups sqlite3 -readonly", content)
+        self.assertIn("sqlite3 -readonly", content)
+        self.assertNotIn("setpriv --reuid=10001", content)
 
 
 class Dep2LivenessExecutionTests(unittest.TestCase):
