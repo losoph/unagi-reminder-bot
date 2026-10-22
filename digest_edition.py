@@ -85,6 +85,24 @@ def dedupe_edition_sections(sections: list[dict]) -> list[dict]:
     return result
 
 
+def sort_sections_by_folder(
+    sections: list[dict], folder_by_sub_id: dict[int, str], folder_order: list[str]
+) -> list[dict]:
+    """Order sections by the user's folder order: listed folders first, other folders
+    alphabetically, channels without a folder last. Stable inside a folder."""
+    position = {name: index for index, name in enumerate(folder_order)}
+
+    def key(section: dict) -> tuple:
+        folder = folder_by_sub_id.get(section.get("sub_id"))
+        if not folder:
+            return (2, 0, "")
+        if folder in position:
+            return (0, position[folder], "")
+        return (1, 0, folder.lower())
+
+    return sorted(sections, key=key)
+
+
 def arrange_edition_sections(sections: list[dict]) -> list[dict]:
     """Order sections juniors-first and label groups when the edition mixes periods."""
     ordered = sorted(sections, key=lambda section: _rank(section.get("period")))

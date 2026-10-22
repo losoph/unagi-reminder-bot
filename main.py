@@ -65,6 +65,8 @@ from data.database import (
     get_scheduled_message_by_delivered_message_id,
     get_subscription_by_id,
     get_user_messages,
+    get_folder_order,
+    get_subscription_folder_map,
     get_user_subscriptions,
     get_user_tags,
     increment_ai_usage,
@@ -161,6 +163,7 @@ from bookmarks import (  # noqa: F401
     setup_bookmark,
     start_save_flow,
 )
+import digest_folders
 import digest_settings
 from digest_settings import (  # noqa: F401
     SubTagState,
@@ -262,6 +265,7 @@ dp.include_router(user_prefs.router)
 dp.include_router(feed.router)
 dp.include_router(bookmarks.router)
 dp.include_router(digest_settings.router)
+dp.include_router(digest_folders.router)
 dp.include_router(data_transfer.router)
 dp.include_router(digest_setup.router)
 # SEC1 (п.5): бот работает только в личных сообщениях. Корневые фильтры
@@ -765,6 +769,14 @@ async def deliver_digest(
     sections = [s for s in sections if s["posts"]]
     if not sections:
         return False
+    try:
+        # Порядок папок из меню «Папки»; сортировка стабильна, поэтому внутри периода он сохранится.
+        folder_by_sub_id = await asyncio.to_thread(get_subscription_folder_map, user_id)
+        if folder_by_sub_id:
+            folder_order = await asyncio.to_thread(get_folder_order, user_id)
+            sections = digest_edition.sort_sections_by_folder(sections, folder_by_sub_id, folder_order)
+    except Exception:
+        logger.exception("Не удалось применить порядок папок к дайджесту пользователя %s", user_id)
 
     def prepare(part: list[dict]) -> tuple[str, list[dict]]:
         if group_by_period:

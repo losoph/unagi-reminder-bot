@@ -332,6 +332,7 @@ def build_digest_settings_keyboard(user_subs, user_id: int | None = None) -> Inl
     ]
     if user_subs:
         rows.append([InlineKeyboardButton(text="🧠 Анализ каналов (ИИ)", callback_data="digest_ai")])
+        rows.append([InlineKeyboardButton(text="📁 Папки", callback_data="fldmenu")])
         has_active = any(not s[5] for s in user_subs)
         has_paused = any(s[5] for s in user_subs)
         bulk_row = []

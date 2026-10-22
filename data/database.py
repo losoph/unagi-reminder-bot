@@ -797,6 +797,18 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # колонка уже есть
 
+        # Порядок папок подписок в дайджесте: позиция задаётся пользователем (меню «Папки»).
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS subscription_folder_order (
+                user_id INTEGER NOT NULL,
+                folder TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                PRIMARY KEY (user_id, folder)
+            )
+            '''
+        )
+
         # Q4 T20 (§3.1): целевая схема данных для модели «папка = одна рассылка»
         cursor.execute(
             '''
@@ -2180,6 +2192,134 @@ def get_subscription_tags(user_id):
             (user_id,),
         ).fetchall()
     return [row[0] for row in rows if row[0]]
+
+
+def _folder_key(folder: str | None) -> str:
+    return folder.strip() if isinstance(folder, str) else ""
+
+
+def get_folder_order(user_id) -> list[str]:
+    """Папки в порядке, заданном пользователем (папки без позиции в список не входят)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            'SELECT folder FROM subscription_folder_order WHERE user_id = ? ORDER BY position, folder COLLATE NOCASE',
+            (user_id,),
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
+def set_folder_order(user_id, folders: list[str]) -> None:
+    """Сохранить порядок папок целиком (позиции — по порядку списка)."""
+    unique = list(dict.fromkeys(name for name in (_folder_key(f) for f in folders) if name))
+    with get_connection() as conn:
+        conn.execute('DELETE FROM subscription_folder_order WHERE user_id = ?', (user_id,))
+        conn.executemany(
+            'INSERT INTO subscription_folder_order (user_id, folder, position) VALUES (?, ?, ?)',
+            [(user_id, name, position) for position, name in enumerate(unique)],
+        )
+        conn.commit()
+
+
+def list_subscription_folders(user_id) -> list[dict]:
+    """Папки пользователя в порядке показа: сначала с заданной позицией, затем по алфавиту,
+    «Без папки» (name=None) последней. Для каждой — число подписок и сколько из них на паузе."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            '''
+            SELECT COALESCE(tag, '') AS folder, COUNT(*) AS total, SUM(is_paused) AS paused
+            FROM subscriptions
+            WHERE user_id = ? AND is_disabled = 0
+            GROUP BY COALESCE(tag, '')
+            ''',
+            (user_id,),
+        ).fetchall()
+    stats = {row[0]: (row[1], row[2] or 0) for row in rows}
+    order = get_folder_order(user_id)
+    names = [name for name in order if name in stats and name]
+    names += sorted((name for name in stats if name and name not in names), key=str.lower)
+    result = [{"name": name, "total": stats[name][0], "paused": stats[name][1]} for name in names]
+    if "" in stats:
+        result.append({"name": None, "total": stats[""][0], "paused": stats[""][1]})
+    return result
+
+
+def get_folder_subscriptions(user_id, folder: str | None):
+    with get_connection() as conn:
+        return conn.execute(
+            '''
+            SELECT id, channel_username, channel_title, period, last_scraped_at, is_paused, tag
+            FROM subscriptions
+            WHERE user_id = ? AND is_disabled = 0 AND COALESCE(tag, '') = ?
+            ORDER BY channel_title COLLATE NOCASE, id
+            ''',
+            (user_id, _folder_key(folder)),
+        ).fetchall()
+
+
+def set_folder_paused(user_id, folder: str | None, paused: bool) -> int:
+    with get_connection() as conn:
+        cursor = conn.execute(
+            '''
+            UPDATE subscriptions SET is_paused = ?
+            WHERE user_id = ? AND is_disabled = 0 AND COALESCE(tag, '') = ? AND is_paused = ?
+            ''',
+            (1 if paused else 0, user_id, _folder_key(folder), 0 if paused else 1),
+        )
+        conn.commit()
+    return cursor.rowcount
+
+
+def delete_folder_subscriptions(user_id, folder: str | None) -> int:
+    key = _folder_key(folder)
+    with get_connection() as conn:
+        cursor = conn.execute(
+            'DELETE FROM subscriptions WHERE user_id = ? AND is_disabled = 0 AND COALESCE(tag, \'\') = ?',
+            (user_id, key),
+        )
+        if key:
+            conn.execute('DELETE FROM subscription_folder_order WHERE user_id = ? AND folder = ?', (user_id, key))
+        conn.commit()
+    return cursor.rowcount
+
+
+def move_folder_subscriptions(user_id, folder: str | None, new_folder: str | None) -> int:
+    """Перенести все подписки папки в другую (или «Без папки»); позиция старой папки переходит новой,
+    если у новой своей ещё нет."""
+    key = _folder_key(folder)
+    new_key = _folder_key(new_folder)
+    if key == new_key:
+        return 0
+    with get_connection() as conn:
+        cursor = conn.execute(
+            '''
+            UPDATE subscriptions SET tag = ?
+            WHERE user_id = ? AND is_disabled = 0 AND COALESCE(tag, '') = ?
+            ''',
+            (new_key or None, user_id, key),
+        )
+        if key:
+            old = conn.execute(
+                'SELECT position FROM subscription_folder_order WHERE user_id = ? AND folder = ?',
+                (user_id, key),
+            ).fetchone()
+            conn.execute('DELETE FROM subscription_folder_order WHERE user_id = ? AND folder = ?', (user_id, key))
+            if old and new_key:
+                conn.execute(
+                    'INSERT OR IGNORE INTO subscription_folder_order (user_id, folder, position) VALUES (?, ?, ?)',
+                    (user_id, new_key, old[0]),
+                )
+        conn.commit()
+    return cursor.rowcount
+
+
+def get_subscription_folder_map(user_id) -> dict[int, str]:
+    """id активной подписки → имя папки (подписки без папки в словарь не входят)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, tag FROM subscriptions WHERE user_id = ? AND is_disabled = 0 AND COALESCE(tag, '') != ''",
+            (user_id,),
+        ).fetchall()
+    return {row[0]: row[1] for row in rows}
 
 
 def add_digest_posts(user_id, channel_username, channel_title, posts):
